@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 test('CI Foundation: repository configuration and Vite/Tauri scaffolding exist', () => {
@@ -69,5 +70,30 @@ test('Rust core only: the Node.js prototype is gone and live docs no longer poin
   // The ADR keeps the history; the operating docs must describe what ships.
   for (const doc of ['AGENT.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
     assert.doesNotMatch(fs.readFileSync(doc, 'utf8'), /src\/core\/|index\.mjs|CentralLlmService/, `${doc} still references the prototype`);
+  }
+});
+
+test('CI Foundation: npm run package copies the exe and keeps the data folder', async () => {
+  const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+  assert.equal(pkg.scripts.package, 'node scripts/package.mjs');
+  assert.match(fs.readFileSync('.gitignore', 'utf8'), /^\/release\/$/m, 'release/ must be git-ignored');
+
+  const { stage } = await import(new URL('../scripts/package.mjs', import.meta.url));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-package-'));
+  try {
+    const exe = path.join(tmp, 'aegis-win.exe');
+    const out = path.join(tmp, 'release', 'AegisWin');
+    fs.writeFileSync(exe, 'v1');
+    fs.mkdirSync(path.join(out, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(out, 'data', 'vault.enc.json'), 'secret');
+
+    assert.equal(stage(exe, out), path.join(out, 'AegisWin.exe'));
+    fs.writeFileSync(exe, 'v2');
+    stage(exe, out);
+    assert.equal(fs.readFileSync(path.join(out, 'AegisWin.exe'), 'utf8'), 'v2');
+    assert.equal(fs.readFileSync(path.join(out, 'data', 'vault.enc.json'), 'utf8'), 'secret', 'the vault must survive a repackage');
+    assert.throws(() => stage(path.join(tmp, 'missing.exe'), out), /No build/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

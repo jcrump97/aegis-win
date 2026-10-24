@@ -53,6 +53,7 @@ npm install
 | `npm run dev` | UI only, in a browser at `http://127.0.0.1:1420` |
 | `npm run tauri:dev` | Desktop app with hot reload. The first build takes a few minutes. |
 | `npm run tauri:build` | Portable release exe at `target/release/aegis-win.exe` |
+| `npm run package` | Release build copied to `release/AegisWin/AegisWin.exe` (git-ignored). Its vault lives in `release/AegisWin/data/` and survives repackaging. Add `-- --no-build` to copy the last build only. |
 
 `npm run dev` and `npm run tauri:dev` both use port 1420, so run only one at a time.
 
