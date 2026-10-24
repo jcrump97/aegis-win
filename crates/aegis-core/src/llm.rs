@@ -388,33 +388,8 @@ mod tests {
 
     #[tokio::test]
     async fn completes_against_an_openai_compatible_server() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 65536];
-            let mut req = Vec::new();
-            loop {
-                let n = sock.read(&mut buf).await.unwrap();
-                req.extend_from_slice(&buf[..n]);
-                let text = String::from_utf8_lossy(&req);
-                if let Some(h) = text.find("\r\n\r\n") {
-                    let len: usize = text
-                        .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
-                        .unwrap_or(0);
-                    if req.len() >= h + 4 + len {
-                        break;
-                    }
-                }
-            }
-            let body = r#"{"choices":[{"message":{"content":"  Disk is full.  "}}]}"#;
-            let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-            sock.write_all(resp.as_bytes()).await.unwrap();
-            String::from_utf8_lossy(&req).to_string()
-        });
-        let answer = handle(&format!("http://127.0.0.1:{port}/v1/"), false).complete("sys", json!({ "q": 1 })).await.unwrap();
+        let (base, server) = crate::testing::mock_llm("  Disk is full.  ").await;
+        let answer = handle(&format!("{base}/"), false).complete("sys", json!({ "q": 1 })).await.unwrap();
         assert_eq!(answer.text, "Disk is full.");
         assert!(!answer.off_lan);
         let request = server.await.unwrap();

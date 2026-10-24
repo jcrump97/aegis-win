@@ -7,6 +7,8 @@ pub mod os;
 pub mod registry;
 pub mod schema;
 pub mod secret;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 pub mod vault;
 
 pub use error::{AegisError, AegisResult, ErrorCode};

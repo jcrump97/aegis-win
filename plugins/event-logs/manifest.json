@@ -2,53 +2,62 @@
   "id": "event-logs",
   "name": "Windows Event & Application Log Explorer",
   "version": "1.0.0",
-  "description": "Fast query, filtering, and AI-assisted root-cause analysis for Windows Application, System, and Security Event Logs.",
+  "description": "Reads Windows Application, System, Setup, and Security event logs, filters them by Event ID and source, and asks the LLM service to explain them.",
   "optionalInstallDefault": true,
   "usesLlm": true,
   "tools": [
     {
       "id": "query_logs",
-      "name": "Query Windows Event Channel",
-      "description": "Queries Application, System, or Security event channels via native wevtutil XML/structured parsing.",
+      "name": "Query Windows Event Log",
+      "description": "Returns the newest events from a Windows event log at or above a minimum severity. Reading the Security log requires administrator rights.",
       "requiresAdmin": false,
       "defaultGatePolicy": "auto",
+      "readOnly": true,
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
-          "channel": { "type": "string", "enum": ["Application", "System", "Security"], "default": "Application" },
-          "severity": { "type": "string", "enum": ["All", "Critical", "Error", "Warning", "Information"], "default": "Error" },
-          "limit": { "type": "number", "default": 25 }
+          "channel": { "type": "string", "enum": ["Application", "System", "Setup", "Security"], "default": "Application" },
+          "severity": { "type": "string", "enum": ["All", "Critical", "Error", "Warning", "Information"], "default": "Error", "description": "Minimum severity: Error includes Critical, Warning includes Error and Critical." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 },
+          "lookbackHours": { "type": "integer", "minimum": 1, "maximum": 2160, "description": "Only events from the last N hours." }
         }
       }
     },
     {
       "id": "filter_by_event_id",
       "name": "Filter Events by ID & Source",
-      "description": "Extracts targeted Windows events (e.g., 1000 App Error, 1002 App Hang, 41 Kernel-Power, 7034 Service Crash).",
+      "description": "Returns events with a specific Event ID, optionally from one source (e.g. 1000 Application Error, 1002 Application Hang, 41 Kernel-Power, 7034 Service Control Manager).",
       "requiresAdmin": false,
       "defaultGatePolicy": "auto",
+      "readOnly": true,
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["eventId"],
         "properties": {
-          "channel": { "type": "string", "default": "Application" },
-          "eventId": { "type": "number" },
-          "source": { "type": "string" }
+          "channel": { "type": "string", "enum": ["Application", "System", "Setup", "Security"], "default": "Application" },
+          "eventId": { "type": "integer", "minimum": 0, "maximum": 65535 },
+          "source": { "type": "string", "maxLength": 128, "description": "Event provider name, for example Application Error." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 },
+          "lookbackHours": { "type": "integer", "minimum": 1, "maximum": 2160 }
         }
       }
     },
     {
       "id": "analyze_logs_with_llm",
       "name": "AI Root-Cause Log Analysis",
-      "description": "Sends selected event log entries to the Central LLM Service for diagnostic root-cause analysis (subject to Off-LAN trust gating).",
+      "description": "Sends the given event entries to the LLM service for a root-cause explanation and safe next steps. Off-LAN endpoints require trusting this plugin first.",
       "requiresAdmin": false,
       "defaultGatePolicy": "auto",
+      "readOnly": true,
       "inputSchema": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["events"],
         "properties": {
-          "events": { "type": "array" },
-          "focusQuestion": { "type": "string" }
+          "events": { "type": "array", "maxItems": 100, "items": { "type": "object" } },
+          "focusQuestion": { "type": "string", "maxLength": 1000 }
         }
       }
     }
