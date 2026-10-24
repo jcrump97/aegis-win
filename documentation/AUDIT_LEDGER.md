@@ -11,3 +11,4 @@
 | 5 | `(feat)` | Implement compile-time plugin registry, first-run wizard state, and per-tool gate policy engine | `PLUGIN_SPEC.md`, `AUDIT_LEDGER.md` | `tests/05-plugin-registry.test.mjs` |
 | 6 | `(feat)` | Build local MCP HTTP server with auto firewall port management and PIN-gated approval web portal | `ARCHITECTURE.md`, `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/06-mcp-server.test.mjs` |
 | 7 | `(feat)` | Add self-contained Windows Event Log explorer plugin with LLM log diagnostics | `PLUGIN_SPEC.md`, `plugins/event-logs/README.md`, `AUDIT_LEDGER.md` | `plugins/event-logs/tests/event-logs.test.mjs` |
+| 8 | `(feat)` | Add Windows Health optimization plugin with UAC self-elevation and dry-run safeguards | `PLUGIN_SPEC.md`, `plugins/windows-health/README.md`, `AUDIT_LEDGER.md` | `plugins/windows-health/tests/windows-health.test.mjs` |

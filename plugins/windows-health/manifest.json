@@ -1,0 +1,77 @@
+{
+  "id": "windows-health",
+  "name": "Windows Health & Network Stack Optimizer",
+  "version": "1.0.0",
+  "description": "Executes core Windows system file repair (SFC) and network recovery operations (DNS flush, DHCP release/renew, Winsock reset) with dry-run impact checks and UAC self-elevation.",
+  "optionalInstallDefault": true,
+  "usesLlm": true,
+  "tools": [
+    {
+      "id": "sfc_scan",
+      "name": "System File Checker (sfc /scannow)",
+      "description": "Scans integrity of all protected Windows system files and repairs corrupted versions.",
+      "requiresAdmin": true,
+      "defaultGatePolicy": "pin_required",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dryRun": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    {
+      "id": "flush_dns",
+      "name": "Flush DNS Resolver Cache",
+      "description": "Purges the Windows DNS client resolver cache via ipconfig /flushdns.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dryRun": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    {
+      "id": "ip_release_renew",
+      "name": "IP Config Release & Renew",
+      "description": "Releases and renews DHCP IPv4 addresses via ipconfig /release && ipconfig /renew (temporarily drops active network connections).",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "adapterFilter": { "type": "string", "default": "" },
+          "dryRun": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    {
+      "id": "winsock_reset",
+      "name": "Reset Winsock Catalog",
+      "description": "Resets Winsock Catalog to a clean state via netsh winsock reset (requires system reboot to complete).",
+      "requiresAdmin": true,
+      "defaultGatePolicy": "pin_required",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "dryRun": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    {
+      "id": "interpret_health_output",
+      "name": "AI Health Output Advisor",
+      "description": "Uses Central LLM Service to interpret SFC or network reset logs.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "required": ["commandOutput"],
+        "properties": {
+          "commandOutput": { "type": "string" }
+        }
+      }
+    }
+  ]
+}
