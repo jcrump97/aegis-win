@@ -112,8 +112,11 @@ aegis-win/
 │   └── usage-monitor/          # Modular resource spikes, crash correlator, active window tracker
 ├── src-tauri/
 │   ├── Cargo.toml
+│   ├── Cargo.lock              # Pinned Rust dependency tree (committed for reproducible builds)
+│   ├── build.rs                # tauri-build; embeds app.manifest in place of Tauri's default
 │   ├── tauri.conf.json
-│   ├── app.manifest            # Windows UAC asInvoker manifest
+│   ├── app.manifest            # Windows UAC asInvoker manifest (+ Common Controls v6)
+│   ├── icons/                  # app-icon.svg source + generated icon.ico / PNGs (`npx tauri icon`)
 │   └── src/
 │       └── main.rs             # Rust native bridge, firewall rule helper, UAC self-elevation
 └── tests/

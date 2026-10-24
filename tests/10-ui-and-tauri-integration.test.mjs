@@ -32,3 +32,18 @@ test('Full System Integration: Tauri v2 asInvoker manifest, dynamic UI scaling, 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Tauri Build Scaffold: build.rs embeds the asInvoker manifest, Windows icon exists, and lockfiles are committed', () => {
+  // Without build.rs + icon.ico, `tauri dev` / `tauri build` cannot compile on Windows.
+  const buildRs = fs.readFileSync('src-tauri/build.rs', 'utf8');
+  assert.match(buildRs, /app_manifest\(include_str!\("app\.manifest"\)\)/);
+  assert.ok(fs.statSync('src-tauri/icons/icon.ico').size > 0, 'Missing src-tauri/icons/icon.ico');
+
+  // A custom manifest replaces Tauri's default, so it must keep the Common Controls v6 dependency.
+  const manifestXml = fs.readFileSync('src-tauri/app.manifest', 'utf8');
+  assert.match(manifestXml, /Microsoft\.Windows\.Common-Controls/);
+
+  // Reproducible builds: pin both the npm and Cargo dependency trees.
+  assert.ok(fs.existsSync('package-lock.json'), 'Missing package-lock.json');
+  assert.ok(fs.existsSync('src-tauri/Cargo.lock'), 'Missing src-tauri/Cargo.lock');
+});
