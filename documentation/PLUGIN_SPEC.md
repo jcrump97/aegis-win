@@ -33,6 +33,7 @@ Plugins are registered at compile time in `src-tauri`. There is no runtime loadi
       "description": "Clears the Windows DNS client resolver cache via ipconfig /flushdns.",
       "requiresAdmin": false,
       "defaultGatePolicy": "pin_required",
+      "readOnly": false,
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -44,7 +45,17 @@ Plugins are registered at compile time in `src-tauri`. There is no runtime loadi
 }
 ```
 
-Every tool MUST declare `requiresAdmin: boolean` and `defaultGatePolicy: "auto" | "pin_required"`. The schema is unchanged by the Rust port.
+Every tool MUST declare `requiresAdmin: boolean`, `defaultGatePolicy: "auto" | "pin_required"`, and `readOnly: boolean` (sent to MCP clients as `readOnlyHint`). A tool that belongs to an optional sub-component also names it in `component`, and fails with `COMPONENT_DISABLED` while that component is off. Unknown fields are rejected.
+
+### 2.1 Naming
+- Plugin ids: lowercase letters, digits and `-`. Tool ids: lowercase letters, digits and `_`. Neither may contain `__`.
+- Internally a tool is `plugin:tool` (gate overrides use this key). Over MCP it is `plugin__tool`, because MCP clients only accept names matching `^[a-zA-Z0-9_-]{1,64}$`; the combined name must fit in 64 characters.
+
+### 2.2 `inputSchema` subset
+`aegis-core::schema` enforces exactly these keywords: `type` (`object`, `string`, `integer`, `number`, `boolean`, `array`), `properties`, `required`, `additionalProperties: false`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `items`, `maxItems`, `default`, `description`. A manifest using any other keyword fails validation at startup, so a schema never looks stricter than what is enforced. Defaults are filled in before the tool runs. Anything the subset cannot express (such as a character allow-list) is validated in the tool itself.
+
+### 2.3 `dryRun`
+A tool that declares a boolean `dryRun` property MUST make `dryRun: true` side-effect free: it describes the commands it would run and their impact, and runs nothing. Dry runs skip the PIN and admin gates.
 
 ## 3. Tool Gate Policy Values
 - `"auto"`: Executes immediately when invoked from the UI or MCP server (ideal for read-only log queries or telemetry snapshots).
