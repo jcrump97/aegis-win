@@ -103,6 +103,8 @@ export interface Endpoint {
   host: string;
   isLan: boolean;
   https: boolean;
+  /** LAN host, but the model runs in Ollama's cloud. */
+  relayed: boolean;
 }
 
 export interface McpStatus {

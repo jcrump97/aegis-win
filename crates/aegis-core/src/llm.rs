@@ -39,6 +39,30 @@ pub struct Endpoint {
     pub host: String,
     pub is_lan: bool,
     pub https: bool,
+    /// The host is on the LAN, but the model runs elsewhere (Ollama cloud
+    /// models), so prompts still leave this network.
+    pub relayed: bool,
+}
+
+impl Endpoint {
+    /// True only when both the host and the model are local.
+    pub fn stays_on_lan(&self) -> bool {
+        self.is_lan && !self.relayed
+    }
+}
+
+/// Ollama serves its cloud models (`glm-4.6:cloud`, `gpt-oss:120b-cloud`) at
+/// the local endpoint and forwards every prompt to ollama.com.
+pub fn model_runs_remotely(model: &str) -> bool {
+    let tag = model.trim().rsplit_once(':').map(|(_, tag)| tag.to_ascii_lowercase()).unwrap_or_default();
+    tag == "cloud" || tag.ends_with("-cloud")
+}
+
+/// Classifies the endpoint together with the model it will run.
+pub fn classify(base_url: &str, model: &str) -> AegisResult<Endpoint> {
+    let mut endpoint = classify_endpoint(base_url)?;
+    endpoint.relayed = endpoint.is_lan && model_runs_remotely(model);
+    Ok(endpoint)
 }
 
 /// Parses an endpoint and decides whether it is on the local network.
@@ -57,7 +81,7 @@ pub fn classify_endpoint(base_url: &str) -> AegisResult<Endpoint> {
         None => return Err(AegisError::invalid("LLM base URL has no host")),
     };
     let https = url.scheme() == "https";
-    Ok(Endpoint { host, is_lan, https })
+    Ok(Endpoint { host, is_lan, https, relayed: false })
 }
 
 pub fn is_lan_ip(ip: IpAddr) -> bool {
@@ -220,14 +244,19 @@ impl LlmHandle {
         if self.config.base_url.trim().is_empty() || self.config.model.trim().is_empty() {
             return Err(AegisError::new(ErrorCode::LlmNotConfigured, "Set an LLM endpoint and model in the LLM tab first."));
         }
-        let endpoint = classify_endpoint(&self.config.base_url)?;
+        let endpoint = classify(&self.config.base_url, &self.config.model)?;
         if !endpoint.is_lan && !endpoint.https {
             return Err(AegisError::invalid("Off-LAN LLM endpoints must use https:// so diagnostics are not sent in clear text."));
         }
-        if !endpoint.is_lan && !self.trusted_off_lan {
+        if !endpoint.stays_on_lan() && !self.trusted_off_lan {
+            let destination = if endpoint.relayed {
+                format!("model '{}', which runs on Ollama's cloud servers outside your LAN", self.config.model.trim())
+            } else {
+                format!("{}, which is outside your LAN", endpoint.host)
+            };
             return Err(AegisError::new(
                 ErrorCode::OffLanTrustRequired,
-                format!("Plugin '{}' needs your permission before it sends diagnostics to {}, which is outside your LAN.", self.plugin_id, endpoint.host),
+                format!("Plugin '{}' needs your permission before it sends diagnostics to {destination}.", self.plugin_id),
             ));
         }
         Ok(endpoint)
@@ -235,7 +264,7 @@ impl LlmHandle {
 
     pub async fn complete(&self, system_prompt: &str, mut payload: Value) -> AegisResult<LlmAnswer> {
         let endpoint = self.preflight()?;
-        let off_lan = !endpoint.is_lan;
+        let off_lan = !endpoint.stays_on_lan();
         if off_lan {
             scrub_value(&mut payload, crate::os::username().as_deref(), crate::os::hostname().as_deref());
         }
@@ -346,6 +375,21 @@ mod tests {
         ] {
             assert!(!classify_endpoint(wan).unwrap().is_lan, "{wan}");
         }
+    }
+
+    #[test]
+    fn ollama_cloud_models_leave_the_lan() {
+        for remote in ["glm-4.6:cloud", "gpt-oss:120b-cloud", "qwen3-coder:480b-cloud", " Kimi-K2.6:CLOUD "] {
+            assert!(model_runs_remotely(remote), "{remote}");
+            let e = classify("http://127.0.0.1:11434/v1", remote).unwrap();
+            assert!(e.is_lan && e.relayed && !e.stays_on_lan(), "{remote}");
+        }
+        for local in ["llama3.2:latest", "mistral:7b-instruct", "cloud-tools:latest", "mycloud", "qwen3:14b"] {
+            assert!(!model_runs_remotely(local), "{local}");
+            assert!(classify("http://127.0.0.1:11434/v1", local).unwrap().stays_on_lan(), "{local}");
+        }
+        // A remote host is off-LAN whatever the model; "relayed" only qualifies a LAN host.
+        assert!(!classify("https://api.openai.com/v1", "gpt-oss:120b-cloud").unwrap().relayed);
     }
 
     #[test]

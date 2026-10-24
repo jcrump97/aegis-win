@@ -14,7 +14,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::error::{AegisError, AegisResult, ErrorCode};
-use crate::llm::{classify_endpoint, Endpoint, LlmHandle};
+use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::registry::{self, Gate, GatePolicy, Plugin, Registry, ToolContext, ToolManifest};
 use crate::schema;
@@ -415,7 +415,7 @@ impl Engine {
     pub async fn settings(&self) -> AegisResult<SettingsView> {
         let status = self.mcp_status().await;
         self.with_state(|s| {
-            let (endpoint, endpoint_error) = match classify_endpoint(&s.llm.base_url) {
+            let (endpoint, endpoint_error) = match classify(&s.llm.base_url, &s.llm.model) {
                 Ok(e) => (Some(e), None),
                 Err(e) => (None, Some(e.message)),
             };
@@ -448,16 +448,13 @@ impl Engine {
                 }
                 s.ui_scale = scale;
             }
+            let destination = |llm: &crate::llm::LlmConfig| classify(&llm.base_url, &llm.model).ok().map(|e| (e.host, e.relayed));
+            let before_destination = destination(&s.llm);
             if let Some(url) = &update.llm_base_url {
                 let url = url.trim();
                 let new = classify_endpoint(url)?;
                 if !new.is_lan && !new.https {
                     return Err(AegisError::invalid("Off-LAN LLM endpoints must use https://."));
-                }
-                // Trust is granted for a destination; a different host needs a new grant.
-                let old_host = classify_endpoint(&s.llm.base_url).ok().map(|e| e.host);
-                if old_host.as_deref() != Some(new.host.as_str()) {
-                    s.trusted_external_llm_plugins.clear();
                 }
                 s.llm.base_url = url.to_owned();
             }
@@ -467,6 +464,11 @@ impl Engine {
                     return Err(AegisError::invalid("Model name must be 1-200 characters."));
                 }
                 s.llm.model = model.to_owned();
+            }
+            // Trust is granted for a destination: a different host, or moving
+            // between a local and an Ollama cloud model, needs a new grant.
+            if destination(&s.llm) != before_destination {
+                s.trusted_external_llm_plugins.clear();
             }
             let before = (s.mcp.host.clone(), s.mcp.port, s.mcp.open_firewall);
             if let Some(host) = &update.mcp_host {
@@ -513,7 +515,7 @@ impl Engine {
 
     pub async fn test_llm(&self) -> AegisResult<LlmTest> {
         let config = self.with_state(|s| s.llm.clone())?;
-        let endpoint = classify_endpoint(&config.base_url)?;
+        let endpoint = classify(&config.base_url, &config.model)?;
         let models = crate::llm::list_models(&self.http, &config).await?;
         Ok(LlmTest { endpoint, models })
     }

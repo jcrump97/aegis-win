@@ -708,6 +708,7 @@ function llmTab(): HTMLElement {
     replace(
       classification,
       s.endpointError ? h('span', { class: 'badge danger' }, s.endpointError)
+      : s.endpoint?.relayed ? h('span', { class: 'badge warn' }, `${s.model} runs in Ollama's cloud: data leaves this PC, so each plugin needs your permission`)
       : s.endpoint?.isLan ? h('span', { class: 'badge ok' }, `${s.endpoint.host} is on your LAN: data stays local`)
       : s.endpoint ? h('span', { class: 'badge warn' }, `${s.endpoint.host} is off-LAN: each plugin needs your permission`)
       : null,

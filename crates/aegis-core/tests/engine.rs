@@ -245,3 +245,18 @@ async fn rotating_the_token_invalidates_the_old_one() {
     assert!(!f.engine.mcp_token_matches(&old));
     assert!(!f.engine.mcp_token_matches(""));
 }
+
+#[tokio::test]
+async fn trust_is_reset_when_the_llm_destination_changes() {
+    let f = ready().await;
+    let trusted = |f: &common::Fixture| f.engine.plugins().unwrap().iter().find(|p| p.id == "demo").unwrap().trusted_off_lan;
+    f.engine.grant_llm_trust("demo", PIN.into()).await.unwrap();
+    assert!(trusted(&f));
+    // Another local model keeps the same destination.
+    f.engine.update_settings(SettingsUpdate { llm_model: Some("mistral:7b-instruct".into()), ..Default::default() }).await.unwrap();
+    assert!(trusted(&f));
+    // An Ollama cloud model at the same local URL sends data to ollama.com.
+    let view = f.engine.update_settings(SettingsUpdate { llm_model: Some("gpt-oss:120b-cloud".into()), ..Default::default() }).await.unwrap();
+    assert!(view.llm.endpoint.as_ref().unwrap().relayed);
+    assert!(!trusted(&f), "moving to a cloud model needs a new grant");
+}

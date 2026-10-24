@@ -28,7 +28,7 @@ impl Default for DemoPlugin {
                 "version": "1.0.0",
                 "description": "Test plugin",
                 "optionalInstallDefault": true,
-                "usesLlm": false,
+                "usesLlm": true,
                 "subComponents": [{ "id": "demo:extra", "name": "Extra", "description": "e" }],
                 "tools": [
                     { "id": "echo", "name": "Echo", "description": "Returns its input.", "requiresAdmin": false,

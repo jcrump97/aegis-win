@@ -357,7 +357,10 @@ fn page(status: StatusCode, body: &str) -> Response {
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    // Not `no-referrer`: under that policy browsers send `Origin: null` on the
+    // form post, which the Origin guard rightly rejects. `same-origin` still
+    // sends nothing to other sites.
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }

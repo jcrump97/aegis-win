@@ -105,10 +105,18 @@ export function schemaForm(schema: JsonSchema, idPrefix: string): SchemaForm {
   };
 }
 
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+/** Shows the core's UTC timestamps in the user's local time. */
+function display(value: unknown): string {
+  const text = String(value);
+  return ISO_UTC.test(text) ? new Date(text).toLocaleString() : text;
+}
+
 function cell(value: unknown): HTMLElement {
   if (value === null || value === undefined) return h('td', {}, '');
   if (typeof value === 'object') return h('td', { class: 'long mono' }, JSON.stringify(value));
-  const text = String(value);
+  const text = display(value);
   return h('td', { class: text.length > 60 ? 'long' : '' }, text);
 }
 
@@ -134,7 +142,7 @@ function table(rows: Record<string, unknown>[]): HTMLElement {
 export function renderValue(value: unknown, depth = 0): HTMLElement {
   if (value === null || value === undefined) return h('span', { class: 'hint' }, 'none');
   if (typeof value !== 'object') {
-    const text = String(value);
+    const text = display(value);
     return text.includes('\n') ? h('pre', {}, text) : h('span', {}, text);
   }
   if (Array.isArray(value)) {

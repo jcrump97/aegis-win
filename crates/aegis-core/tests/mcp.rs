@@ -142,15 +142,18 @@ async fn pin_gated_tools_are_approved_in_the_browser_portal() {
     let csp = page.headers()["content-security-policy"].to_str().unwrap().to_owned();
     assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"));
     assert_eq!(page.headers()["x-frame-options"], "DENY");
+    // Browsers send `Origin: null` on a form post from a `no-referrer` page, and
+    // the guard rejects that, so the page must keep its real origin.
+    assert_eq!(page.headers()["referrer-policy"], "same-origin");
     let html = page.text().await.unwrap();
     assert!(html.contains("Fix &lt;it&gt;"), "tool name is escaped");
     assert!(!html.contains("<script>"), "arguments are escaped");
     let csrf = extract_csrf(&html);
 
-    let form = |csrf: &str, pin: &str, decision: &str| {
+    let post = |origin: &str, csrf: &str, pin: &str, decision: &str| {
         s.http
             .post(&approval_url)
-            .header("origin", &s.base)
+            .header("origin", origin)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(
                 url::form_urlencoded::Serializer::new(String::new())
@@ -158,7 +161,10 @@ async fn pin_gated_tools_are_approved_in_the_browser_portal() {
                     .finish(),
             )
     };
+    let form = |csrf: &str, pin: &str, decision: &str| post(&s.base, csrf, pin, decision);
     assert_eq!(form("0".repeat(32).as_str(), PIN, "approve").send().await.unwrap().status(), 403, "bad CSRF");
+    let null_origin = post("null", &csrf, PIN, "approve").send().await.unwrap();
+    assert_eq!(null_origin.status(), 403, "an opaque origin is still refused");
     assert_eq!(form(&csrf, "000000", "approve").send().await.unwrap().status(), 403, "wrong PIN");
     let approved = form(&csrf, PIN, "approve").send().await.unwrap();
     assert_eq!(approved.status(), 200);
