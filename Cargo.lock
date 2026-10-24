@@ -51,6 +51,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-plugin-windows-health"
+version = "0.1.0"
+dependencies = [
+ "aegis-core",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aegis-win"
 version = "1.0.0"
 dependencies = [
