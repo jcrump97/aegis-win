@@ -78,6 +78,10 @@ dependencies = [
 name = "aegis-win"
 version = "1.0.0"
 dependencies = [
+ "aegis-core",
+ "aegis-plugin-event-logs",
+ "aegis-plugin-usage-monitor",
+ "aegis-plugin-windows-health",
  "serde",
  "serde_json",
  "tauri",

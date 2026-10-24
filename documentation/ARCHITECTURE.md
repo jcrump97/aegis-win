@@ -105,7 +105,7 @@ flowchart LR
     CORE -- "Off-LAN only if plugin trusted;<br/>payload sanitized" --> LLM["LLM endpoint"]
 ```
 
-- The PIN crosses the webview→Rust boundary in exactly one command (`unlock_vault`) and is never stored in JS state. Approval PINs go from the browser portal straight to the Rust HTTP handler.
+- The PIN crosses the webview→Rust boundary only as an argument of the one command that needs it (unlock, a gated run, an approval, a gate or trust change) and is never stored in JS state. Approval PINs from the browser portal go straight to the Rust HTTP handler. See [SECURITY_MODEL §2.1](SECURITY_MODEL.md).
 - The UI receives display data only: no API keys, no bearer tokens, no derived keys.
 
 ## 3. Directory Structure
@@ -119,7 +119,7 @@ aegis-win/
 │                               # MCP server + /approve portal, elevation job bridge
 ├── plugins/<plugin-id>/        # One crate per plugin: Cargo.toml, manifest.json, src/lib.rs, README.md, tests/
 ├── src-tauri/                  # Thin app binary: Tauri commands, wiring, --elevate-tool mode
-├── src/ui/                     # TypeScript UI (invoke-only), Tailwind compiled at build time
+├── src/ui/                     # TypeScript UI (invoke-only), plain DOM, no framework
 ├── documentation/              # Specs, ADRs, audit ledger
 └── tests/                      # JS tests for UI/docs/repo invariants (Rust tests live beside their crates)
 ```

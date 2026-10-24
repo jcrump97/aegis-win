@@ -46,3 +46,14 @@ test('CI Foundation: npm run ci also runs the Rust workspace tests', () => {
   assert.match(cargo, /\[workspace\]/);
   assert.match(cargo, /crates\/aegis-core/);
 });
+
+test('CI Foundation: npm run ci typechecks and builds the UI before the Rust tests', () => {
+  const runner = fs.readFileSync('scripts/ci-runner.mjs', 'utf8');
+  const tsc = runner.indexOf("execSync('npx --no-install tsc -p .'");
+  const vite = runner.indexOf("execSync('npx --no-install vite build");
+  const cargo = runner.indexOf('test --workspace --quiet`');
+  assert.ok(tsc > 0 && vite > tsc && cargo > vite, 'tsc, then vite build (Tauri embeds dist/), then cargo test');
+  const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+  assert.equal(pkg.scripts.typecheck, 'tsc -p .');
+  assert.ok(!pkg.dependencies?.react, 'The UI is plain TypeScript; React was removed');
+});

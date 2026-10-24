@@ -10,16 +10,10 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "title": "AegisWin — Portable Windows Diagnostic & MCP Utility",
-        "width": 1280,
-        "height": 820,
-        "minWidth": 900,
-        "minHeight": 620,
-        "backgroundColor": "#090D16"
-      }
-    ]
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    }
   },
   "bundle": {
     "active": false

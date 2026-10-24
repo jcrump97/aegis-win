@@ -6,7 +6,9 @@
  *  1. Atomic commit message prefix convention: ^(chore|doc|feat|fix|test|refactor|perf|security)\b
  *  2. Documentation folder integrity & audit synchronization
  *  3. Core & Plugin automated test suites via Node built-in test runner (Vite/Vitest compatible)
- *  4. Rust workspace tests (`cargo test --workspace`)
+ *  4. Frontend typecheck (`tsc`) and production build (`vite build`); the
+ *     Tauri crate embeds `dist/` at compile time, so this runs before cargo
+ *  5. Rust workspace tests (`cargo test --workspace`)
  */
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -65,6 +67,17 @@ try {
 } catch (err) {
   console.error('[AegisWin CI] FAIL: Test suite execution failed.');
   process.exit(1);
+}
+
+if (fs.existsSync(path.join(rootDir, 'tsconfig.json'))) {
+  console.log('[AegisWin CI] Typechecking and building the UI...');
+  try {
+    execSync('npx --no-install tsc -p .', { stdio: 'inherit' });
+    execSync('npx --no-install vite build --logLevel warn', { stdio: 'inherit' });
+  } catch (err) {
+    console.error('[AegisWin CI] FAIL: UI typecheck or build failed. Run npm install, then npm run typecheck.');
+    process.exit(1);
+  }
 }
 
 if (fs.existsSync(path.join(rootDir, 'Cargo.toml'))) {
