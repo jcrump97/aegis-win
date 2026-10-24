@@ -49,10 +49,10 @@ npm install
 
 | Command | What it does |
 | :--- | :--- |
-| `npm run ci` | Full test suite (also runs automatically before each commit) |
+| `npm run ci` | Full test suite: Node tests plus `cargo test --workspace` (also runs automatically before each commit) |
 | `npm run dev` | UI only, in a browser at `http://127.0.0.1:1420` |
 | `npm run tauri:dev` | Desktop app with hot reload. The first build takes a few minutes. |
-| `npm run tauri:build` | Portable release exe at `src-tauri/target/release/aegis-win.exe` |
+| `npm run tauri:build` | Portable release exe at `target/release/aegis-win.exe` |
 
 `npm run dev` and `npm run tauri:dev` both use port 1420, so run only one at a time.
 

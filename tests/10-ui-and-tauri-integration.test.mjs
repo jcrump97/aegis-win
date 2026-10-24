@@ -45,5 +45,5 @@ test('Tauri Build Scaffold: build.rs embeds the asInvoker manifest, Windows icon
 
   // Reproducible builds: pin both the npm and Cargo dependency trees.
   assert.ok(fs.existsSync('package-lock.json'), 'Missing package-lock.json');
-  assert.ok(fs.existsSync('src-tauri/Cargo.lock'), 'Missing src-tauri/Cargo.lock');
+  assert.ok(fs.existsSync('Cargo.lock'), 'Missing src-tauri/Cargo.lock');
 });

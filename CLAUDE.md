@@ -3,7 +3,7 @@
 ## Quick Commands
 - **Run full CI pipeline & test suites**: `npm run ci` (or `node scripts/ci-runner.mjs`)
 - **Run unit & plugin tests**: `npm test`
-- **Run Rust tests** (once crates exist): `cargo test --workspace`
+- **Run Rust tests**: `cargo test --workspace` (also part of `npm run ci`)
 - **Start Vite dev server**: `npm run dev` (port 1420, strict)
 - **Run the desktop app in dev mode**: `npm run tauri:dev` (uses port 1420 too, so stop `npm run dev` first)
 - **Build portable Tauri v2 Windows binary**: `npm run tauri:build`

@@ -22,7 +22,7 @@
   - `(perf) ...` — Measured performance improvement
 - **No AI Attribution**: Commit messages and PR descriptions MUST NOT carry AI-tool attribution: no `Co-Authored-By: Claude …` (or other AI) trailers and no "Generated with …" footers. Credit for AI assistance belongs in the README, not in every commit. `.githooks/commit-msg` rejects these trailers.
 - **Signed Commits**: Commits are SSH-signed with the maintainer's key (`commit.gpgsign=true`). Never bypass signing or hooks (`--no-verify`, `--no-gpg-sign`).
-- **Mandatory Test Gate**: Every commit MUST add or update automated tests (`tests/`, `plugins/<id>/tests/`, or a crate's Rust tests) and pass `npm run ci` (`node scripts/ci-runner.mjs`) via the `.githooks/pre-commit` hook. Once the first Rust crate lands, `npm run ci` also runs `cargo test --workspace`.
+- **Mandatory Test Gate**: Every commit MUST add or update automated tests (`tests/`, `plugins/<id>/tests/`, or a crate's Rust tests) and pass `npm run ci` (`node scripts/ci-runner.mjs`) via the `.githooks/pre-commit` hook. `npm run ci` also runs `cargo test --workspace`.
 - **Mandatory Documentation Audit**: Every commit MUST audit and update `documentation/AUDIT_LEDGER.md` (and any impacted spec in `documentation/`) to keep agent knowledge 100% synchronized with the codebase.
 
 ## 3. Repository Map

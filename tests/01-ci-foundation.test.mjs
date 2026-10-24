@@ -38,3 +38,11 @@ test('CI Foundation: commit-msg hook rejects AI attribution trailers and footers
   assert.ok(!pattern.test('(feat) Add Claude-compatible MCP tool listing'), 'Mentioning a product in the subject is allowed');
   assert.ok(!pattern.test('Co-Authored-By: Jane Doe <jane@example.com>'), 'Human co-authors are allowed');
 });
+
+test('CI Foundation: npm run ci also runs the Rust workspace tests', () => {
+  const runner = fs.readFileSync('scripts/ci-runner.mjs', 'utf8');
+  assert.match(runner, /test --workspace/);
+  const cargo = fs.readFileSync('Cargo.toml', 'utf8');
+  assert.match(cargo, /\[workspace\]/);
+  assert.match(cargo, /crates\/aegis-core/);
+});

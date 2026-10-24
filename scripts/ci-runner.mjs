@@ -6,6 +6,7 @@
  *  1. Atomic commit message prefix convention: ^(chore|doc|feat|fix|test|refactor|perf|security)\b
  *  2. Documentation folder integrity & audit synchronization
  *  3. Core & Plugin automated test suites via Node built-in test runner (Vite/Vitest compatible)
+ *  4. Rust workspace tests (`cargo test --workspace`)
  */
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -45,11 +46,40 @@ for (const tf of testFiles) {
   console.log(`  -> ${path.relative(rootDir, tf)}`);
 }
 
+// Git hooks inherit whatever PATH launched git, which often lacks ~/.cargo/bin
+// right after a rustup install, so fall back to the default rustup location.
+function findCargo() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const fallback = path.join(home, '.cargo', 'bin', process.platform === 'win32' ? 'cargo.exe' : 'cargo');
+  try {
+    execSync('cargo --version', { stdio: 'ignore' });
+    return 'cargo';
+  } catch {
+    return fs.existsSync(fallback) ? `"${fallback}"` : null;
+  }
+}
+
 try {
   const cmd = `node --test ${testFiles.map((f) => `"${f}"`).join(' ')}`;
   execSync(cmd, { stdio: 'inherit' });
-  console.log('[AegisWin CI] PASS: All unit, integration, and audit tests succeeded.');
 } catch (err) {
   console.error('[AegisWin CI] FAIL: Test suite execution failed.');
   process.exit(1);
 }
+
+if (fs.existsSync(path.join(rootDir, 'Cargo.toml'))) {
+  const cargo = findCargo();
+  if (!cargo) {
+    console.error('[AegisWin CI] FAIL: Cargo.toml exists but cargo was not found. Install Rust (see README).');
+    process.exit(1);
+  }
+  console.log('[AegisWin CI] Running Rust workspace tests...');
+  try {
+    execSync(`${cargo} test --workspace --quiet`, { stdio: 'inherit' });
+  } catch (err) {
+    console.error('[AegisWin CI] FAIL: Rust tests failed.');
+    process.exit(1);
+  }
+}
+
+console.log('[AegisWin CI] PASS: All unit, integration, and audit tests succeeded.');
