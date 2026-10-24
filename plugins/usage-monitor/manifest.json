@@ -1,0 +1,82 @@
+{
+  "id": "usage-monitor",
+  "name": "Diagnostic Usage & Time-Window Monitor",
+  "version": "1.0.0",
+  "description": "Monitors system/process resource spikes, correlates application crash/hang events, and tracks active foreground window transitions during user-defined diagnostic timeframes.",
+  "optionalInstallDefault": true,
+  "usesLlm": true,
+  "subComponents": [
+    {
+      "id": "usage-monitor:resource-spikes",
+      "name": "System & Per-Process Resource Spikes",
+      "description": "Captures CPU %, RAM working set, Disk I/O, and Network throughput spikes."
+    },
+    {
+      "id": "usage-monitor:crash-correlator",
+      "name": "Application Crash & Hang Event Correlator",
+      "description": "Correlates resource spikes with Event ID 1000/1002 application faults in the same window."
+    },
+    {
+      "id": "usage-monitor:active-window",
+      "name": "Foreground Window & Problem App Tracker",
+      "description": "Logs active foreground process transitions when UI stalls or slowdowns occur."
+    }
+  ],
+  "tools": [
+    {
+      "id": "configure_watch_window",
+      "name": "Configure Diagnostic Watch Window",
+      "description": "Schedules a timeframe and resource threshold watch for problematic applications.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "startTime": { "type": "string", "default": "21:00" },
+          "endTime": { "type": "string", "default": "23:00" },
+          "cpuThresholdPercent": { "type": "number", "default": 85 },
+          "ramThresholdMb": { "type": "number", "default": 2048 },
+          "targetProcesses": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    {
+      "id": "capture_diagnostic_snapshot",
+      "name": "Capture Correlated Diagnostic Clues",
+      "description": "Collects telemetry across enabled sub-components (Resource Spikes, Crash Correlator, Active Window) for the active watch window.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "windowLabel": { "type": "string", "default": "Current Diagnostic Window" }
+        }
+      }
+    },
+    {
+      "id": "analyze_clues_with_llm",
+      "name": "Synthesize Diagnostic Clues with AI",
+      "description": "Sends correlated resource spikes and crash events to the Central LLM Service to pinpoint root causes.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "required": ["snapshot"],
+        "properties": {
+          "snapshot": { "type": "object" }
+        }
+      }
+    },
+    {
+      "id": "purge_telemetry_history",
+      "name": "Purge Rolling Telemetry Database",
+      "description": "Deletes stored diagnostic snapshots from the portable ./data directory.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  ]
+}
