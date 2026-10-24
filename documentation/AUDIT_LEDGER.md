@@ -8,3 +8,4 @@
 | 2 | `(doc)` | Establish guiding principles, agent standards, and system architecture plan | `AGENT.md`, `CLAUDE.md`, `GUIDING_PRINCIPLES.md`, `ARCHITECTURE.md`, `PLUGIN_SPEC.md`, `SECURITY_MODEL.md` | `tests/02-documentation-audit.test.mjs` |
 | 3 | `(feat)` | Implement portable zero-knowledge PIN vault and AES-256-GCM secret store | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/03-vault.test.mjs` |
 | 4 | `(feat)` | Add central LLM service with LAN detection and per-plugin external trust gate | `ARCHITECTURE.md`, `AUDIT_LEDGER.md` | `tests/04-llm-service.test.mjs` |
+| 5 | `(feat)` | Implement compile-time plugin registry, first-run wizard state, and per-tool gate policy engine | `PLUGIN_SPEC.md`, `AUDIT_LEDGER.md` | `tests/05-plugin-registry.test.mjs` |
