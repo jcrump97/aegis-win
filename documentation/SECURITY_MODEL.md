@@ -23,3 +23,6 @@ When the user enables the MCP HTTP server on port `P`:
 ### 3.1 Bind-Aware Firewall Resolution (`asInvoker` Compatibility)
 - **Loopback Default (`127.0.0.1`)**: Bypasses `netsh advfirewall` so standard users never see an `Access is denied` error on startup.
 - **LAN Mode (`0.0.0.0` / RFC1918 IP)**: Checks token elevation and issues `aegis-win.exe --elevate-firewall-port <P>` via UAC if running as a standard user.
+
+## 5. Cross-Integrity Encrypted UAC Job Bridge (`src/core/elevation-bridge.mjs`)
+When a Standard User (`Medium Integrity`) process triggers UAC self-elevation (`High Integrity`), command parameters and stdout payloads are exchanged via ephemeral `AES-256-GCM` authenticated job files in `./data/jobs/<jobId>.{req,res}.enc`. Any tampering between integrity levels invalidates the GCM authentication tag and aborts execution.

@@ -17,3 +17,4 @@
 | 11 | `(security)` | Enforce 3-strike PIN lockout, CSRF token, and Host header validation on MCP approval portal | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/11-mcp-portal-hardening.test.mjs` |
 | 12 | `(feat)` | Make firewall port management bind-aware for standard-user loopback vs LAN elevation | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/12-firewall-bind-awareness.test.mjs` |
 | 13 | `(feat)` | Add async background job runner and progress streaming for long-running approved tools | `ARCHITECTURE.md`, `AUDIT_LEDGER.md` | `tests/13-async-job-runner.test.mjs` |
+| 14 | `(security)` | Implement encrypted cross-integrity IPC job bridge for UAC self-elevation | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/14-elevation-ipc-bridge.test.mjs` |
