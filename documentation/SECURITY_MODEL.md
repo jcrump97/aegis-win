@@ -10,6 +10,13 @@
 - **Vault Encryption**: LLM API keys and MCP Bearer tokens are encrypted at rest inside `./data/vault.enc` using `AES-256-GCM` with authenticated 12-byte IVs and 16-byte auth tags.
 - **PIN Non-Exposure Invariant**: No API, MCP response, or log file ever contains the plaintext PIN or its derived key.
 
+### 2.1 Rust Core Requirements ([ADR 0001](adr/0001-rust-core.md))
+- **Algorithms**: Argon2id (`argon2` crate) for new vaults, AES-256-GCM (`aes-gcm`), `OsRng` for every salt, nonce, ticket ID, and CSRF token. No hand-rolled cryptography.
+- **Secret memory**: the PIN, derived key, and decrypted secrets are held in `zeroize`-on-drop types inside the Rust process and wiped when the vault locks. Comparisons of verifiers and tokens use constant-time equality (`subtle`).
+- **Webview boundary**: the webview is untrusted for secrets. It sends the startup PIN to exactly one Tauri command (`unlock_vault`), keeps no copy, and never receives API keys, bearer tokens, or derived keys back. Secret-bearing types do not implement `Serialize` or `Debug`, so they cannot leak into an `invoke` response or a log line by accident.
+- **No demo credentials**: no build may ship a default or hardcoded PIN. A vault that doesn't exist yet means first-run PIN setup.
+- **Process execution**: system binaries are launched by absolute path with argument vectors only. No shell, no `PATH` lookup, no string-built command lines (see [PLUGIN_SPEC §4](PLUGIN_SPEC.md)).
+
 ## 3. Automatic Firewall & Port Lifecycle
 When the user enables the MCP HTTP server on port `P`:
 - AegisWin binds to the configured interface and invokes `netsh advfirewall firewall add rule name="AegisWin_MCP_<P>" dir=in action=allow protocol=TCP localport=<P> profile=private` (or queues UAC elevation if required).

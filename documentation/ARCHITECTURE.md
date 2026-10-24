@@ -2,7 +2,9 @@
 
 ## 1. High-Level System Overview
 
-**AegisWin** is a portable Windows utility built on **Tauri v2 (Rust)** and **Vite (React/TypeScript/ES Modules)** with a compile-time modular plugin architecture, a central OpenAI-compatible LLM diagnostic service, and an authenticated HTTP MCP server with PIN-gated human approval.
+**AegisWin** is a portable Windows utility built on **Tauri v2**. All core logic lives in the **Rust backend**: vault, plugin registry and gate policy engine, LLM service, MCP server, and the plugins themselves. A **Vite + TypeScript** webview UI is a presentation layer only. It has a compile-time modular plugin architecture, a central OpenAI-compatible LLM diagnostic service, and an authenticated HTTP MCP server with PIN-gated human approval.
+
+> **Migration status**: the core is being ported from a Node.js prototype (`src/core/*.mjs`, `plugins/*/index.mjs`) to Rust, one module per PR. See [ADR 0001](adr/0001-rust-core.md) for the decision, the target layout, and the port order. The diagrams below describe the target design. Until a module is ported, its JS prototype and tests are the behavioral spec.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -83,7 +85,46 @@ flowchart TD
     I --> E
 ```
 
+### 2.3 Asynchronous Job Streaming for Long-Running Tools (`sfc /scannow`)
+When a slow administrative command is approved on `/approve/:ticketId` with `asyncExecution: true`, the HTTP handler transitions the ticket to `status: "running"` (`progressPercent: 15..100`) and spawns a non-blocking worker so the browser tab never hangs and the MCP agent can poll `mcp:check_ticket` for completion.
+
+### 2.4 Process & Trust Layout (Target)
+
+```mermaid
+flowchart LR
+    subgraph EXE["aegis-win.exe (single portable binary, asInvoker)"]
+        UI["WebView2 UI<br/>(Vite + TypeScript)<br/>no secrets held"]
+        CMD["Tauri commands<br/>(src-tauri)"]
+        CORE["aegis-core (Rust)<br/>vault · registry · gate engine<br/>LLM service · MCP server"]
+        PLG["Plugin crates<br/>(plugins/*)"]
+        UI -- "invoke()" --> CMD --> CORE --> PLG
+    end
+    PLG -- "Win32 via windows crate /<br/>absolute-path binaries, argv only" --> OS[(Windows)]
+    AGENT["MCP client agent"] -- "POST /mcp (Bearer)" --> CORE
+    BROWSER["User's browser<br/>/approve/:ticketId"] -- "PIN + decision" --> CORE
+    CORE -- "Off-LAN only if plugin trusted;<br/>payload sanitized" --> LLM["LLM endpoint"]
+```
+
+- The PIN crosses the webview→Rust boundary in exactly one command (`unlock_vault`) and is never stored in JS state. Approval PINs go from the browser portal straight to the Rust HTTP handler.
+- The UI receives display data only: no API keys, no bearer tokens, no derived keys.
+
 ## 3. Directory Structure
+
+### 3.1 Target (Rust core, per ADR 0001)
+```
+aegis-win/
+├── Cargo.toml                  # Workspace: src-tauri, crates/*, plugins/*
+├── crates/
+│   └── aegis-core/             # vault, PIN KDF, registry + gate policy, LLM service + sanitizer,
+│                               # MCP server + /approve portal, elevation job bridge
+├── plugins/<plugin-id>/        # One crate per plugin: Cargo.toml, manifest.json, src/lib.rs, README.md, tests/
+├── src-tauri/                  # Thin app binary: Tauri commands, wiring, --elevate-tool mode
+├── src/ui/                     # TypeScript UI (invoke-only), Tailwind compiled at build time
+├── documentation/              # Specs, ADRs, audit ledger
+└── tests/                      # JS tests for UI/docs/repo invariants (Rust tests live beside their crates)
+```
+
+### 3.2 Current (Node.js prototype being ported)
 ```
 aegis-win/
 ├── AGENT.md
@@ -122,6 +163,3 @@ aegis-win/
 └── tests/
     └── *.test.mjs              # Core & architectural verification test suites
 ```
-
-### 2.3 Asynchronous Job Streaming for Long-Running Tools (`sfc /scannow`)
-When a slow administrative command is approved on `/approve/:ticketId` with `asyncExecution: true`, the HTTP handler transitions the ticket to `status: "running"` (`progressPercent: 15..100`) and spawns a non-blocking worker so the browser tab never hangs and the MCP agent can poll `mcp:check_ticket` for completion.

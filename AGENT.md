@@ -18,13 +18,18 @@
   - `(chore) ...` — Build, CI, or tooling configuration
   - `(test) ...` — Test suite expansion
   - `(refactor) ...` — Efficiency improvement with zero behavior change
-- **Mandatory Test Gate**: Every commit MUST add or update automated tests in `tests/` or `plugins/<id>/tests/` and pass `npm run ci` (`node scripts/ci-runner.mjs`) via the `.githooks/pre-commit` hook.
+  - `(security) ...` — Hardening or a fix to a security invariant
+  - `(perf) ...` — Measured performance improvement
+- **No AI Attribution**: Commit messages and PR descriptions MUST NOT carry AI-tool attribution: no `Co-Authored-By: Claude …` (or other AI) trailers and no "Generated with …" footers. Credit for AI assistance belongs in the README, not in every commit. `.githooks/commit-msg` rejects these trailers.
+- **Signed Commits**: Commits are SSH-signed with the maintainer's key (`commit.gpgsign=true`). Never bypass signing or hooks (`--no-verify`, `--no-gpg-sign`).
+- **Mandatory Test Gate**: Every commit MUST add or update automated tests (`tests/`, `plugins/<id>/tests/`, or a crate's Rust tests) and pass `npm run ci` (`node scripts/ci-runner.mjs`) via the `.githooks/pre-commit` hook. Once the first Rust crate lands, `npm run ci` also runs `cargo test --workspace`.
 - **Mandatory Documentation Audit**: Every commit MUST audit and update `documentation/AUDIT_LEDGER.md` (and any impacted spec in `documentation/`) to keep agent knowledge 100% synchronized with the codebase.
 
 ## 3. Repository Map
 - `AGENT.md` & `CLAUDE.md` — Agent operating instructions and workflow shortcuts.
-- `documentation/` — Critical architectural specs, diagrams, security invariants, plugin contracts, and the live commit audit ledger.
-- `src/core/` — Portable encrypted vault, zero-knowledge PIN verifier, Central LLM Service (with LAN/Off-LAN detector), Plugin Registry, and MCP HTTP Server + Approval Web Portal.
-- `src/ui/` — High-contrast dark-mode UI (`WCAG AAA`), dynamic UI scaling engine (`80%`–`150%`), First-Run Component Wizard, Plugin Views, and Live MCP Approval Queue.
-- `plugins/` — Self-contained modular plugins (`event-logs`, `windows-health`, `usage-monitor`), each with its own `manifest.json`, implementation, `tests/`, and `README.md`.
-- `src-tauri/` — Tauri v2 Rust backend, `Cargo.toml`, `tauri.conf.json`, and Windows `app.manifest` (`asInvoker`).
+- `documentation/` — Critical architectural specs, diagrams, security invariants, plugin contracts, decision records (`adr/`), and the live commit audit ledger.
+- `crates/aegis-core/` *(target)* — Rust core: portable encrypted vault, zero-knowledge PIN verifier, Central LLM Service (with LAN/Off-LAN detector), Plugin Registry, and MCP HTTP Server + Approval Web Portal.
+- `src/core/` *(legacy)* — Node.js prototype of the same core. It is the behavioral spec until each module is ported to Rust, then deleted ([ADR 0001](documentation/adr/0001-rust-core.md)).
+- `src/ui/` — High-contrast dark-mode UI (`WCAG AAA`), dynamic UI scaling engine (`80%`–`150%`), First-Run Component Wizard, Plugin Views, and Live MCP Approval Queue. Talks to the core only through Tauri `invoke`.
+- `plugins/` — Self-contained modular plugins (`event-logs`, `windows-health`, `usage-monitor`). Each is becoming a Rust crate with its own `manifest.json`, `src/lib.rs`, `tests/`, and `README.md` (see `documentation/PLUGIN_SPEC.md`).
+- `src-tauri/` — Tauri v2 app binary (thin command layer and wiring), `build.rs`, `tauri.conf.json`, and Windows `app.manifest` (`asInvoker`).
