@@ -217,6 +217,17 @@ pub fn relaunch_elevated() -> io::Result<()> {
     })
 }
 
+/// The private IPv4 address this PC uses to reach other networks, if any.
+/// `connect` on a UDP socket only picks a route; no packet is sent.
+pub fn primary_lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_private() => Some(ip),
+        _ => None,
+    }
+}
+
 pub mod eventlog {
     //! Read-only access to Windows event channels through `wevtapi`.
 
@@ -336,7 +347,7 @@ pub mod eventlog {
         let limit = q.limit.clamp(1, 500);
 
         let results = unsafe {
-            EvtQuery(None, &HSTRING::from(*channel), &HSTRING::from(xpath), (EvtQueryChannelPath.0 | EvtQueryReverseDirection.0) as u32)
+            EvtQuery(None, &HSTRING::from(*channel), &HSTRING::from(xpath), EvtQueryChannelPath.0 | EvtQueryReverseDirection.0)
         }
         .map_err(|e| {
             let code = (e.code().0 as u32) & 0xFFFF;
@@ -350,7 +361,7 @@ pub mod eventlog {
         })?;
         let results = Handle(results);
         let context = Handle(
-            unsafe { EvtCreateRenderContext(None, EvtRenderContextSystem.0 as u32) }.map_err(|e| EventLogError::Failed(e.message()))?,
+            unsafe { EvtCreateRenderContext(None, EvtRenderContextSystem.0) }.map_err(|e| EventLogError::Failed(e.message()))?,
         );
         let mut publishers: HashMap<String, Option<Handle>> = HashMap::new();
         let mut records = Vec::new();

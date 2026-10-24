@@ -27,6 +27,8 @@ tokio.workspace = true
 # needs CMake and NASM to build on Windows.
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json"] }
 url = "2"
+# MCP server and approval portal (HTTP/1.1 only, no TLS: loopback or private LAN).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

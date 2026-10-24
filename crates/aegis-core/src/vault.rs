@@ -183,25 +183,70 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
 
     /// Checks a PIN against the open vault in constant time (used for approvals).
     pub fn verify_pin(&self, pin: &str) -> bool {
-        match derive_key(pin, &self.salt, &self.params) {
-            Ok(candidate) => bool::from(candidate.as_ref().ct_eq(self.key.as_ref())),
-            Err(_) => false,
-        }
+        self.verifier().verify(pin)
+    }
+
+    /// A detached copy of what is needed to check a PIN, so the slow Argon2
+    /// derivation can run without holding the lock on the vault.
+    pub fn verifier(&self) -> PinVerifier {
+        PinVerifier { params: self.params, salt: self.salt, key: self.key.clone() }
     }
 
     pub fn change_pin(&mut self, current: &str, new_pin: &str) -> Result<(), VaultError> {
         if !self.verify_pin(current) {
             return Err(VaultError::WrongPin);
         }
-        validate_new_pin(new_pin)?;
-        let salt = random_bytes::<SALT_LEN>();
-        self.key = derive_key(new_pin, &salt, &self.params)?;
-        self.salt = salt;
-        self.save()
+        let key = NewKey::derive(new_pin, self.params)?;
+        self.install_key(key)
+    }
+
+    pub fn params(&self) -> KdfParams {
+        self.params
+    }
+
+    /// Switches to a key derived with [`NewKey::derive`] and re-encrypts.
+    pub fn install_key(&mut self, new: NewKey) -> Result<(), VaultError> {
+        let (old_salt, old_key) = (self.salt, self.key.clone());
+        self.salt = new.salt;
+        self.key = new.key;
+        self.save().inspect_err(|_| {
+            self.salt = old_salt;
+            self.key = old_key;
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// A key for a new PIN, derived away from the vault lock (Argon2 is slow).
+pub struct NewKey {
+    salt: [u8; SALT_LEN],
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl NewKey {
+    pub fn derive(new_pin: &str, params: KdfParams) -> Result<Self, VaultError> {
+        validate_new_pin(new_pin)?;
+        let salt = random_bytes::<SALT_LEN>();
+        let key = derive_key(new_pin, &salt, &params)?;
+        Ok(Self { salt, key })
+    }
+}
+
+pub struct PinVerifier {
+    params: KdfParams,
+    salt: [u8; SALT_LEN],
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl PinVerifier {
+    pub fn verify(&self, pin: &str) -> bool {
+        match derive_key(pin, &self.salt, &self.params) {
+            Ok(candidate) => bool::from(candidate.as_ref().ct_eq(self.key.as_ref())),
+            Err(_) => false,
+        }
     }
 }
 
