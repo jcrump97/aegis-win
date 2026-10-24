@@ -329,6 +329,14 @@ fn valid_ticket_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Shows a core RFC 3339 timestamp in this PC's local time zone (the page runs
+/// no script, so the browser cannot convert it).
+fn local_time(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.with_timezone(&chrono::Local).format("%a %-d %b %Y, %-I:%M:%S %p").to_string())
+        .unwrap_or_else(|_| rfc3339.to_owned())
+}
+
 pub fn escape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -389,7 +397,7 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
         escape_html(&ticket.tool_name),
         escape_html(&ticket.plugin_id),
         escape_html(&ticket.tool_description),
-        escape_html(&ticket.created_at),
+        escape_html(&local_time(&ticket.created_at)),
         escape_html(&status_label(ticket.status)),
         escape_html(&args),
     ));
@@ -519,6 +527,16 @@ mod tests {
     fn negotiates_protocol_versions() {
         assert_eq!(initialize(&json!({ "protocolVersion": "2025-03-26" }))["protocolVersion"], "2025-03-26");
         assert_eq!(initialize(&json!({ "protocolVersion": "1999-01-01" }))["protocolVersion"], PROTOCOL_VERSIONS[0]);
+    }
+
+    #[test]
+    fn approval_page_shows_local_time() {
+        let utc = "2026-10-24T19:14:05Z";
+        let expected = chrono::DateTime::parse_from_rfc3339(utc).unwrap().with_timezone(&chrono::Local);
+        let shown = local_time(utc);
+        assert!(shown.contains(&expected.format("%-I:%M:%S").to_string()), "{shown}");
+        assert!(!shown.contains(utc), "{shown}");
+        assert_eq!(local_time("not a time"), "not a time");
     }
 
     #[test]

@@ -401,7 +401,7 @@ function toolBadges(tool: ToolView): HTMLElement {
   return h(
     'div',
     { class: 'badges' },
-    tool.readOnly ? h('span', { class: 'badge ok' }, 'read-only') : h('span', { class: 'badge warn' }, 'changes the system'),
+    tool.readOnly ? h('span', { class: 'badge ok' }, 'read-only') : h('span', { class: 'badge warn' }, 'makes changes'),
     tool.requiresAdmin ? h('span', { class: 'badge danger' }, 'administrator') : null,
     tool.effectivePolicy === 'pin_required' ? h('span', { class: 'badge accent' }, 'PIN') : null,
     !tool.available ? h('span', { class: 'badge' }, 'component off') : null,
@@ -567,7 +567,7 @@ function ticketCard(t: TicketView): HTMLElement {
 // ---- MCP --------------------------------------------------------------------
 
 function mcpTab(): HTMLElement {
-  const container = h('div', { class: 'stack' }, h('h2', {}, 'MCP server'), h('p', { class: 'hint' }, 'Lets AI agents such as Claude call AegisWin tools over the Model Context Protocol. Read-only tools run right away; anything that changes the system waits for your PIN.'));
+  const container = h('div', { class: 'stack' }, h('h2', {}, 'MCP server'), h('p', { class: 'hint' }, 'Lets AI agents such as Claude call AegisWin tools over the Model Context Protocol. Tools set to “needs my PIN” wait until you approve them in the browser or on the Approvals tab; the rest run right away. Repairs need your PIN by default.'));
   if (!settings) return container;
   const mcp = settings.mcp;
 
@@ -668,7 +668,7 @@ function gatesCard(): HTMLElement {
           const policy = select.value as 'auto' | 'pin_required';
           let pin: string | null = null;
           if (policy === 'auto' && t.effectivePolicy === 'pin_required') {
-            pin = await askPin(`Let agents run "${t.name}" without asking?`, t.readOnly ? 'This tool only reads information.' : 'This tool changes the system. Agents will be able to run it without your approval.', 'Allow');
+            pin = await askPin(`Let agents run "${t.name}" without asking?`, t.readOnly ? 'This tool only reads information.' : 'This tool makes changes. Agents will be able to run it without your approval.', 'Allow');
             if (pin === null) {
               select.value = t.effectivePolicy;
               return;
@@ -683,7 +683,7 @@ function gatesCard(): HTMLElement {
             await handleError(e);
           }
         });
-        return h('tr', {}, h('td', {}, t.name, h('div', { class: 'hint mono' }, t.mcpName)), h('td', {}, t.readOnly ? 'read-only' : 'changes the system', t.requiresAdmin ? ', administrator' : ''), h('td', {}, select));
+        return h('tr', {}, h('td', {}, t.name, h('div', { class: 'hint mono' }, t.mcpName)), h('td', {}, t.readOnly ? 'read-only' : 'makes changes', t.requiresAdmin ? ', administrator' : ''), h('td', {}, select));
       }),
     );
   return h(
@@ -732,8 +732,12 @@ function llmTab(): HTMLElement {
   test.addEventListener('click', async () => {
     try {
       const out = await busy(test, () => api.testLlm());
+      // Ollama lists "name:latest" for a model saved as plain "name".
+      const saved = settings!.llm.model;
+      const installed = out.models.some((m) => m === saved || m === `${saved}:latest` || `${m}:latest` === saved);
       replace(
         models,
+        out.models.length && !installed ? h('div', { class: 'badge warn' }, `The saved model "${saved}" is not on this server. Pick one below, then Save.`) : null,
         out.models.length ? h('span', { class: 'hint' }, 'Models (click to use):') : h('span', { class: 'hint' }, 'Connected, but the server listed no models.'),
         ...out.models.map((m) => h('button', { class: 'badge accent', onclick: () => (model.value = m) }, m)),
       );

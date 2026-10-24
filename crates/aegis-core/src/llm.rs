@@ -290,10 +290,15 @@ impl LlmHandle {
         }
         let response = request.send().await.map_err(|e| llm_failed(&endpoint, &e.to_string()))?;
         let status = response.status();
-        let value: Value = response.json().await.map_err(|e| llm_failed(&endpoint, &format!("HTTP {status}: {e}")))?;
+        let raw = response.text().await.map_err(|e| llm_failed(&endpoint, &format!("HTTP {status}: {e}")))?;
+        let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         if !status.is_success() {
-            let detail = value.pointer("/error/message").and_then(Value::as_str).unwrap_or("request rejected");
-            return Err(llm_failed(&endpoint, &format!("HTTP {status}: {}", truncate(detail, 300))));
+            let detail = value
+                .pointer("/error/message")
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("request rejected");
+            return Err(self.rejected(&endpoint, status, detail));
         }
         let text = value
             .pointer("/choices/0/message/content")
@@ -306,6 +311,24 @@ impl LlmHandle {
             off_lan,
             scrubbed: off_lan,
         })
+    }
+}
+
+impl LlmHandle {
+    /// Turns a rejected request into advice: a missing model and a wrong base
+    /// URL are the usual first-run problems.
+    fn rejected(&self, endpoint: &Endpoint, status: reqwest::StatusCode, detail: &str) -> AegisError {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            let model = &self.config.model;
+            if detail.to_ascii_lowercase().contains("model") {
+                return llm_failed(
+                    endpoint,
+                    &format!("the model '{model}' isn't installed there. On the LLM tab, click Test connection and pick a listed model, or install it (Ollama: ollama pull {model})."),
+                );
+            }
+            return llm_failed(endpoint, "nothing answered at this base URL (HTTP 404). Check it on the LLM tab; Ollama's is http://127.0.0.1:11434/v1.");
+        }
+        llm_failed(endpoint, &format!("HTTP {status}: {}", truncate(detail, 300)))
     }
 }
 
@@ -428,6 +451,22 @@ mod tests {
         assert!(handle("https://api.example.com/v1", true).preflight().is_ok());
         assert_eq!(handle("http://api.example.com/v1", true).preflight().unwrap_err().code, ErrorCode::InvalidArguments);
         assert!(handle("http://127.0.0.1:11434/v1", false).preflight().is_ok());
+    }
+
+    #[tokio::test]
+    async fn explains_a_missing_model_and_a_wrong_url() {
+        let ollama = json!({ "error": { "message": "model \"m\" not found, try pulling it first" } }).to_string();
+        let (base, _) = crate::testing::mock_http("404 Not Found", ollama).await;
+        let err = handle(&base, false).complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("model 'm' isn't installed") && err.message.contains("ollama pull m"), "{}", err.message);
+
+        let (base, _) = crate::testing::mock_http("404 Not Found", "404 page not found".into()).await;
+        let err = handle(&base, false).complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("Check it on the LLM tab"), "{}", err.message);
+
+        let (base, _) = crate::testing::mock_http("500 Internal Server Error", json!({ "error": "out of memory" }).to_string()).await;
+        let err = handle(&base, false).complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("HTTP 500 Internal Server Error: out of memory"), "{}", err.message);
     }
 
     #[tokio::test]

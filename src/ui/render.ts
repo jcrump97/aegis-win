@@ -2,6 +2,7 @@
 
 import type { JsonSchema } from './api';
 import { h } from './dom';
+import { type Inline, parseMarkdown } from './markdown';
 
 export interface SchemaForm {
   element: HTMLElement;
@@ -113,6 +114,30 @@ function display(value: unknown): string {
   return ISO_UTC.test(text) ? new Date(text).toLocaleString() : text;
 }
 
+function inlineNodes(inlines: Inline[]): Array<Node | string> {
+  return inlines.map((i) => (i.kind === 'text' ? i.text : h(i.kind, {}, i.text)));
+}
+
+/** Renders an LLM answer's Markdown with text nodes only. */
+function markdown(text: string): HTMLElement {
+  return h(
+    'div',
+    { class: 'answer' },
+    ...parseMarkdown(text).map((b) => {
+      switch (b.kind) {
+        case 'heading':
+          return h(b.level <= 2 ? 'h4' : 'h5', {}, ...inlineNodes(b.inlines));
+        case 'paragraph':
+          return h('p', {}, ...inlineNodes(b.inlines));
+        case 'list':
+          return h(b.ordered ? 'ol' : 'ul', {}, ...b.items.map((item) => h('li', {}, ...inlineNodes(item))));
+        case 'code':
+          return h('pre', {}, b.text);
+      }
+    }),
+  );
+}
+
 function cell(value: unknown): HTMLElement {
   if (value === null || value === undefined) return h('td', {}, '');
   if (typeof value === 'object') return h('td', { class: 'long mono' }, JSON.stringify(value));
@@ -157,7 +182,7 @@ export function renderValue(value: unknown, depth = 0): HTMLElement {
     return h(
       'div',
       {},
-      h('div', { class: 'answer' }, answer.text),
+      markdown(answer.text),
       h(
         'p',
         { class: 'hint' },

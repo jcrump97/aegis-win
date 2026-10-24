@@ -56,3 +56,24 @@ test('Tauri Build Scaffold: build.rs embeds the asInvoker manifest, Windows icon
   assert.ok(fs.existsSync('package-lock.json'), 'Missing package-lock.json');
   assert.ok(fs.existsSync('Cargo.lock'), 'Missing Cargo.lock');
 });
+
+test('UI: LLM answers parse a safe Markdown subset into plain data', async () => {
+  // Compile the TypeScript module with esbuild (already installed with Vite) so this runs on any Node version.
+  const { transformSync } = await import('esbuild');
+  const { code } = transformSync(fs.readFileSync('src/ui/markdown.ts', 'utf8'), { loader: 'ts', format: 'esm' });
+  const { parseMarkdown } = await import(`data:text/javascript,${encodeURIComponent(code)}`);
+
+  const blocks = parseMarkdown('## Cause\nThe **disk** is full.\n\n1. Run `cleanmgr`\n2. Restart\n\n- *one*\n  continued\n\n```\n<script>x</script>\n```');
+  assert.deepEqual(blocks, [
+    { kind: 'heading', level: 2, inlines: [{ kind: 'text', text: 'Cause' }] },
+    { kind: 'paragraph', inlines: [{ kind: 'text', text: 'The ' }, { kind: 'strong', text: 'disk' }, { kind: 'text', text: ' is full.' }] },
+    { kind: 'list', ordered: true, items: [[{ kind: 'text', text: 'Run ' }, { kind: 'code', text: 'cleanmgr' }], [{ kind: 'text', text: 'Restart' }]] },
+    { kind: 'list', ordered: false, items: [[{ kind: 'em', text: 'one' }, { kind: 'text', text: ' continued' }]] },
+    { kind: 'code', text: '<script>x</script>' },
+  ]);
+  // Arithmetic and stray asterisks stay literal text.
+  assert.deepEqual(parseMarkdown('5 * 3 * 2'), [{ kind: 'paragraph', inlines: [{ kind: 'text', text: '5 * 3 * 2' }] }]);
+  // The renderer must build elements, never parse HTML.
+  const render = fs.readFileSync('src/ui/render.ts', 'utf8');
+  assert.match(render, /markdown\(answer\.text\)/, 'LLM answers go through the Markdown renderer');
+});

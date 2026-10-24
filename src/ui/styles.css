@@ -145,7 +145,15 @@ td.long { max-width: 520px; white-space: pre-wrap; word-break: break-word; }
 dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0.3rem 0; }
 dl.kv dt { color: var(--muted); }
 dl.kv dd { margin: 0; word-break: break-word; }
-.answer { white-space: pre-wrap; line-height: 1.55; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; }
+.answer { line-height: 1.55; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; }
+.answer > * { margin: 0 0 0.6rem; }
+.answer > :last-child { margin-bottom: 0; }
+.answer p { white-space: pre-wrap; }
+.answer h4 { font-size: 1.05rem; margin-top: 0.4rem; }
+.answer h5 { font-size: 0.95rem; margin-top: 0.4rem; }
+.answer ul, .answer ol { padding-left: 1.4rem; }
+.answer li + li { margin-top: 0.25rem; }
+.answer code { font-family: Consolas, 'Cascadia Mono', monospace; font-size: 0.9em; background: var(--raised); padding: 0 0.25em; border-radius: 4px; }
 details > summary { cursor: pointer; color: var(--muted); margin-top: 0.4rem; }
 
 /* Dialog */

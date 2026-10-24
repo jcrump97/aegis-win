@@ -8,9 +8,15 @@ use crate::llm::{http_client, LlmConfig, LlmHandle};
 /// Starts a one-shot OpenAI-compatible server on loopback that answers
 /// `/chat/completions` with `answer`. The join handle yields the raw request.
 pub async fn mock_llm(answer: &str) -> (String, JoinHandle<String>) {
+    let body = serde_json::json!({ "choices": [{ "message": { "content": answer } }] }).to_string();
+    mock_http("200 OK", body).await
+}
+
+/// Starts a one-shot HTTP server on loopback (base URL ends in `/v1`) that
+/// answers any request with `status` and `body`.
+pub async fn mock_http(status: &'static str, body: String) -> (String, JoinHandle<String>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
-    let body = serde_json::json!({ "choices": [{ "message": { "content": answer } }] }).to_string();
     let handle = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 65536];
@@ -33,7 +39,7 @@ pub async fn mock_llm(answer: &str) -> (String, JoinHandle<String>) {
             }
         }
         let resp = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         );
         sock.write_all(resp.as_bytes()).await.unwrap();
