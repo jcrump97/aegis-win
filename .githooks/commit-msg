@@ -7,3 +7,10 @@ if ! echo "$FIRST_LINE" | grep -Eq '^\((feat|fix|doc|chore|test|refactor|securit
   echo "Actual: $FIRST_LINE"
   exit 1
 fi
+
+# No AI-tool attribution trailers or footers in commit messages (AGENT.md section 2)
+ATTRIBUTION_PATTERN='^co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|generated with \[?(claude|copilot|gemini|chatgpt)'
+if grep -v '^#' "$COMMIT_MSG_FILE" | grep -Eiq "$ATTRIBUTION_PATTERN"; then
+  echo "[Git Hook Error] Remove AI attribution trailers/footers from the commit message (credit goes in the README)."
+  exit 1
+fi

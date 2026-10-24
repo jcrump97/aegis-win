@@ -10,6 +10,7 @@ const REQUIRED_DOCS = [
   'documentation/PLUGIN_SPEC.md',
   'documentation/SECURITY_MODEL.md',
   'documentation/AUDIT_LEDGER.md',
+  'documentation/adr/0001-rust-core.md',
 ];
 
 test('Documentation Audit: all required agent and architecture docs exist and are non-empty', () => {
@@ -33,4 +34,24 @@ test('Documentation Audit: SECURITY_MODEL.md enforces Zero-Knowledge PIN and AES
   assert.match(sec, /AES-256-GCM/);
   assert.match(sec, /PIN Non-Exposure Invariant/);
   assert.match(sec, /netsh advfirewall/);
+});
+
+test('Documentation Audit: ADR 0001 records the accepted Rust-core decision and is linked from the specs', () => {
+  const adr = fs.readFileSync('documentation/adr/0001-rust-core.md', 'utf8');
+  assert.match(adr, /\*\*Status\*\*: Accepted/);
+  assert.match(adr, /## Migration plan/);
+  for (const doc of ['documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md', 'documentation/SECURITY_MODEL.md', 'AGENT.md', 'CLAUDE.md']) {
+    assert.match(fs.readFileSync(doc, 'utf8'), /adr\/0001-rust-core\.md/, `${doc} must link ADR 0001`);
+  }
+});
+
+test('Documentation Audit: agent docs list every commit prefix the hook allows and forbid AI attribution', () => {
+  const hook = fs.readFileSync('.githooks/commit-msg', 'utf8');
+  const prefixes = hook.match(/\((feat\|[a-z|]+)\)/)[1].split('|');
+  assert.ok(prefixes.length >= 8, 'Expected the full prefix alternation from the hook');
+  for (const doc of ['AGENT.md', 'CLAUDE.md']) {
+    const text = fs.readFileSync(doc, 'utf8');
+    for (const p of prefixes) assert.ok(text.includes(`(${p})`), `${doc} must document the (${p}) prefix`);
+    assert.match(text, /No AI Attribution/, `${doc} must state the no-AI-attribution rule`);
+  }
 });
