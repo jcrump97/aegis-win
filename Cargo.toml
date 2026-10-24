@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/aegis-core", "plugins/event-logs", "plugins/windows-health"]
+members = ["src-tauri", "crates/aegis-core", "plugins/event-logs", "plugins/windows-health", "plugins/usage-monitor"]
 
 [workspace.package]
 version = "0.1.0"
