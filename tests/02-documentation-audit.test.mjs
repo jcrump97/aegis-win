@@ -55,3 +55,14 @@ test('Documentation Audit: agent docs list every commit prefix the hook allows a
     assert.match(text, /No AI Attribution/, `${doc} must state the no-AI-attribution rule`);
   }
 });
+
+test('Documentation Audit: README covers status, Windows dev setup, and the Claude acknowledgement', () => {
+  const readme = fs.readFileSync('README.md', 'utf8');
+  assert.match(readme, /adr\/0001-rust-core\.md/, 'README must point to the migration ADR in its status note');
+  // Git does not clone core.hooksPath, so the README is the only place a new contributor learns to enable the hooks.
+  assert.match(readme, /git config core\.hooksPath \.githooks/);
+  for (const script of ['ci', 'dev', 'tauri:dev', 'tauri:build']) {
+    assert.ok(readme.includes(`npm run ${script}`), `README must document npm run ${script}`);
+  }
+  assert.match(readme, /## Acknowledgements[\s\S]*Claude/, 'README must credit Claude under Acknowledgements');
+});
