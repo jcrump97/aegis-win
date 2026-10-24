@@ -2,9 +2,9 @@
 
 Every plugin in `plugins/<plugin-id>/` is a self-contained module compiled into the portable executable.
 
-> **Migration status**: plugins are moving from Node.js prototypes (`index.mjs`) to Rust crates, per [ADR 0001](adr/0001-rust-core.md). New plugins MUST use the Rust layout in §1. A plugin that has not been ported yet keeps its legacy layout (§1.1) until its port PR.
+> Plugins are Rust crates ([ADR 0001](adr/0001-rust-core.md)). The Node.js prototypes have been removed.
 
-## 1. Required Files per Plugin Directory (Rust)
+## 1. Required Files per Plugin Directory
 Each `plugins/<plugin-id>/` directory MUST contain:
 1. `Cargo.toml`: a workspace member crate named `aegis-plugin-<plugin-id>` that depends on `aegis-core`.
 2. `manifest.json`: declarative metadata, installable sub-components (if modular), and tool schemas with default gate policies. Embedded at compile time with `include_str!` and validated by `aegis-core` at startup.
@@ -13,9 +13,6 @@ Each `plugins/<plugin-id>/` directory MUST contain:
 5. `tests/<plugin-id>.rs`: integration tests run by `cargo test --workspace` on every commit.
 
 Plugins are registered at compile time in `src-tauri`. There is no runtime loading of plugin code.
-
-### 1.1 Legacy Layout (Node.js prototype, until ported)
-`manifest.json`, `index.mjs`, `README.md`, and `tests/<plugin-id>.test.mjs`. The port PR deletes `index.mjs` and the `.test.mjs` suite once the Rust tests cover the same behavior.
 
 ## 2. `manifest.json` Schema
 ```json
@@ -59,7 +56,7 @@ A tool that declares a boolean `dryRun` property MUST make `dryRun: true` side-e
 
 ## 3. Tool Gate Policy Values
 - `"auto"`: Executes immediately when invoked from the UI or MCP server (ideal for read-only log queries or telemetry snapshots).
-- `"pin_required"`: Requires explicit human approval via the local `/approve/<ticket-id>` PIN-gated web page when called over MCP (or PIN confirmation modal in the UI). Users can customize every tool's gate policy in Settings.
+- `"pin_required"`: Requires explicit human approval via the local `/approve/<ticket-id>` PIN-gated web page when called over MCP (or PIN confirmation modal in the UI). Users can change every tool's gate policy on the app's MCP server tab; loosening a gate to `auto` needs the PIN.
 
 ## 4. Talking to Windows
 1. **Prefer documented Win32 APIs** through Microsoft's `windows` crate (e.g. `EvtQuery`/`EvtRender` for event logs, PDH for performance counters) over spawning processes.

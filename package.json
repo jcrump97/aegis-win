@@ -10,7 +10,7 @@
     "typecheck": "tsc -p .",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "test": "node --test tests/**/*.test.mjs plugins/**/tests/*.test.mjs",
+    "test": "node --test tests/*.test.mjs",
     "ci": "node scripts/ci-runner.mjs"
   },
   "devDependencies": {

@@ -31,5 +31,3 @@ Reads Windows event logs and asks the LLM service to explain them. Every tool is
 ## Tests
 
 `cargo test -p aegis-plugin-event-logs`: reads the real Application log, filters by the id and source of a real event, checks channel and source validation, the Security admin path, and LLM analysis against a loopback mock.
-
-The legacy `index.mjs` and `tests/event-logs.test.mjs` remain only until the JS prototype is removed (ADR 0001, Amendment 1).

@@ -4,12 +4,12 @@
 
 AegisWin is a single `.exe` you can run from a USB stick or a downloads folder. It lets you, or an AI agent you connect over [MCP](https://modelcontextprotocol.io), read event logs, watch resource usage, and run common Windows repairs. Every state-changing action an agent asks for waits until you approve it with your PIN.
 
-> **Status: early development.** The security design is specified and prototyped with tests, and the core is being ported from a Node.js prototype to Rust ([ADR 0001](documentation/adr/0001-rust-core.md)). The plugins don't touch Windows yet: they return sample data. Don't rely on it for real diagnostics or repairs.
+> **Status: early development.** The core is written in Rust ([ADR 0001](documentation/adr/0001-rust-core.md)) and the plugins work against real Windows APIs: event logs, live usage sampling, and the repair commands. It has not had an outside security review or a tagged release yet, so try repairs with **Dry run** first.
 
 ## What it's designed to do
 
 - **Portable, single executable.** Tauri v2 app; all state lives in `./data/` next to the exe. Nothing goes to the registry or `%APPDATA%`, and no helper binaries are dropped.
-- **Standard user by default.** Runs `asInvoker`, so it never forces a UAC prompt at launch. Admin-only tools (`sfc /scannow`, Winsock reset) ask for one-time elevation for that task only.
+- **Standard user by default.** Runs `asInvoker`, so it never forces a UAC prompt at launch. Admin-only tools (`sfc /scannow`, Winsock reset) say so up front and offer to restart AegisWin as administrator.
 - **PIN-gated approvals for AI agents.** Each tool is either `auto` (e.g. read-only log queries) or `pin_required`. A gated MCP call returns a local approval link where you review the exact action, add a comment, and accept or decline with your PIN. The PIN never reaches the agent, an LLM, or a log.
 - **LAN-aware LLM use.** Local endpoints (Ollama, LM Studio, private LAN addresses) are trusted. Before a plugin sends diagnostics to an LLM outside your LAN, you have to trust that plugin, and usernames, hostnames, and local paths are scrubbed from the payload.
 - **Self-contained plugins.** `event-logs`, `windows-health`, and `usage-monitor`, each with its own manifest, tests, and docs.

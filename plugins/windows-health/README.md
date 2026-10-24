@@ -21,5 +21,3 @@ Windows repair commands. Every repair is `pin_required` by default and supports 
 ## Tests
 
 `cargo test -p aegis-plugin-windows-health` never runs a real repair, because CI runners are administrators. It checks gating, dry-run output, argument handling, SFC result parsing, and LLM interpretation against a loopback mock.
-
-The legacy `index.mjs` and `tests/windows-health.test.mjs` remain only until the JS prototype is removed (ADR 0001, Amendment 1).

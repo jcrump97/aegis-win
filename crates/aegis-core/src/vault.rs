@@ -1,4 +1,4 @@
-//! Portable encrypted vault (`./data/vault.enc`) and the global PIN guard.
+//! Portable encrypted vault (`./data/vault.enc.json`) and the global PIN guard.
 //!
 //! The PIN is stretched with Argon2id into a 256-bit key that encrypts the whole
 //! state with AES-256-GCM. Nothing secret is stored in clear: no PIN, no PIN

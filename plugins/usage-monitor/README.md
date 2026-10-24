@@ -38,5 +38,3 @@ The sampler only runs when `resource-spikes` or `active-window` is enabled.
 ## Tests
 
 `cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, and LLM analysis against a loopback mock.
-
-The legacy `index.mjs` and `tests/usage-monitor.test.mjs` remain only until the JS prototype is removed (ADR 0001, Amendment 1).

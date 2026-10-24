@@ -145,3 +145,5 @@ A Windows user can, from one portable `aegis-win.exe`:
 6. Tauri app: commands, `./data` paths, WebView2 data directory, CSP, restart-as-admin.
 7. UI rebuild on `invoke`.
 8. Remove the JS prototype and its tests, and bring the docs in line with the shipped design.
+
+**Status (2026-10-24)**: steps 1–8 are done on `feat/rust-core`. Still open: DPAPI binding (#6), the elevation job bridge (#10), and a license.

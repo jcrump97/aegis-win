@@ -57,3 +57,17 @@ test('CI Foundation: npm run ci typechecks and builds the UI before the Rust tes
   assert.equal(pkg.scripts.typecheck, 'tsc -p .');
   assert.ok(!pkg.dependencies?.react, 'The UI is plain TypeScript; React was removed');
 });
+
+test('Rust core only: the Node.js prototype is gone and live docs no longer point at it', () => {
+  for (const legacy of ['src/core', 'src/ui/app-shell.mjs']) {
+    assert.ok(!fs.existsSync(legacy), `${legacy} was removed by ADR 0001 and must not come back`);
+  }
+  for (const plugin of fs.readdirSync('plugins')) {
+    assert.ok(!fs.existsSync(`plugins/${plugin}/index.mjs`), `plugins/${plugin} must be a Rust crate, not index.mjs`);
+    assert.ok(fs.existsSync(`plugins/${plugin}/src/lib.rs`), `plugins/${plugin} is missing src/lib.rs`);
+  }
+  // The ADR keeps the history; the operating docs must describe what ships.
+  for (const doc of ['AGENT.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
+    assert.doesNotMatch(fs.readFileSync(doc, 'utf8'), /src\/core\/|index\.mjs|CentralLlmService/, `${doc} still references the prototype`);
+  }
+});

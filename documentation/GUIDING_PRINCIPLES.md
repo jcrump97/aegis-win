@@ -7,7 +7,7 @@ This document records the foundational engineering philosophy for **AegisWin**. 
 - **Avoid Antivirus False Positives**: Multi-binary droppers and obfuscated child scripts trigger Windows Defender SmartScreen and Bitdefender Advanced Threat Defense. AegisWin compiles plugins into a single portable executable and uses transparent, structured command invocation.
 
 ## 2. True Zero-Footprint Portability
-- **Self-Contained `./data/` Directory**: All configuration, encrypted secrets (`vault.enc`), rolling telemetry (`telemetry.json`), and audit logs live relative to the portable executable directory.
+- **Self-Contained `./data/` Directory**: All configuration and encrypted secrets (`vault.enc.json`) and the WebView2 profile (`webview/`) live relative to the portable executable directory. Usage telemetry is kept in memory only and is never written to disk.
 - **Standard User First (`asInvoker`)**: Launching the app never forces a UAC prompt. Users can browse logs, monitor resources, and run the MCP server as a standard user, elevating only specific administrative repair tools when needed—or optionally set "Run as Administrator" in Windows shortcut properties.
 
 ## 3. Zero-Knowledge Human Authority
