@@ -19,3 +19,4 @@
 | 13 | `(feat)` | Add async background job runner and progress streaming for long-running approved tools | `ARCHITECTURE.md`, `AUDIT_LEDGER.md` | `tests/13-async-job-runner.test.mjs` |
 | 14 | `(security)` | Implement encrypted cross-integrity IPC job bridge for UAC self-elevation | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/14-elevation-ipc-bridge.test.mjs` |
 | 15 | `(security)` | Add deterministic host and PII sanitizer for Off-LAN LLM payloads | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/15-offlan-pii-sanitizer.test.mjs` |
+| 16 | `(chore)` | Make the Tauri v2 shell buildable on Windows: add build.rs embedding the asInvoker manifest (with Common Controls v6), app icons, and npm/Cargo lockfiles | `ARCHITECTURE.md`, `AUDIT_LEDGER.md` | `tests/10-ui-and-tauri-integration.test.mjs` |
