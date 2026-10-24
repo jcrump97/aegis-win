@@ -34,5 +34,9 @@ When the user enables the MCP HTTP server on port `P`:
 ## 5. Cross-Integrity Encrypted UAC Job Bridge (`src/core/elevation-bridge.mjs`)
 When a Standard User (`Medium Integrity`) process triggers UAC self-elevation (`High Integrity`), command parameters and stdout payloads are exchanged via ephemeral `AES-256-GCM` authenticated job files in `./data/jobs/<jobId>.{req,res}.enc`. Any tampering between integrity levels invalidates the GCM authentication tag and aborts execution.
 
-## 6. Deterministic Off-LAN PII & Host Sanitizer (`scrubHostAndPiiForOffLan`)
-Whenever `CentralLlmService` dispatches a prompt to an Off-LAN endpoint, it automatically scrubs `C:\Users\<Name>`, SMB UNC paths (`\\Server\Share`), the active OS username, and the local machine hostname before transmission.
+## 6. Off-LAN LLM Gate and PII Sanitizer (`aegis-core::llm`)
+- **LAN classification** parses the endpoint URL first. IP literals are LAN when loopback, RFC 1918, link-local, IPv6 ULA (`fc00::/7`) or IPv6 link-local; host names only when they are `localhost` or end in `.localhost`, `.local`, `.lan`, `.home`, `.internal` or `.home.arpa` (whole labels, so `fcbarcelona.com` is not LAN). Everything else is Off-LAN.
+- **Trust is bound by the engine, not the plugin.** Each call gets an `LlmHandle` carrying the calling plugin's id and whether the user trusted it; a plugin cannot claim another identity. An untrusted Off-LAN call fails with `OFF_LAN_TRUST_REQUIRED` before any byte is sent.
+- **Off-LAN endpoints must use `https://`.** Plain-HTTP Off-LAN URLs are refused.
+- **No redirects.** The HTTP client never follows redirects, so a LAN endpoint cannot bounce a payload to an Off-LAN host.
+- **Scrubbing** runs on every string in the payload before an Off-LAN call: profile paths (`C:\Users\<Name>`, also with `/`), SMB UNC server names (`\\Server\Share`), and the Windows user and computer names as whole words (case-insensitive). The PIN is never part of any payload because it is never stored.

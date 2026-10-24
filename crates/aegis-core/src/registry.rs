@@ -122,11 +122,17 @@ impl PluginManifest {
 pub struct ToolContext {
     pub elevated: bool,
     pub enabled_components: Vec<String>,
+    /// Present for plugins with `usesLlm: true`; already bound to this plugin's id and trust grant.
+    pub llm: Option<crate::llm::LlmHandle>,
 }
 
 impl ToolContext {
     pub fn component_enabled(&self, id: &str) -> bool {
         self.enabled_components.iter().any(|c| c == id)
+    }
+
+    pub fn llm(&self) -> AegisResult<&crate::llm::LlmHandle> {
+        self.llm.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::LlmNotConfigured, "this plugin is not allowed to use the LLM service"))
     }
 }
 
