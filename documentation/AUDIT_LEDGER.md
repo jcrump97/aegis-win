@@ -18,3 +18,4 @@
 | 12 | `(feat)` | Make firewall port management bind-aware for standard-user loopback vs LAN elevation | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/12-firewall-bind-awareness.test.mjs` |
 | 13 | `(feat)` | Add async background job runner and progress streaming for long-running approved tools | `ARCHITECTURE.md`, `AUDIT_LEDGER.md` | `tests/13-async-job-runner.test.mjs` |
 | 14 | `(security)` | Implement encrypted cross-integrity IPC job bridge for UAC self-elevation | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/14-elevation-ipc-bridge.test.mjs` |
+| 15 | `(security)` | Add deterministic host and PII sanitizer for Off-LAN LLM payloads | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/15-offlan-pii-sanitizer.test.mjs` |

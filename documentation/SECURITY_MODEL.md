@@ -26,3 +26,6 @@ When the user enables the MCP HTTP server on port `P`:
 
 ## 5. Cross-Integrity Encrypted UAC Job Bridge (`src/core/elevation-bridge.mjs`)
 When a Standard User (`Medium Integrity`) process triggers UAC self-elevation (`High Integrity`), command parameters and stdout payloads are exchanged via ephemeral `AES-256-GCM` authenticated job files in `./data/jobs/<jobId>.{req,res}.enc`. Any tampering between integrity levels invalidates the GCM authentication tag and aborts execution.
+
+## 6. Deterministic Off-LAN PII & Host Sanitizer (`scrubHostAndPiiForOffLan`)
+Whenever `CentralLlmService` dispatches a prompt to an Off-LAN endpoint, it automatically scrubs `C:\Users\<Name>`, SMB UNC paths (`\\Server\Share`), the active OS username, and the local machine hostname before transmission.

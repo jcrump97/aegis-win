@@ -1,11 +1,13 @@
 /**
  * AegisWin Central LLM Service
  * - Connects to local Ollama, LM Studio, or any OpenAI-compatible API (/v1/chat/completions)
- * - Classifies endpoints as On-LAN (localhost, 127.0.0.0/8, ::1, RFC1918 private subnets, .local/.lan)
- *   vs Off-LAN (external cloud APIs)
+ * - Classifies endpoints as On-LAN vs Off-LAN
  * - Enforces per-plugin external trust warning before any plugin sends data off-LAN
  * - Scrubs user PIN and credentials from all outbound prompts
+ * - When calling an Off-LAN endpoint, runs deterministic PII & Host sanitization
+ *   (redacting C:\Users\<Name>, OS username, machine hostname, and UNC paths)
  */
+import os from 'node:os';
 
 export function isLanAddress(urlString) {
   try {
@@ -44,6 +46,34 @@ export function isLanAddress(urlString) {
   } catch {
     return false;
   }
+}
+
+export function scrubHostAndPiiForOffLan(text) {
+  if (typeof text !== 'string') return text;
+  let scrubbed = text;
+
+  // 1. Redact Windows User Profile paths: C:\Users\<Username>\...
+  scrubbed = scrubbed.replace(/([A-Za-z]:\\Users\\)([^\\/"'\s]+)/gi, '$1<REDACTED_USER>');
+
+  // 2. Redact SMB UNC server/share paths: \Server\Share
+  scrubbed = scrubbed.replace(/\\\\([A-Za-z0-9._-]+)\\([A-Za-z0-9$._-]+)/g, '\\\\<REDACTED_HOST>\\<REDACTED_SHARE>');
+
+  // 3. Redact current OS username and hostname if >= 3 chars
+  try {
+    const currentUser = os.userInfo().username;
+    if (currentUser && currentUser.length >= 3) {
+      scrubbed = scrubbed.split(currentUser).join('<REDACTED_USER>');
+    }
+  } catch {}
+
+  try {
+    const currentHost = os.hostname();
+    if (currentHost && currentHost.length >= 3) {
+      scrubbed = scrubbed.split(currentHost).join('<REDACTED_HOST>');
+    }
+  } catch {}
+
+  return scrubbed;
 }
 
 export class CentralLlmService {
@@ -121,8 +151,14 @@ export class CentralLlmService {
     }
 
     const { llmConfig } = this.vault.getState();
-    const safeSystem = this.vault.scrubForExternalOutput(systemPrompt || 'You are a Windows system diagnostics assistant.');
-    const safeUser = this.vault.scrubForExternalOutput(userPrompt || '');
+    let safeSystem = this.vault.scrubForExternalOutput(systemPrompt || 'You are a Windows system diagnostics assistant.');
+    let safeUser = this.vault.scrubForExternalOutput(userPrompt || '');
+
+    // Automatically scrub Windows usernames, profile paths, UNC shares, and hostnames when going Off-LAN
+    if (access.isOffLan) {
+      safeSystem = scrubHostAndPiiForOffLan(safeSystem);
+      safeUser = scrubHostAndPiiForOffLan(safeUser);
+    }
 
     const endpoint = `${llmConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`;
     const headers = {
@@ -151,6 +187,7 @@ export class CentralLlmService {
       pluginId,
       endpoint,
       isOffLan: access.isOffLan,
+      piiScrubbed: access.isOffLan,
       model: llmConfig.model,
       content: response.choices?.[0]?.message?.content || '',
     };
