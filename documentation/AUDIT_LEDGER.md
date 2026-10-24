@@ -6,3 +6,4 @@
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | `(chore)` | Initialize portable Windows utility repository and CI pipeline | N/A (Bootstrap) | `tests/01-ci-foundation.test.mjs` |
 | 2 | `(doc)` | Establish guiding principles, agent standards, and system architecture plan | `AGENT.md`, `CLAUDE.md`, `GUIDING_PRINCIPLES.md`, `ARCHITECTURE.md`, `PLUGIN_SPEC.md`, `SECURITY_MODEL.md` | `tests/02-documentation-audit.test.mjs` |
+| 3 | `(feat)` | Implement portable zero-knowledge PIN vault and AES-256-GCM secret store | `SECURITY_MODEL.md`, `AUDIT_LEDGER.md` | `tests/03-vault.test.mjs` |
