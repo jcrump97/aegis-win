@@ -19,3 +19,7 @@ When the user enables the MCP HTTP server on port `P`:
 - **Host Header Validation**: Rejects any request to `/mcp` or `/approve/:ticketId` whose `Host` header does not match `127.0.0.1`, `localhost`, or the configured LAN bind IP.
 - **Per-Ticket CSRF Nonce**: Each approval page embeds a 128-bit cryptographic `csrfToken` validated on `POST`.
 - **3-Strike PIN Brute-Force Lockout**: Three failed PIN submissions permanently transition the ticket to `locked_out` (`HTTP 423 Locked`), requiring the agent to request a fresh ticket.
+
+### 3.1 Bind-Aware Firewall Resolution (`asInvoker` Compatibility)
+- **Loopback Default (`127.0.0.1`)**: Bypasses `netsh advfirewall` so standard users never see an `Access is denied` error on startup.
+- **LAN Mode (`0.0.0.0` / RFC1918 IP)**: Checks token elevation and issues `aegis-win.exe --elevate-firewall-port <P>` via UAC if running as a standard user.

@@ -15,6 +15,30 @@ export class FirewallPortManager {
     this.activeRules = new Set();
   }
 
+  openPortForBind({ host = '127.0.0.1', port, isElevatedAdmin = false, rulePrefix = 'AegisWin_MCP' }) {
+    const cleanHost = String(host).toLowerCase();
+    if (cleanHost === '127.0.0.1' || cleanHost === 'localhost' || cleanHost === '::1') {
+      return {
+        opened: true,
+        loopbackBypass: true,
+        requiresElevation: false,
+        port,
+        message: 'Bound to local loopback (127.0.0.1); Windows Firewall rule not required for standard user.',
+      };
+    }
+    if (!isElevatedAdmin) {
+      return {
+        opened: false,
+        loopbackBypass: false,
+        requiresElevation: true,
+        port,
+        elevationCommand: `aegis-win.exe --elevate-firewall-port ${port}`,
+        message: 'LAN binding (0.0.0.0) requires one-time UAC elevation to add Windows Defender Firewall rule.',
+      };
+    }
+    return this.openPort(port, rulePrefix);
+  }
+
   openPort(port, rulePrefix = 'AegisWin_MCP') {
     const ruleName = `${rulePrefix}_${port}`;
     const cmd = `netsh advfirewall firewall add rule name="${ruleName}" dir=in action=allow protocol=TCP localport=${port} profile=private`;
