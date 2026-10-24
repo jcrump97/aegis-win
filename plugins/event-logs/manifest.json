@@ -1,0 +1,56 @@
+{
+  "id": "event-logs",
+  "name": "Windows Event & Application Log Explorer",
+  "version": "1.0.0",
+  "description": "Fast query, filtering, and AI-assisted root-cause analysis for Windows Application, System, and Security Event Logs.",
+  "optionalInstallDefault": true,
+  "usesLlm": true,
+  "tools": [
+    {
+      "id": "query_logs",
+      "name": "Query Windows Event Channel",
+      "description": "Queries Application, System, or Security event channels via native wevtutil XML/structured parsing.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": { "type": "string", "enum": ["Application", "System", "Security"], "default": "Application" },
+          "severity": { "type": "string", "enum": ["All", "Critical", "Error", "Warning", "Information"], "default": "Error" },
+          "limit": { "type": "number", "default": 25 }
+        }
+      }
+    },
+    {
+      "id": "filter_by_event_id",
+      "name": "Filter Events by ID & Source",
+      "description": "Extracts targeted Windows events (e.g., 1000 App Error, 1002 App Hang, 41 Kernel-Power, 7034 Service Crash).",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "required": ["eventId"],
+        "properties": {
+          "channel": { "type": "string", "default": "Application" },
+          "eventId": { "type": "number" },
+          "source": { "type": "string" }
+        }
+      }
+    },
+    {
+      "id": "analyze_logs_with_llm",
+      "name": "AI Root-Cause Log Analysis",
+      "description": "Sends selected event log entries to the Central LLM Service for diagnostic root-cause analysis (subject to Off-LAN trust gating).",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "inputSchema": {
+        "type": "object",
+        "required": ["events"],
+        "properties": {
+          "events": { "type": "array" },
+          "focusQuestion": { "type": "string" }
+        }
+      }
+    }
+  ]
+}
