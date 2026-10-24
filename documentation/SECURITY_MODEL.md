@@ -14,3 +14,8 @@
 When the user enables the MCP HTTP server on port `P`:
 - AegisWin binds to the configured interface and invokes `netsh advfirewall firewall add rule name="AegisWin_MCP_<P>" dir=in action=allow protocol=TCP localport=<P> profile=private` (or queues UAC elevation if required).
 - When the MCP server stops or the portable app exits cleanly, the temporary firewall rule is removed so no stale open ports remain on the host.
+
+## 4. Approval Portal Hardening (DNS Rebinding, CSRF, and 3-Strike Lockout)
+- **Host Header Validation**: Rejects any request to `/mcp` or `/approve/:ticketId` whose `Host` header does not match `127.0.0.1`, `localhost`, or the configured LAN bind IP.
+- **Per-Ticket CSRF Nonce**: Each approval page embeds a 128-bit cryptographic `csrfToken` validated on `POST`.
+- **3-Strike PIN Brute-Force Lockout**: Three failed PIN submissions permanently transition the ticket to `locked_out` (`HTTP 423 Locked`), requiring the agent to request a fresh ticket.

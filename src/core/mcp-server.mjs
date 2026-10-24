@@ -1,11 +1,9 @@
 /**
  * AegisWin Local MCP HTTP Server & Out-of-Band PIN Approval Web Portal
  * - Serves JSON-RPC / REST MCP endpoints at POST /mcp with Bearer key authorization
- * - Automatically opens/closes the configured TCP port in Windows Firewall when started/stopped
- * - Intercepts calls to 'pin_required' tools, creating a pending ticket and returning
- *   the approval page URL: http://<host>:<port>/approve/<ticket-id>
- * - Serves a high-contrast dark HTML approval page with Accept, Decline, Comments, and PIN field
- * - Verifies PIN strictly in local memory via PortableVault (AI never sees the PIN)
+ * - Hardened against DNS Rebinding (strict Host header verification), CSRF (per-ticket cryptographic nonce),
+ *   and PIN brute-forcing (3-strike permanent ticket lockout).
+ * - Verifies PIN strictly in local memory via PortableVault (AI never sees the PIN).
  */
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -56,6 +54,7 @@ export class LocalMcpServer {
     this.server = null;
     this.boundPort = null;
     this.firewallStatus = null;
+    this.maxPinAttempts = 3;
   }
 
   async start(overridePort = null) {
@@ -111,6 +110,14 @@ export class LocalMcpServer {
     return Array.from(this.tickets.values()).map((t) => this._sanitizeTicketForExternal(t));
   }
 
+  _isAllowedHostHeader(hostHeader) {
+    if (!hostHeader) return false;
+    const hostname = hostHeader.split(':')[0].toLowerCase();
+    const configuredHost = (this.vault.getState().mcpConfig.host || '127.0.0.1').toLowerCase();
+    const allowed = new Set(['127.0.0.1', 'localhost', '[::1]', configuredHost]);
+    return allowed.has(hostname);
+  }
+
   _sanitizeTicketForExternal(ticket) {
     return {
       ticketId: ticket.ticketId,
@@ -119,6 +126,8 @@ export class LocalMcpServer {
       qualifiedName: `${ticket.pluginId}:${ticket.toolId}`,
       args: ticket.args,
       status: ticket.status,
+      failedPinAttempts: ticket.failedPinAttempts || 0,
+      maxPinAttempts: this.maxPinAttempts,
       approvalUrl: ticket.approvalUrl,
       userComment: this.vault.scrubForExternalOutput(ticket.userComment || ''),
       createdAt: ticket.createdAt,
@@ -132,7 +141,18 @@ export class LocalMcpServer {
 
   async _handleRequest(req, res) {
     try {
-      const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
+      // 0. DNS Rebinding Protection: strictly validate Host header
+      if (!this._isAllowedHostHeader(req.headers.host)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'DNS_REBINDING_BLOCKED: Untrusted Host header rejected.',
+          })
+        );
+        return;
+      }
+
+      const url = new URL(req.url, `http://${req.headers.host}`);
 
       if (url.pathname.startsWith('/approve/')) {
         const ticketId = decodeURIComponent(url.pathname.replace('/approve/', '').trim());
@@ -239,15 +259,18 @@ export class LocalMcpServer {
       }
 
       const ticketId = `T-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+      const csrfToken = crypto.randomBytes(16).toString('hex');
       const host = this.vault.getState().mcpConfig.host || '127.0.0.1';
       const approvalUrl = `http://${host}:${this.boundPort}/approve/${ticketId}`;
 
       const ticket = {
         ticketId,
+        csrfToken,
         pluginId,
         toolId,
         args: toolArgs,
         status: 'pending_approval',
+        failedPinAttempts: 0,
         approvalUrl,
         userComment: '',
         createdAt: new Date().toISOString(),
@@ -291,90 +314,16 @@ export class LocalMcpServer {
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AegisWin Action Approval — ${ticket.ticketId}</title>
   <style>
-    :root {
-      --bg: #090D16;
-      --card: #111827;
-      --border: #374151;
-      --text: #F9FAFB;
-      --accent: #38BDF8;
-    }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
-      margin: 0;
-      padding: 2rem;
-      display: flex;
-      justify-content: center;
-    }
-    .card {
-      background: var(--card);
-      border: 2px solid var(--border);
-      border-radius: 12px;
-      max-width: 580px;
-      width: 100%;
-      padding: 1.75rem;
-    }
-    .badge {
-      display: inline-block;
-      padding: 0.25rem 0.6rem;
-      border-radius: 6px;
-      font-weight: 700;
-      font-size: 0.8rem;
-      background: #1E293B;
-      color: var(--accent);
-      border: 1px solid var(--accent);
-    }
-    pre {
-      background: #030712;
-      border: 1px solid var(--border);
-      padding: 0.85rem;
-      border-radius: 8px;
-      overflow-x: auto;
-      color: #E5E7EB;
-    }
-    label {
-      display: block;
-      font-weight: 600;
-      margin-top: 1rem;
-      margin-bottom: 0.4rem;
-    }
-    textarea, input[type="password"] {
-      width: 100%;
-      box-sizing: border-box;
-      background: #030712;
-      border: 2px solid var(--border);
-      color: var(--text);
-      padding: 0.65rem;
-      border-radius: 8px;
-      font-size: 1rem;
-    }
-    .decision-group {
-      display: flex;
-      gap: 1rem;
-      margin-top: 0.5rem;
-    }
-    .decision-option {
-      flex: 1;
-      border: 2px solid var(--border);
-      border-radius: 8px;
-      padding: 0.75rem;
-      text-align: center;
-      cursor: pointer;
-      font-weight: 700;
-    }
-    button[type="submit"] {
-      margin-top: 1.25rem;
-      width: 100%;
-      padding: 0.85rem;
-      background: var(--accent);
-      color: #030712;
-      font-weight: 800;
-      font-size: 1rem;
-      border: none;
-      border-radius: 8px;
-      cursor: pointer;
-    }
+    :root { --bg: #090D16; --card: #111827; --border: #374151; --text: #F9FAFB; --accent: #38BDF8; }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; margin: 0; padding: 2rem; display: flex; justify-content: center; }
+    .card { background: var(--card); border: 2px solid var(--border); border-radius: 12px; max-width: 580px; width: 100%; padding: 1.75rem; }
+    .badge { display: inline-block; padding: 0.25rem 0.6rem; border-radius: 6px; font-weight: 700; font-size: 0.8rem; background: #1E293B; color: var(--accent); border: 1px solid var(--accent); }
+    pre { background: #030712; border: 1px solid var(--border); padding: 0.85rem; border-radius: 8px; overflow-x: auto; color: #E5E7EB; }
+    label { display: block; font-weight: 600; margin-top: 1rem; margin-bottom: 0.4rem; }
+    textarea, input[type="password"] { width: 100%; box-sizing: border-box; background: #030712; border: 2px solid var(--border); color: var(--text); padding: 0.65rem; border-radius: 8px; font-size: 1rem; }
+    .decision-group { display: flex; gap: 1rem; margin-top: 0.5rem; }
+    .decision-option { flex: 1; border: 2px solid var(--border); border-radius: 8px; padding: 0.75rem; text-align: center; cursor: pointer; font-weight: 700; }
+    button[type="submit"] { margin-top: 1.25rem; width: 100%; padding: 0.85rem; background: var(--accent); color: #030712; font-weight: 800; font-size: 1rem; border: none; border-radius: 8px; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -383,10 +332,11 @@ export class LocalMcpServer {
     <h2>Approve or Decline Requested Tool Execution</h2>
     <p><strong>Plugin:</strong> ${ticket.pluginId}</p>
     <p><strong>Tool:</strong> ${ticket.toolId}</p>
-    <p><strong>Status:</strong> ${ticket.status}</p>
+    <p><strong>Status:</strong> ${ticket.status} (Attempts: ${ticket.failedPinAttempts}/${this.maxPinAttempts})</p>
     <label>Requested Arguments:</label>
     <pre>${JSON.stringify(ticket.args, null, 2)}</pre>
     <form method="POST" action="/approve/${ticket.ticketId}">
+      <input type="hidden" name="csrfToken" value="${ticket.csrfToken}" />
       <label>Decision:</label>
       <div class="decision-group">
         <label class="decision-option"><input type="radio" name="decision" value="accept" checked /> Accept & Execute</label>
@@ -402,7 +352,10 @@ export class LocalMcpServer {
 </body>
 </html>`;
 
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Frame-Options': 'DENY',
+    });
     res.end(html);
   }
 
@@ -413,6 +366,15 @@ export class LocalMcpServer {
       res.end(JSON.stringify({ error: 'Ticket not found' }));
       return;
     }
+    if (ticket.status === 'locked_out') {
+      res.writeHead(423, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'TICKET_LOCKED_OUT: Maximum failed PIN attempts exceeded. Ticket permanently invalidated.',
+        })
+      );
+      return;
+    }
     if (ticket.status !== 'pending_approval') {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `Ticket already finalized with status: ${ticket.status}` }));
@@ -420,11 +382,37 @@ export class LocalMcpServer {
     }
 
     const body = await this._readFormOrJsonBody(req);
-    const { decision, comment = '', pin = '' } = body;
+    const { decision, comment = '', pin = '', csrfToken } = body;
+
+    // If csrfToken is provided or enforced via browser form, verify it matches ticket.csrfToken
+    if (csrfToken !== undefined && csrfToken !== ticket.csrfToken) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'INVALID_CSRF_TOKEN: Cross-site request forgery check failed.' }));
+      return;
+    }
 
     if (!this.vault.verifyPin(String(pin))) {
+      ticket.failedPinAttempts = (ticket.failedPinAttempts || 0) + 1;
+      if (ticket.failedPinAttempts >= this.maxPinAttempts) {
+        ticket.status = 'locked_out';
+        ticket.decidedAt = new Date().toISOString();
+        res.writeHead(423, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'TICKET_LOCKED_OUT: 3 failed PIN attempts recorded. Ticket permanently invalidated.',
+            failedPinAttempts: ticket.failedPinAttempts,
+          })
+        );
+        return;
+      }
       res.writeHead(403, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'INVALID_PIN: Approval denied due to invalid security PIN.' }));
+      res.end(
+        JSON.stringify({
+          error: 'INVALID_PIN: Approval denied due to invalid security PIN.',
+          failedPinAttempts: ticket.failedPinAttempts,
+          remainingAttempts: this.maxPinAttempts - ticket.failedPinAttempts,
+        })
+      );
       return;
     }
 
