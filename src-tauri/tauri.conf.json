@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AegisWin",
+  "version": "1.0.0",
+  "identifier": "org.aegiswin.portable",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AegisWin — Portable Windows Diagnostic & MCP Utility",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 620,
+        "backgroundColor": "#090D16"
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

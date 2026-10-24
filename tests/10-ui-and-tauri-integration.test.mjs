@@ -1,0 +1,34 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createAegisWinApp } from '../src/ui/app-shell.mjs';
+
+test('Full System Integration: Tauri v2 asInvoker manifest, dynamic UI scaling, and all 3 plugins registered', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-e2e-'));
+  try {
+    // Verify Windows manifest uses asInvoker (Standard User by default)
+    const manifestXml = fs.readFileSync('src-tauri/app.manifest', 'utf8');
+    assert.match(manifestXml, /requestedExecutionLevel level="asInvoker" uiAccess="false"/);
+
+    const app = createAegisWinApp({ dataDir: tmpDir });
+    app.vault.unlockWithPin('246810');
+
+    // Verify dynamic UI scaling clamping and persistence
+    assert.equal(app.setUiScale(1.25), 1.25);
+    assert.equal(app.setUiScale(2.5), 1.5);
+    assert.equal(app.setUiScale(0.5), 0.85);
+    assert.equal(app.getThemeSpec().backgroundPrimary, '#090D16');
+
+    // Verify all 3 core plugins and their tools are available
+    const plugins = app.registry.listAvailablePlugins();
+    assert.equal(plugins.length, 3);
+    const mcpTools = app.registry.listMcpTools();
+    assert.ok(mcpTools.some((t) => t.name === 'event-logs:query_logs'));
+    assert.ok(mcpTools.some((t) => t.name === 'windows-health:sfc_scan'));
+    assert.ok(mcpTools.some((t) => t.name === 'usage-monitor:capture_diagnostic_snapshot'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

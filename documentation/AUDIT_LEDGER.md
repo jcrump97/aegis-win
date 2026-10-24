@@ -13,3 +13,4 @@
 | 7 | `(feat)` | Add self-contained Windows Event Log explorer plugin with LLM log diagnostics | `PLUGIN_SPEC.md`, `plugins/event-logs/README.md`, `AUDIT_LEDGER.md` | `plugins/event-logs/tests/event-logs.test.mjs` |
 | 8 | `(feat)` | Add Windows Health optimization plugin with UAC self-elevation and dry-run safeguards | `PLUGIN_SPEC.md`, `plugins/windows-health/README.md`, `AUDIT_LEDGER.md` | `plugins/windows-health/tests/windows-health.test.mjs` |
 | 9 | `(feat)` | Add modular Usage and Diagnostic Monitor plugin with time-window correlation | `PLUGIN_SPEC.md`, `plugins/usage-monitor/README.md`, `AUDIT_LEDGER.md` | `plugins/usage-monitor/tests/usage-monitor.test.mjs` |
+| 10 | `(feat)` | Integrate Tauri v2 Rust backend, asInvoker manifest, and high-contrast dynamic-scale UI | `ARCHITECTURE.md`, `AUDIT_LEDGER.md` | `tests/10-ui-and-tauri-integration.test.mjs` |

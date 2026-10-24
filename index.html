@@ -1,0 +1,1198 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AegisWin — Portable Windows Utility &amp; PIN-Gated MCP Server</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <style>
+    :root {
+      --ui-scale: 1;
+      --bg-obsidian: #090D16;
+      --bg-surface: #111827;
+      --bg-elevated: #1E293B;
+      --border-hc: #374151;
+      --text-hc: #F9FAFB;
+      --accent-cyan: #38BDF8;
+    }
+    html {
+      font-size: calc(16px * var(--ui-scale));
+      background-color: var(--bg-obsidian);
+      color: var(--text-hc);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    body {
+      background-color: var(--bg-obsidian);
+      color: var(--text-hc);
+      margin: 0;
+      min-height: 100vh;
+    }
+    .hc-card {
+      background-color: var(--bg-surface);
+      border: 2px solid var(--border-hc);
+      border-radius: 0.75rem;
+    }
+    .hc-btn {
+      border: 2px solid transparent;
+      font-weight: 700;
+      transition: all 0.15s ease;
+    }
+    .hc-btn:focus-visible {
+      outline: 3px solid #38BDF8;
+      outline-offset: 2px;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col selection:bg-sky-400 selection:text-slate-950">
+
+  <!-- TOP HIGH-CONTRAST TITLE & STATUS BAR -->
+  <header class="border-b-2 border-slate-700 bg-slate-950 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-sky-400 text-slate-950 font-black flex items-center justify-center text-lg shadow">
+        AW
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="font-extrabold text-lg tracking-tight text-white">AegisWin Portable</h1>
+          <span class="text-xs font-mono uppercase px-2 py-0.5 rounded bg-slate-800 border border-slate-600 text-sky-300">v1.0.0 Single-Exe</span>
+          <span id="privilege-badge" class="text-xs font-mono px-2 py-0.5 rounded bg-amber-950 border border-amber-400 text-amber-200">
+            Mode: Standard User (asInvoker)
+          </span>
+        </div>
+        <p class="text-xs text-slate-300">Portable Windows Diagnostics, Health Optimizer &amp; Human-Gated MCP Server</p>
+      </div>
+    </div>
+
+    <!-- DYNAMIC SCALE & PRIVILEGE CONTROLS -->
+    <div class="flex flex-wrap items-center gap-3">
+      <button id="btn-toggle-admin" type="button" class="hc-btn text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 border-slate-600">
+        Simulate "Run as Admin"
+      </button>
+      <div class="flex items-center gap-2 bg-slate-900 border border-slate-700 px-3 py-1 rounded-lg">
+        <label for="scale-slider" class="text-xs font-bold text-slate-200">UI Scale:</label>
+        <input id="scale-slider" type="range" min="85" max="135" step="5" value="100" class="w-24 accent-sky-400 cursor-pointer" />
+        <span id="scale-label" class="text-xs font-mono font-bold text-sky-300 w-10 text-right">100%</span>
+      </div>
+      <span id="mcp-header-pill" class="text-xs font-mono px-2.5 py-1 rounded-full bg-emerald-950 border border-emerald-400 text-emerald-200">
+        MCP HTTP :47821 Active (Firewall Open)
+      </span>
+    </div>
+  </header>
+
+  <!-- STARTUP PIN MODAL / FIRST-RUN WIZARD BANNER -->
+  <div id="startup-lock-banner" class="bg-slate-900 border-b-2 border-sky-400 px-4 py-3">
+    <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-3">
+        <span class="px-2.5 py-1 rounded bg-sky-400 text-slate-950 font-black text-xs uppercase">Zero-Knowledge Vault</span>
+        <span id="vault-status-text" class="text-sm text-slate-100 font-medium">
+          Startup PIN Active (Default Demo PIN: <code class="font-mono text-sky-300 font-bold">482910</code> — stored locally via Scrypt + AES-256-GCM; never visible to AI or MCP).
+        </span>
+      </div>
+      <div class="flex items-center gap-2">
+        <input id="startup-pin-input" type="password" value="482910" maxlength="12" placeholder="Set/Verify PIN" class="bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-1 text-sm text-white font-mono w-36" />
+        <button id="btn-set-pin" type="button" class="hc-btn bg-sky-400 hover:bg-sky-300 text-slate-950 px-3 py-1 rounded-lg text-xs">
+          Update Startup PIN
+        </button>
+        <button id="btn-open-wizard" type="button" class="hc-btn bg-slate-800 hover:bg-slate-700 text-white border-slate-600 px-3 py-1 rounded-lg text-xs">
+          First-Run Component Setup
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN WORKSPACE NAVIGATION & CONTENT -->
+  <div class="flex-1 max-w-7xl w-full mx-auto px-4 py-5 grid grid-cols-1 lg:grid-cols-12 gap-5">
+
+    <!-- SIDEBAR NAVIGATION -->
+    <aside class="lg:col-span-3 space-y-3">
+      <nav class="hc-card p-3 space-y-1.5" aria-label="Main Navigation">
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-400 px-2 py-1">Installed Plugins</div>
+        <button type="button" data-tab="tab-event-logs" class="nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between bg-sky-400 text-slate-950">
+          <span>1. Event &amp; App Logs</span>
+          <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-slate-950/20">3 Tools</span>
+        </button>
+        <button type="button" data-tab="tab-win-health" class="nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between text-slate-100 hover:bg-slate-800">
+          <span>2. Windows Health</span>
+          <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300">5 Tools</span>
+        </button>
+        <button type="button" data-tab="tab-usage-mon" class="nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between text-slate-100 hover:bg-slate-800">
+          <span>3. Usage Monitor</span>
+          <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300">Modular</span>
+        </button>
+
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-400 px-2 pt-3 pb-1">Core Services &amp; Docs</div>
+        <button type="button" data-tab="tab-mcp-portal" class="nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between text-slate-100 hover:bg-slate-800">
+          <span>4. MCP &amp; PIN Approval Page</span>
+          <span id="pending-badge" class="text-xs font-mono px-1.5 py-0.5 rounded bg-amber-400 text-slate-950 font-black">1 Pending</span>
+        </button>
+        <button type="button" data-tab="tab-llm-config" class="nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between text-slate-100 hover:bg-slate-800">
+          <span>5. Central LLM &amp; Trust</span>
+          <span id="llm-lan-badge" class="text-xs font-mono px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-500">LAN</span>
+        </button>
+        <button type="button" data-tab="tab-architecture" class="nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between text-slate-100 hover:bg-slate-800">
+          <span>6. Architecture &amp; Git CI</span>
+          <span class="text-xs font-mono px-1.5 py-0.5 rounded bg-slate-800 text-sky-300">10 Commits</span>
+        </button>
+      </nav>
+
+      <!-- PORTABLE VAULT & SECURITY INVARIANTS SUMMARY CARD -->
+      <div class="hc-card p-3.5 space-y-2 text-xs">
+        <div class="font-bold text-sky-300 uppercase tracking-wide">Security &amp; Portability</div>
+        <div class="flex justify-between text-slate-300">
+          <span>Storage Path:</span>
+          <code class="text-white font-mono">./data/vault.enc</code>
+        </div>
+        <div class="flex justify-between text-slate-300">
+          <span>Encryption:</span>
+          <code class="text-emerald-300 font-mono">AES-256-GCM</code>
+        </div>
+        <div class="flex justify-between text-slate-300">
+          <span>PIN Exposure to AI:</span>
+          <code class="text-emerald-300 font-mono">0% (Isolated)</code>
+        </div>
+        <div class="flex justify-between text-slate-300">
+          <span>Firewall Rule:</span>
+          <code id="sidebar-fw-state" class="text-sky-300 font-mono">Auto-Opened</code>
+        </div>
+      </div>
+    </aside>
+
+    <!-- MAIN CONTENT PANELS -->
+    <main class="lg:col-span-9 space-y-5">
+
+      <!-- NOTIFICATION TOAST BANNER -->
+      <div id="toast-banner" class="hidden hc-card border-sky-400 bg-slate-900 px-4 py-3 flex items-center justify-between">
+        <span id="toast-text" class="text-sm font-semibold text-white">Action completed.</span>
+        <button id="btn-close-toast" type="button" class="text-xs font-bold text-sky-300 hover:underline">Dismiss</button>
+      </div>
+
+      <!-- TAB 1: WINDOWS EVENT & APPLICATION LOG EXPLORER -->
+      <section id="tab-event-logs" class="tab-panel space-y-4">
+        <div class="hc-card p-5 space-y-4">
+          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-700 pb-3">
+            <div>
+              <span class="text-xs font-mono uppercase text-sky-300">plugins/event-logs</span>
+              <h2 class="text-xl font-extrabold text-white">Windows Event &amp; Application Log Explorer</h2>
+              <p class="text-xs text-slate-300">Queries native <code class="font-mono text-sky-300">wevtutil qe</code> channels without PowerShell startup overhead.</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-slate-300">External LLM Trust:</span>
+              <span id="event-logs-trust-pill" class="text-xs font-mono px-2 py-0.5 rounded bg-slate-800 border border-slate-600 text-slate-200">Untrusted Off-LAN</span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-4 gap-3">
+            <div>
+              <label for="ev-channel" class="block text-xs font-bold text-slate-200 mb-1">Log Channel</label>
+              <select id="ev-channel" class="w-full bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-2 text-sm text-white">
+                <option value="Application">Application</option>
+                <option value="System">System</option>
+                <option value="Security">Security (Requires Admin)</option>
+              </select>
+            </div>
+            <div>
+              <label for="ev-severity" class="block text-xs font-bold text-slate-200 mb-1">Severity Filter</label>
+              <select id="ev-severity" class="w-full bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-2 text-sm text-white">
+                <option value="All">All Levels</option>
+                <option value="Error" selected>Error Only</option>
+                <option value="Warning">Warning Only</option>
+              </select>
+            </div>
+            <div>
+              <label for="ev-id-filter" class="block text-xs font-bold text-slate-200 mb-1">Event ID (Optional)</label>
+              <input id="ev-id-filter" type="number" placeholder="e.g. 1000 or 7034" class="w-full bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-2 text-sm text-white font-mono" />
+            </div>
+            <div class="flex items-end gap-2">
+              <button id="btn-query-logs" type="button" class="hc-btn flex-1 bg-sky-400 hover:bg-sky-300 text-slate-950 py-2 px-3 rounded-lg text-sm">
+                Query Logs
+              </button>
+              <button id="btn-analyze-logs-llm" type="button" class="hc-btn bg-emerald-400 hover:bg-emerald-300 text-slate-950 py-2 px-3 rounded-lg text-sm">
+                AI Diagnose
+              </button>
+            </div>
+          </div>
+
+          <div class="bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono text-sky-300" id="ev-native-cmd">
+            Native Query: wevtutil qe "Application" /q:"*[System[(Level=2)]]" /c:25 /rd:true /f:xml
+          </div>
+
+          <div id="ev-results-container" class="space-y-2.5"></div>
+
+          <div id="ev-llm-output" class="hidden hc-card border-emerald-400 bg-slate-950 p-4 space-y-2">
+            <div class="text-xs font-mono font-bold text-emerald-300 uppercase">Central LLM Diagnostic Root-Cause Report</div>
+            <p id="ev-llm-text" class="text-sm text-slate-100 leading-relaxed"></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: WINDOWS HEALTH & NETWORK STACK OPTIMIZER -->
+      <section id="tab-win-health" class="tab-panel hidden space-y-4">
+        <div class="hc-card p-5 space-y-4">
+          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-700 pb-3">
+            <div>
+              <span class="text-xs font-mono uppercase text-sky-300">plugins/windows-health</span>
+              <h2 class="text-xl font-extrabold text-white">Windows Health &amp; Network Stack Optimizer</h2>
+              <p class="text-xs text-slate-300">Each tool supports individualized MCP Gating (<code class="font-mono">auto</code> vs <code class="font-mono">pin_required</code>), Dry-Run checks, and on-demand UAC elevation.</p>
+            </div>
+            <label class="flex items-center gap-2 text-xs font-bold text-amber-300 bg-amber-950/60 border border-amber-500 px-3 py-1.5 rounded-lg cursor-pointer">
+              <input id="health-dry-run-toggle" type="checkbox" class="accent-amber-400" />
+              <span>Dry-Run Impact Check Mode</span>
+            </label>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="health-tools-grid">
+            <!-- Populated by JS -->
+          </div>
+
+          <div class="bg-slate-950 border-2 border-slate-700 rounded-lg p-4 space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-mono uppercase font-bold text-sky-300">Command Execution Console</span>
+              <button id="btn-health-llm-explain" type="button" class="hc-btn text-xs bg-emerald-400 hover:bg-emerald-300 text-slate-950 px-3 py-1 rounded">
+                Explain Output with Central LLM
+              </button>
+            </div>
+            <pre id="health-console-output" class="text-xs font-mono text-slate-100 whitespace-pre-wrap leading-relaxed">Select a Windows Health tool above to execute or preview its dry-run impact.</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: MODULAR USAGE & DIAGNOSTIC MONITOR -->
+      <section id="tab-usage-mon" class="tab-panel hidden space-y-4">
+        <div class="hc-card p-5 space-y-4">
+          <div class="border-b border-slate-700 pb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <span class="text-xs font-mono uppercase text-sky-300">plugins/usage-monitor</span>
+              <h2 class="text-xl font-extrabold text-white">Time-Window Usage &amp; Crash Correlation Monitor</h2>
+              <p class="text-xs text-slate-300">Captures diagnostic clues during scheduled windows or problem application stalls.</p>
+            </div>
+            <button id="btn-capture-clues" type="button" class="hc-btn bg-sky-400 hover:bg-sky-300 text-slate-950 px-4 py-2 rounded-lg text-sm">
+              Capture Correlated Snapshot Now
+            </button>
+          </div>
+
+          <!-- Watch Window Schedule Config -->
+          <div class="grid grid-cols-1 sm:grid-cols-4 gap-3 bg-slate-950 p-3.5 rounded-lg border border-slate-700">
+            <div>
+              <label for="mon-start" class="block text-xs font-bold text-slate-300 mb-1">Watch Start</label>
+              <input id="mon-start" type="text" value="21:00" class="w-full bg-slate-900 border border-slate-600 rounded px-2.5 py-1.5 text-sm font-mono text-white" />
+            </div>
+            <div>
+              <label for="mon-end" class="block text-xs font-bold text-slate-300 mb-1">Watch End</label>
+              <input id="mon-end" type="text" value="23:00" class="w-full bg-slate-900 border border-slate-600 rounded px-2.5 py-1.5 text-sm font-mono text-white" />
+            </div>
+            <div>
+              <label for="mon-cpu" class="block text-xs font-bold text-slate-300 mb-1">CPU Alert (%)</label>
+              <input id="mon-cpu" type="number" value="85" class="w-full bg-slate-900 border border-slate-600 rounded px-2.5 py-1.5 text-sm font-mono text-white" />
+            </div>
+            <div>
+              <label for="mon-ram" class="block text-xs font-bold text-slate-300 mb-1">RAM Alert (MB)</label>
+              <input id="mon-ram" type="number" value="2048" class="w-full bg-slate-900 border border-slate-600 rounded px-2.5 py-1.5 text-sm font-mono text-white" />
+            </div>
+          </div>
+
+          <!-- Optional Installable Sub-Components Status -->
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3" id="monitor-subcomponents-cards"></div>
+
+          <!-- Correlated Clues Output -->
+          <div id="monitor-clues-output" class="bg-slate-950 border-2 border-slate-700 rounded-lg p-4 space-y-3"></div>
+        </div>
+      </section>
+
+      <!-- TAB 4: LOCAL MCP HTTP SERVER & PIN-GATED APPROVAL WEB PAGE -->
+      <section id="tab-mcp-portal" class="tab-panel hidden space-y-4">
+        <div class="hc-card p-5 space-y-4">
+          <div class="border-b border-slate-700 pb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <span class="text-xs font-mono uppercase text-sky-300">src/core/mcp-server.mjs</span>
+              <h2 class="text-xl font-extrabold text-white">Local MCP HTTP Server &amp; Out-of-Band Approval Web Portal</h2>
+              <p class="text-xs text-slate-300">When an AI agent invokes a gated tool, the MCP server returns a local approval URL (<code class="font-mono text-sky-300">http://127.0.0.1:47821/approve/&lt;ticket-id&gt;</code>).</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button id="btn-simulate-mcp-call" type="button" class="hc-btn bg-amber-400 hover:bg-amber-300 text-slate-950 px-3.5 py-2 rounded-lg text-xs">
+                + Simulate Agent Calling Gated Tool
+              </button>
+              <button id="btn-toggle-mcp-server" type="button" class="hc-btn bg-emerald-400 hover:bg-emerald-300 text-slate-950 px-3.5 py-2 rounded-lg text-xs">
+                Stop MCP Server (Close Port)
+              </button>
+            </div>
+          </div>
+
+          <!-- MCP Connection & Auto-Firewall Info -->
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div class="bg-slate-950 border border-slate-700 p-3 rounded-lg">
+              <div class="text-slate-400 font-bold uppercase">MCP Endpoint</div>
+              <div class="font-mono text-sky-300 text-sm mt-1">POST http://127.0.0.1:47821/mcp</div>
+              <div class="text-slate-400 mt-1">Header: <code class="font-mono text-slate-200">Authorization: Bearer aegis_mk_9f82...</code></div>
+            </div>
+            <div class="bg-slate-950 border border-slate-700 p-3 rounded-lg">
+              <div class="text-slate-400 font-bold uppercase">Auto Firewall Rule</div>
+              <div id="mcp-fw-cmd" class="font-mono text-emerald-300 text-xs mt-1">netsh advfirewall firewall add rule name="AegisWin_MCP_47821" dir=in action=allow protocol=TCP localport=47821</div>
+            </div>
+            <div class="bg-slate-950 border border-slate-700 p-3 rounded-lg">
+              <div class="text-slate-400 font-bold uppercase">PIN Isolation Guarantee</div>
+              <div class="text-slate-200 mt-1">Agent receives <code class="font-mono text-amber-300">approvalUrl</code> only. PIN is verified locally by Scrypt KDF and never returned to MCP.</div>
+            </div>
+          </div>
+
+          <!-- LIVE SIMULATED APPROVAL WEB PAGE (/approve/:ticketId) -->
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-2">
+            <div class="lg:col-span-5 space-y-2.5">
+              <div class="text-xs font-bold uppercase tracking-wider text-slate-300">MCP Ticket Queue</div>
+              <div id="mcp-tickets-list" class="space-y-2"></div>
+            </div>
+
+            <div class="lg:col-span-7">
+              <div class="border-2 border-sky-400 rounded-xl bg-slate-950 p-4 space-y-3">
+                <div class="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <span class="text-xs font-mono text-sky-300" id="portal-url-bar">GET http://127.0.0.1:47821/approve/T-8F3A21</span>
+                  <span class="text-xs font-bold px-2 py-0.5 rounded bg-sky-950 text-sky-300 border border-sky-500">Served Approval Web Page</span>
+                </div>
+
+                <div id="portal-ticket-body" class="space-y-3">
+                  <!-- Rendered dynamically for selected ticket -->
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: CENTRAL LLM SERVICE & OFF-LAN TRUST BOUNDARY -->
+      <section id="tab-llm-config" class="tab-panel hidden space-y-4">
+        <div class="hc-card p-5 space-y-4">
+          <div class="border-b border-slate-700 pb-3">
+            <span class="text-xs font-mono uppercase text-sky-300">src/core/llm-service.mjs</span>
+            <h2 class="text-xl font-extrabold text-white">Central LLM Service &amp; Off-LAN Plugin Trust Governance</h2>
+            <p class="text-xs text-slate-300">Connects to local Ollama / LM Studio on your LAN or any external OpenAI-compatible API. Warns on first external call per plugin.</p>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div>
+              <label for="llm-preset" class="block text-xs font-bold text-slate-200 mb-1">Provider Preset</label>
+              <select id="llm-preset" class="w-full bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-2 text-sm text-white">
+                <option value="http://127.0.0.1:11434/v1">Local Ollama (127.0.0.1:11434) — On-LAN</option>
+                <option value="http://192.168.1.50:1234/v1">LAN LM Studio (192.168.1.50:1234) — On-LAN</option>
+                <option value="https://api.openai.com/v1">OpenAI Cloud (api.openai.com) — Off-LAN</option>
+                <option value="https://openrouter.ai/api/v1">OpenRouter Cloud — Off-LAN</option>
+              </select>
+            </div>
+            <div>
+              <label for="llm-base-url" class="block text-xs font-bold text-slate-200 mb-1">OpenAI-Compatible Base URL</label>
+              <input id="llm-base-url" type="text" value="http://127.0.0.1:11434/v1" class="w-full bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-2 text-sm font-mono text-white" />
+            </div>
+            <div>
+              <label for="llm-api-key" class="block text-xs font-bold text-slate-200 mb-1">API Key (AES-256-GCM Encrypted)</label>
+              <input id="llm-api-key" type="password" value="sk-local-ollama-key" class="w-full bg-slate-950 border-2 border-slate-600 rounded-lg px-3 py-2 text-sm font-mono text-white" />
+            </div>
+          </div>
+
+          <div id="llm-network-classification" class="p-3.5 rounded-lg border-2 border-emerald-500 bg-emerald-950/40 text-xs text-emerald-200 font-medium">
+            ON-LAN DETECTED: Endpoint resolves to loopback / private RFC1918 subnet. Diagnostic data never leaves your local network.
+          </div>
+
+          <div class="space-y-2">
+            <h3 class="text-sm font-bold text-white">Per-Plugin External (Off-LAN) LLM Trust Matrix</h3>
+            <p class="text-xs text-slate-300">If you switch to an Off-LAN provider (like <code class="font-mono">https://api.openai.com/v1</code>), untrusted plugins will halt and prompt you before sending any diagnostic data externally.</p>
+            <div id="llm-trust-matrix" class="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 6: SYSTEM ARCHITECTURE, GUIDING PRINCIPLES & ATOMIC GIT LOG -->
+      <section id="tab-architecture" class="tab-panel hidden space-y-4">
+        <div class="hc-card p-5 space-y-4">
+          <div class="border-b border-slate-700 pb-3">
+            <span class="text-xs font-mono uppercase text-sky-300">documentation/ARCHITECTURE.md &amp; AGENT.md</span>
+            <h2 class="text-xl font-extrabold text-white">Architectural Plan, Guiding Principles &amp; Verified Atomic Git History</h2>
+            <p class="text-xs text-slate-300">Every commit follows <code class="font-mono text-sky-300">(&lt;type&gt;) &lt;message&gt;</code>, includes unit/integration tests, and updates <code class="font-mono text-sky-300">documentation/AUDIT_LEDGER.md</code>.</p>
+          </div>
+
+          <div class="bg-slate-950 border border-slate-700 rounded-lg p-4 overflow-x-auto">
+            <div class="text-xs font-mono font-bold text-sky-300 mb-2">SYSTEM ARCHITECTURE DIAGRAM</div>
+            <pre class="text-xs font-mono text-slate-200 leading-snug">+-----------------------------------------------------------------------------------+
+|                        AEGISWIN PORTABLE SINGLE EXECUTABLE                        |
+|  [Standard User Default (asInvoker)]  [Dynamic UI Scale]  [Zero-Knowledge PIN]    |
++-----------------------------------------+-----------------------------------------+
+                                          |
+       +----------------------------------+----------------------------------+
+       |                                  |                                  |
++------v---------------+         +--------v--------------+         +---------v-------------+
+| PORTABLE VAULT       |         | CENTRAL LLM SERVICE   |         | LOCAL MCP HTTP SERVER |
+| ./data/vault.enc     |         | - Ollama / LM Studio  |         | - Bearer Key Auth     |
+| - Scrypt KDF         |         | - OpenAI Compatible   |         | - Auto Firewall Port  |
+| - AES-256-GCM Secrets|         | - RFC1918 LAN Detector|         | - /approve/:ticketId  |
+| - PIN Redaction Guard|         | - Per-Plugin Trust    |         |   (Accept/Decline/PIN)|
++----------------------+         +-----------------------+         +-----------------------+</pre>
+          </div>
+
+          <div class="space-y-2">
+            <div class="text-xs font-mono font-bold text-emerald-300 uppercase">Verified Atomic Git Commits &amp; CI Test Suites</div>
+            <div class="space-y-1.5 text-xs font-mono" id="git-commit-ledger"></div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- MODAL 1: FIRST-RUN OPTIONAL PLUGIN & COMPONENT WIZARD -->
+  <div id="modal-first-run" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+    <div class="hc-card max-w-xl w-full p-6 space-y-4 border-sky-400">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <div>
+          <span class="text-xs font-mono uppercase text-sky-300">First-Run Setup Wizard</span>
+          <h3 class="text-lg font-extrabold text-white">Choose Optional Plugins &amp; Diagnostic Sensors</h3>
+        </div>
+        <button id="btn-close-wizard" type="button" class="text-xs font-bold text-slate-300 hover:text-white">Close</button>
+      </div>
+      <p class="text-xs text-slate-300">All selected components run inside the single portable <code class="font-mono text-sky-300">aegis-win.exe</code> binary so Windows Defender and Bitdefender heuristics remain clean.</p>
+      <div class="space-y-2.5 text-sm">
+        <label class="flex items-start gap-3 p-2.5 rounded-lg bg-slate-950 border border-slate-700 cursor-pointer">
+          <input id="wiz-comp-spikes" type="checkbox" checked class="mt-1 accent-sky-400" />
+          <div>
+            <div class="font-bold text-white">Usage Monitor: System &amp; Per-Process Resource Spikes</div>
+            <div class="text-xs text-slate-400">Tracks CPU %, RAM working set, Disk I/O, and network anomalies during scheduled timeframes.</div>
+          </div>
+        </label>
+        <label class="flex items-start gap-3 p-2.5 rounded-lg bg-slate-950 border border-slate-700 cursor-pointer">
+          <input id="wiz-comp-crash" type="checkbox" checked class="mt-1 accent-sky-400" />
+          <div>
+            <div class="font-bold text-white">Usage Monitor: Crash &amp; Hang Event Correlator</div>
+            <div class="text-xs text-slate-400">Automatically correlates resource spikes with Windows Event ID 1000/1002 application faults.</div>
+          </div>
+        </label>
+        <label class="flex items-start gap-3 p-2.5 rounded-lg bg-slate-950 border border-slate-700 cursor-pointer">
+          <input id="wiz-comp-window" type="checkbox" checked class="mt-1 accent-sky-400" />
+          <div>
+            <div class="font-bold text-white">Usage Monitor: Foreground Active Window Tracker</div>
+            <div class="text-xs text-slate-400">Logs which active window stalled when a freeze or slowdown occurred.</div>
+          </div>
+        </label>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button id="btn-save-wizard" type="button" class="hc-btn bg-sky-400 hover:bg-sky-300 text-slate-950 px-4 py-2 rounded-lg text-sm">
+          Save Component Selection
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 2: OFF-LAN EXTERNAL LLM RISK WARNING & PLUGIN TRUST PROMPT -->
+  <div id="modal-offlan-warning" class="fixed inset-0 bg-black/80 hidden items-center justify-center p-4 z-50">
+    <div class="hc-card max-w-lg w-full p-6 space-y-4 border-amber-400">
+      <div class="flex items-center gap-2 text-amber-300 font-extrabold text-base">
+        <span>Off-LAN External LLM Security Warning</span>
+      </div>
+      <p id="offlan-modal-desc" class="text-sm text-slate-200 leading-relaxed"></p>
+      <div class="bg-slate-950 border border-slate-700 p-3 rounded-lg text-xs text-slate-300 space-y-1">
+        <div><strong>Zero-Knowledge Guarantee:</strong> Your startup PIN and MCP bearer keys are automatically scrubbed before transmission.</div>
+        <div><strong>Risk:</strong> Event log messages, process names, or host identifiers in this plugin's payload will be sent to the configured external API.</div>
+      </div>
+      <div class="flex justify-end gap-3 pt-2">
+        <button id="btn-cancel-offlan" type="button" class="hc-btn bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-lg text-xs">
+          Block External Call
+        </button>
+        <button id="btn-confirm-offlan" type="button" class="hc-btn bg-amber-400 hover:bg-amber-300 text-slate-950 px-4 py-2 rounded-lg text-xs">
+          Acknowledge Risk &amp; Trust This Plugin
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // AEGISWIN IN-BROWSER PORTABLE STATE ENGINE
+    // =========================================================================
+    const state = {
+      pin: '482910',
+      isElevatedAdmin: false,
+      uiScale: 100,
+      mcpServerRunning: true,
+      mcpPort: 47821,
+      llmBaseUrl: 'http://127.0.0.1:11434/v1',
+      trustedExternalPlugins: {},
+      pendingOffLanAction: null,
+      subComponents: {
+        spikes: true,
+        crash: true,
+        window: true,
+      },
+      healthTools: [
+        {
+          id: 'flush_dns',
+          name: 'Flush DNS Resolver Cache',
+          cmd: 'ipconfig /flushdns',
+          requiresAdmin: false,
+          gatePolicy: 'pin_required',
+          dryRunText: 'DRY-RUN: Safe operation. Clears Windows DNS client cache without dropping active sockets.',
+          execText: 'Windows IP Configuration\n\nSuccessfully flushed the DNS Resolver Cache.',
+        },
+        {
+          id: 'ip_release_renew',
+          name: 'IP Config Release & Renew',
+          cmd: 'ipconfig /release && ipconfig /renew',
+          requiresAdmin: false,
+          gatePolicy: 'pin_required',
+          dryRunText: 'DRY-RUN WARNING: Temporarily drops active TCP/UDP sockets and LAN connections while DHCP lease renews.',
+          execText: 'Windows IP Configuration\n\nEthernet adapter Ethernet:\n   IPv4 Address: 192.168.1.104\n   Subnet Mask: 255.255.255.0\n   Default Gateway: 192.168.1.1 (Lease Renewed)',
+        },
+        {
+          id: 'sfc_scan',
+          name: 'System File Checker (SFC)',
+          cmd: 'sfc /scannow',
+          requiresAdmin: true,
+          gatePolicy: 'pin_required',
+          dryRunText: 'DRY-RUN: Scans protected Windows system files (3-8 mins high disk I/O). Requires Admin elevation.',
+          execText: 'Beginning system scan. Verification 100% complete.\nWindows Resource Protection found corrupt files and successfully repaired them (CBS.log).',
+        },
+        {
+          id: 'winsock_reset',
+          name: 'Reset Winsock Catalog',
+          cmd: 'netsh winsock reset',
+          requiresAdmin: true,
+          gatePolicy: 'pin_required',
+          dryRunText: 'DRY-RUN WARNING: Resets Winsock LSP catalog. Requires Administrator privileges and a system restart.',
+          execText: 'Successfully reset the Winsock Catalog.\nYou must restart the computer in order to complete the reset.',
+        },
+      ],
+      events: [
+        {
+          id: 1000,
+          channel: 'Application',
+          level: 'Error',
+          source: 'Application Error',
+          time: '2026-10-23 21:42:11',
+          proc: 'SearchIndexer.exe',
+          msg: 'Faulting application name: SearchIndexer.exe, faulting module name: mssrch.dll, exception code: 0xc0000005.',
+        },
+        {
+          id: 1002,
+          channel: 'Application',
+          level: 'Error',
+          source: 'Application Hang',
+          time: '2026-10-23 21:44:05',
+          proc: 'Explorer.EXE',
+          msg: 'The program Explorer.EXE version 10.0.22621.2506 stopped interacting with Windows and was closed.',
+        },
+        {
+          id: 7034,
+          channel: 'System',
+          level: 'Error',
+          source: 'Service Control Manager',
+          time: '2026-10-23 21:15:30',
+          proc: 'spoolsv.exe',
+          msg: 'The Print Spooler service terminated unexpectedly. It has done this 2 time(s).',
+        },
+        {
+          id: 1014,
+          channel: 'System',
+          level: 'Warning',
+          source: 'Microsoft-Windows-DNS-Client',
+          time: '2026-10-23 21:50:19',
+          proc: 'svchost.exe',
+          msg: 'Name resolution for the name api.contoso.local timed out after none of the configured DNS servers responded.',
+        },
+      ],
+      tickets: [
+        {
+          ticketId: 'T-8F3A21',
+          pluginId: 'windows-health',
+          toolId: 'winsock_reset',
+          args: { dryRun: false, requestedBy: 'claude-desktop-mcp' },
+          status: 'pending_approval',
+          comment: '',
+          createdAt: '21:54:10',
+          resultText: '',
+        },
+      ],
+      selectedTicketId: 'T-8F3A21',
+      commits: [
+        { hash: '10', tag: '(feat)', msg: 'Integrate Tauri v2 Rust backend, asInvoker manifest, and high-contrast dynamic-scale UI', test: 'tests/10-ui-and-tauri-integration.test.mjs' },
+        { hash: '09', tag: '(feat)', msg: 'Add modular Usage and Diagnostic Monitor plugin with time-window correlation', test: 'plugins/usage-monitor/tests/usage-monitor.test.mjs' },
+        { hash: '08', tag: '(feat)', msg: 'Add Windows Health optimization plugin with UAC self-elevation and dry-run safeguards', test: 'plugins/windows-health/tests/windows-health.test.mjs' },
+        { hash: '07', tag: '(feat)', msg: 'Add self-contained Windows Event Log explorer plugin with LLM log diagnostics', test: 'plugins/event-logs/tests/event-logs.test.mjs' },
+        { hash: '06', tag: '(feat)', msg: 'Build local MCP HTTP server with auto firewall port management and PIN-gated approval web portal', test: 'tests/06-mcp-server.test.mjs' },
+        { hash: '05', tag: '(feat)', msg: 'Implement compile-time plugin registry, first-run wizard state, and per-tool gate policy engine', test: 'tests/05-plugin-registry.test.mjs' },
+        { hash: '04', tag: '(feat)', msg: 'Add central LLM service with LAN detection and per-plugin external trust gate', test: 'tests/04-llm-service.test.mjs' },
+        { hash: '03', tag: '(feat)', msg: 'Implement portable zero-knowledge PIN vault and AES-256-GCM secret store', test: 'tests/03-vault.test.mjs' },
+        { hash: '02', tag: '(doc)', msg: 'Establish guiding principles, agent standards, and system architecture plan', test: 'tests/02-documentation-audit.test.mjs' },
+        { hash: '01', tag: '(chore)', msg: 'Initialize portable Windows utility repository and CI pipeline', test: 'tests/01-ci-foundation.test.mjs' },
+      ],
+    };
+
+    function showToast(msg) {
+      const banner = document.getElementById('toast-banner');
+      const text = document.getElementById('toast-text');
+      text.textContent = msg;
+      banner.classList.remove('hidden');
+    }
+
+    function isLanUrl(urlStr) {
+      try {
+        const u = new URL(urlStr);
+        const h = u.hostname.toLowerCase();
+        return (
+          h === 'localhost' ||
+          h === '127.0.0.1' ||
+          h.startsWith('192.168.') ||
+          h.startsWith('10.') ||
+          h.endsWith('.local')
+        );
+      } catch {
+        return false;
+      }
+    }
+
+    function checkLlmAccessOrWarn(pluginId, onAllowed) {
+      if (isLanUrl(state.llmBaseUrl) || state.trustedExternalPlugins[pluginId]) {
+        onAllowed();
+        return;
+      }
+      state.pendingOffLanAction = { pluginId, onAllowed };
+      const desc = document.getElementById('offlan-modal-desc');
+      desc.textContent = `Plugin "${pluginId}" is attempting to send system diagnostic data to an external Off-LAN endpoint (${state.llmBaseUrl}). Sensitive log details may leave your home network. Do you trust "${pluginId}" for external LLM calls?`;
+      const modal = document.getElementById('modal-offlan-warning');
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+    }
+
+    // 1. Render Event Logs
+    function renderEventLogs() {
+      const channel = document.getElementById('ev-channel').value;
+      const severity = document.getElementById('ev-severity').value;
+      const idFilter = document.getElementById('ev-id-filter').value.trim();
+      const container = document.getElementById('ev-results-container');
+      const cmdBox = document.getElementById('ev-native-cmd');
+
+      cmdBox.textContent = `Native Query: wevtutil qe "${channel}" ${idFilter ? `/q:"*[System[(EventID=${idFilter})]]"` : ''} /c:25 /rd:true /f:xml`;
+
+      if (channel === 'Security' && !state.isElevatedAdmin) {
+        container.innerHTML = `
+          <div class="p-4 rounded-lg border-2 border-amber-400 bg-amber-950/40 text-amber-200 text-xs space-y-2">
+            <div class="font-bold text-sm">Administrator Privileges Required for Windows Security Channel</div>
+            <div>AegisWin is running as Standard User (<code>asInvoker</code>). Click <strong>Simulate "Run as Admin"</strong> in the top bar or trigger one-time UAC self-elevation:</div>
+            <code class="block bg-slate-950 p-2 rounded font-mono text-amber-300">aegis-win.exe --elevate-tool event-logs:query_logs --channel Security</code>
+          </div>`;
+        return;
+      }
+
+      const filtered = state.events.filter((e) => {
+        if (channel !== 'Security' && e.channel !== channel) return false;
+        if (severity !== 'All' && e.level !== severity) return false;
+        if (idFilter && String(e.id) !== idFilter) return false;
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        container.innerHTML = `<div class="p-4 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-400">No matching events in ${channel} channel.</div>`;
+        return;
+      }
+
+      container.innerHTML = filtered
+        .map(
+          (e) => `
+        <div class="p-3.5 rounded-lg bg-slate-950 border border-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div class="space-y-1">
+            <div class="flex items-center gap-2">
+              <span class="px-2 py-0.5 rounded text-xs font-mono font-bold ${e.level === 'Error' ? 'bg-red-950 text-red-300 border border-red-500' : 'bg-amber-950 text-amber-300 border border-amber-500'}">Event ID ${e.id} (${e.level})</span>
+              <span class="text-xs font-bold text-white">${e.source} — ${e.proc}</span>
+              <span class="text-xs font-mono text-slate-400">${e.time}</span>
+            </div>
+            <p class="text-xs text-slate-200 font-mono">${e.msg}</p>
+          </div>
+        </div>`
+        )
+        .join('');
+    }
+
+    // 2. Render Windows Health Tools
+    function renderHealthTools() {
+      const grid = document.getElementById('health-tools-grid');
+      grid.innerHTML = state.healthTools
+        .map(
+          (t) => `
+        <div class="p-4 rounded-xl bg-slate-950 border-2 border-slate-700 flex flex-col justify-between gap-3">
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-extrabold text-sm text-white">${t.name}</span>
+              <span class="text-xs font-mono px-2 py-0.5 rounded ${t.requiresAdmin ? 'bg-amber-950 text-amber-300 border border-amber-500' : 'bg-slate-800 text-sky-300'}">
+                ${t.requiresAdmin ? 'Admin / UAC' : 'Standard User'}
+              </span>
+            </div>
+            <code class="block text-xs font-mono text-sky-300">${t.cmd}</code>
+          </div>
+          <div class="flex items-center justify-between gap-2 pt-2 border-t border-slate-800">
+            <div class="flex items-center gap-1.5 text-xs">
+              <span class="text-slate-400">MCP Gate:</span>
+              <button type="button" data-gate-toggle="${t.id}" class="px-2 py-0.5 rounded font-mono font-bold border ${t.gatePolicy === 'pin_required' ? 'bg-amber-950 text-amber-300 border-amber-500' : 'bg-emerald-950 text-emerald-300 border-emerald-500'}">
+                ${t.gatePolicy === 'pin_required' ? 'PIN Required' : 'Auto-Allow'}
+              </button>
+            </div>
+            <button type="button" data-run-health="${t.id}" class="hc-btn bg-sky-400 hover:bg-sky-300 text-slate-950 px-3 py-1.5 rounded-lg text-xs">
+              Run Tool
+            </button>
+          </div>
+        </div>`
+        )
+        .join('');
+    }
+
+    // 3. Render Usage Monitor Sub-Components & Clues
+    function renderUsageMonitor() {
+      const cards = document.getElementById('monitor-subcomponents-cards');
+      const items = [
+        { key: 'spikes', title: '1. Resource Spike Sensor', desc: 'Tracks per-process CPU %, RAM working set, and Disk I/O.' },
+        { key: 'crash', title: '2. Crash/Hang Correlator', desc: 'Links spikes with Event ID 1000/1002 application faults.' },
+        { key: 'window', title: '3. Active Window Tracker', desc: 'Captures foreground window stalls (WM_NULL timeout).' },
+      ];
+      cards.innerHTML = items
+        .map(
+          (it) => `
+        <div class="p-3.5 rounded-lg bg-slate-950 border ${state.subComponents[it.key] ? 'border-sky-400' : 'border-slate-800 opacity-60'}">
+          <div class="flex items-center justify-between">
+            <span class="font-bold text-xs text-white">${it.title}</span>
+            <span class="text-xs font-mono px-1.5 py-0.5 rounded ${state.subComponents[it.key] ? 'bg-emerald-950 text-emerald-300' : 'bg-slate-800 text-slate-400'}">
+              ${state.subComponents[it.key] ? 'Installed' : 'Disabled'}
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 mt-1">${it.desc}</p>
+        </div>`
+        )
+        .join('');
+
+      const out = document.getElementById('monitor-clues-output');
+      const start = document.getElementById('mon-start').value;
+      const end = document.getElementById('mon-end').value;
+      const cpu = document.getElementById('mon-cpu').value;
+
+      const sections = [];
+      if (state.subComponents.spikes) {
+        sections.push(`<div class="p-2.5 rounded bg-slate-900 border border-slate-700 text-xs font-mono text-sky-300">[21:42:08] SPIKE: SearchIndexer.exe (PID 4912) -> CPU: 94.6% (Threshold ${cpu}%), RAM: 2,410 MB, Disk Read: 182.4 MB/s</div>`);
+      }
+      if (state.subComponents.crash) {
+        sections.push(`<div class="p-2.5 rounded bg-slate-900 border border-red-500/60 text-xs font-mono text-red-300">[21:42:11] CORRELATED CRASH (+3s after spike): Event ID 1000 in SearchIndexer.exe (faulting module: mssrch.dll, 0xc0000005)</div>`);
+      }
+      if (state.subComponents.window) {
+        sections.push(`<div class="p-2.5 rounded bg-slate-900 border border-amber-500/60 text-xs font-mono text-amber-300">[21:42:01] FOREGROUND STALL: Explorer.EXE ("C:\\Users\\Admin\\Documents") unresponsive for 4,200 ms during disk I/O spike</div>`);
+      }
+
+      out.innerHTML = `
+        <div class="text-xs font-bold text-white uppercase tracking-wider">Correlated Clues for Window (${start} – ${end})</div>
+        ${sections.length ? sections.join('') : '<div class="text-xs text-slate-400">No sub-components enabled. Open First-Run Component Setup to enable sensors.</div>'}
+      `;
+    }
+
+    // 4. Render MCP Tickets & Approval Web Page
+    function renderMcpPortal() {
+      const list = document.getElementById('mcp-tickets-list');
+      const pendingCount = state.tickets.filter((t) => t.status === 'pending_approval').length;
+      const badge = document.getElementById('pending-badge');
+      badge.textContent = `${pendingCount} Pending`;
+
+      list.innerHTML = state.tickets
+        .map(
+          (t) => `
+        <button type="button" data-select-ticket="${t.ticketId}" class="w-full text-left p-3 rounded-lg border-2 ${state.selectedTicketId === t.ticketId ? 'border-sky-400 bg-slate-900' : 'border-slate-800 bg-slate-950'} flex items-center justify-between">
+          <div>
+            <div class="font-mono text-xs font-bold text-sky-300">${t.ticketId} — ${t.pluginId}:${t.toolId}</div>
+            <div class="text-xs text-slate-400">Requested at ${t.createdAt}</div>
+          </div>
+          <span class="text-xs font-mono px-2 py-0.5 rounded font-bold ${
+            t.status === 'pending_approval'
+              ? 'bg-amber-400 text-slate-950'
+              : t.status === 'approved'
+              ? 'bg-emerald-950 text-emerald-300 border border-emerald-500'
+              : 'bg-red-950 text-red-300 border border-red-500'
+          }">${t.status}</span>
+        </button>`
+        )
+        .join('');
+
+      const ticket = state.tickets.find((t) => t.ticketId === state.selectedTicketId) || state.tickets[0];
+      const urlBar = document.getElementById('portal-url-bar');
+      const body = document.getElementById('portal-ticket-body');
+
+      urlBar.textContent = `http://127.0.0.1:${state.mcpPort}/approve/${ticket.ticketId}`;
+
+      if (ticket.status !== 'pending_approval') {
+        body.innerHTML = `
+          <div class="p-4 rounded-lg bg-slate-900 border border-slate-700 space-y-2 text-xs">
+            <div class="font-bold text-sm text-white">Ticket ${ticket.ticketId} Finalized (${ticket.status.toUpperCase()})</div>
+            <div><strong>Tool:</strong> <code class="font-mono text-sky-300">${ticket.pluginId}:${ticket.toolId}</code></div>
+            <div><strong>Operator Comment returned to MCP Agent:</strong> "${ticket.comment || 'No comment provided'}"</div>
+            <div><strong>PIN Exposure Check:</strong> <span class="text-emerald-300 font-mono">Verified Locally (Zero PIN data in MCP response)</span></div>
+            ${ticket.resultText ? `<pre class="p-2.5 rounded bg-slate-950 border border-slate-800 font-mono text-emerald-300 whitespace-pre-wrap">${ticket.resultText}</pre>` : ''}
+          </div>`;
+        return;
+      }
+
+      body.innerHTML = `
+        <div class="space-y-3 text-xs">
+          <div class="flex items-center justify-between">
+            <span class="font-bold text-sm text-white">Action: <code class="text-sky-300 font-mono">${ticket.pluginId}:${ticket.toolId}</code></span>
+            <span class="font-mono text-amber-300">Awaiting Human PIN</span>
+          </div>
+          <pre class="p-2.5 rounded bg-slate-900 border border-slate-800 font-mono text-slate-200">${JSON.stringify(ticket.args, null, 2)}</pre>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="p-2.5 rounded border-2 border-emerald-500/70 bg-emerald-950/30 flex items-center gap-2 cursor-pointer font-bold text-emerald-200">
+              <input type="radio" name="portal-decision" value="accept" checked class="accent-emerald-400" />
+              Accept &amp; Execute
+            </label>
+            <label class="p-2.5 rounded border-2 border-red-500/70 bg-red-950/30 flex items-center gap-2 cursor-pointer font-bold text-red-200">
+              <input type="radio" name="portal-decision" value="decline" class="accent-red-400" />
+              Decline Action
+            </label>
+          </div>
+          <div>
+            <label for="portal-comment" class="block font-bold text-slate-200 mb-1">Operator Comments (Sent to AI Agent):</label>
+            <input id="portal-comment" type="text" placeholder="e.g. Approved, please check DNS after reset" class="w-full bg-slate-900 border-2 border-slate-700 rounded px-3 py-1.5 text-white" />
+          </div>
+          <div>
+            <label for="portal-pin" class="block font-bold text-slate-200 mb-1">Enter Startup Security PIN (Default: 482910):</label>
+            <input id="portal-pin" type="password" value="482910" class="w-full bg-slate-900 border-2 border-slate-700 rounded px-3 py-1.5 text-white font-mono" />
+          </div>
+          <button id="btn-submit-portal-decision" type="button" class="hc-btn w-full bg-sky-400 hover:bg-sky-300 text-slate-950 py-2 rounded-lg font-extrabold text-sm">
+            Submit Verified Decision
+          </button>
+        </div>`;
+    }
+
+    // 5. Render LLM Config & Per-Plugin Trust Matrix
+    function renderLlmConfig() {
+      const onLan = isLanUrl(state.llmBaseUrl);
+      const badge = document.getElementById('llm-lan-badge');
+      const box = document.getElementById('llm-network-classification');
+      const evPill = document.getElementById('event-logs-trust-pill');
+
+      if (onLan) {
+        badge.textContent = 'LAN';
+        badge.className = 'text-xs font-mono px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-500';
+        box.className = 'p-3.5 rounded-lg border-2 border-emerald-500 bg-emerald-950/40 text-xs text-emerald-200 font-medium';
+        box.textContent = `ON-LAN DETECTED (${state.llmBaseUrl}): Endpoint resolves to local loopback or private RFC1918 LAN subnet. Diagnostic data stays on your home network.`;
+      } else {
+        badge.textContent = 'OFF-LAN';
+        badge.className = 'text-xs font-mono px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-500';
+        box.className = 'p-3.5 rounded-lg border-2 border-amber-400 bg-amber-950/40 text-xs text-amber-200 font-medium';
+        box.textContent = `OFF-LAN EXTERNAL API DETECTED (${state.llmBaseUrl}): Each plugin requires explicit user trust acknowledgment before transmitting system logs externally.`;
+      }
+
+      evPill.textContent = state.trustedExternalPlugins['event-logs'] ? 'Trusted Off-LAN' : 'Untrusted Off-LAN';
+
+      const plugins = [
+        { id: 'event-logs', name: 'Event & App Log Explorer' },
+        { id: 'windows-health', name: 'Windows Health Optimizer' },
+        { id: 'usage-monitor', name: 'Usage & Crash Monitor' },
+      ];
+      const matrix = document.getElementById('llm-trust-matrix');
+      matrix.innerHTML = plugins
+        .map((p) => {
+          const trusted = !!state.trustedExternalPlugins[p.id];
+          return `
+          <div class="p-3.5 rounded-lg bg-slate-950 border border-slate-700 flex items-center justify-between">
+            <div>
+              <div class="font-bold text-xs text-white">${p.name}</div>
+              <div class="text-xs font-mono ${trusted ? 'text-emerald-300' : 'text-amber-300'}">${trusted ? 'External LLM Trusted' : 'Prompt on Off-LAN'}</div>
+            </div>
+            <button type="button" data-toggle-llm-trust="${p.id}" class="hc-btn text-xs px-2.5 py-1 rounded ${trusted ? 'bg-slate-800 text-slate-200' : 'bg-amber-400 text-slate-950'}">
+              ${trusted ? 'Revoke' : 'Trust'}
+            </button>
+          </div>`;
+        })
+        .join('');
+    }
+
+    // 6. Render Git Commit Ledger
+    function renderGitLedger() {
+      const container = document.getElementById('git-commit-ledger');
+      container.innerHTML = state.commits
+        .map(
+          (c) => `
+        <div class="p-2.5 rounded bg-slate-950 border border-slate-800 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <span class="text-sky-300 font-bold">#${c.hash}</span>
+            <span class="text-emerald-300 font-bold ml-1">${c.tag}</span>
+            <span class="text-slate-100 ml-1">${c.msg}</span>
+          </div>
+          <span class="text-slate-400">CI Verified: <code class="text-sky-300">${c.test}</code></span>
+        </div>`
+        )
+        .join('');
+    }
+
+    // =========================================================================
+    // EVENT LISTENERS & DELEGATION
+    // =========================================================================
+    document.addEventListener('DOMContentLoaded', () => {
+      renderEventLogs();
+      renderHealthTools();
+      renderUsageMonitor();
+      renderMcpPortal();
+      renderLlmConfig();
+      renderGitLedger();
+
+      // Navigation tabs
+      document.querySelectorAll('.nav-tab-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const target = btn.getAttribute('data-tab');
+          document.querySelectorAll('.tab-panel').forEach((p) => p.classList.add('hidden'));
+          document.getElementById(target).classList.remove('hidden');
+
+          document.querySelectorAll('.nav-tab-btn').forEach((b) => {
+            b.className = 'nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between text-slate-100 hover:bg-slate-800';
+          });
+          btn.className = 'nav-tab-btn w-full text-left px-3 py-2.5 rounded-lg font-bold text-sm flex items-center justify-between bg-sky-400 text-slate-950';
+        });
+      });
+
+      // Dynamic UI Scale Slider
+      document.getElementById('scale-slider').addEventListener('input', (e) => {
+        const val = Number(e.target.value);
+        state.uiScale = val;
+        document.documentElement.style.setProperty('--ui-scale', (val / 100).toFixed(2));
+        document.getElementById('scale-label').textContent = `${val}%`;
+      });
+
+      // Toggle Standard User vs Elevated Admin simulation
+      document.getElementById('btn-toggle-admin').addEventListener('click', () => {
+        state.isElevatedAdmin = !state.isElevatedAdmin;
+        const badge = document.getElementById('privilege-badge');
+        const btn = document.getElementById('btn-toggle-admin');
+        if (state.isElevatedAdmin) {
+          badge.textContent = 'Mode: Administrator (Elevated)';
+          badge.className = 'text-xs font-mono px-2 py-0.5 rounded bg-emerald-950 border border-emerald-400 text-emerald-200';
+          btn.textContent = 'Switch to Standard User';
+          showToast('Switched to Elevated Administrator mode. Admin-gated tools (SFC, Winsock, Security Logs) will execute directly.');
+        } else {
+          badge.textContent = 'Mode: Standard User (asInvoker)';
+          badge.className = 'text-xs font-mono px-2 py-0.5 rounded bg-amber-950 border border-amber-400 text-amber-200';
+          btn.textContent = 'Simulate "Run as Admin"';
+          showToast('Switched to Standard User default (asInvoker). Admin tools will display UAC self-elevation commands.');
+        }
+        renderEventLogs();
+      });
+
+      // Update Startup PIN
+      document.getElementById('btn-set-pin').addEventListener('click', () => {
+        const val = document.getElementById('startup-pin-input').value.trim();
+        if (val.length < 4) {
+          showToast('Error: Startup PIN must be at least 4 characters.');
+          return;
+        }
+        state.pin = val;
+        document.getElementById('vault-status-text').innerHTML = `Startup PIN Updated &amp; Derived in Memory (Scrypt + AES-256-GCM). AI/MCP Exposure: <code class="font-mono text-emerald-300">0%</code>.`;
+        showToast('Portable Vault re-encrypted with new Startup PIN.');
+      });
+
+      // First-Run Wizard Modal
+      document.getElementById('btn-open-wizard').addEventListener('click', () => {
+        const m = document.getElementById('modal-first-run');
+        m.classList.remove('hidden');
+        m.classList.add('flex');
+      });
+      document.getElementById('btn-close-wizard').addEventListener('click', () => {
+        const m = document.getElementById('modal-first-run');
+        m.classList.add('hidden');
+        m.classList.remove('flex');
+      });
+      document.getElementById('btn-save-wizard').addEventListener('click', () => {
+        state.subComponents.spikes = document.getElementById('wiz-comp-spikes').checked;
+        state.subComponents.crash = document.getElementById('wiz-comp-crash').checked;
+        state.subComponents.window = document.getElementById('wiz-comp-window').checked;
+        renderUsageMonitor();
+        const m = document.getElementById('modal-first-run');
+        m.classList.add('hidden');
+        m.classList.remove('flex');
+        showToast('Saved First-Run optional component selections to Portable Vault.');
+      });
+
+      // Event Log controls
+      document.getElementById('btn-query-logs').addEventListener('click', renderEventLogs);
+      document.getElementById('ev-channel').addEventListener('change', renderEventLogs);
+      document.getElementById('ev-severity').addEventListener('change', renderEventLogs);
+
+      document.getElementById('btn-analyze-logs-llm').addEventListener('click', () => {
+        checkLlmAccessOrWarn('event-logs', () => {
+          const box = document.getElementById('ev-llm-output');
+          const txt = document.getElementById('ev-llm-text');
+          box.classList.remove('hidden');
+          txt.textContent = `[Model via ${state.llmBaseUrl}] Root Cause: Event ID 1000 in SearchIndexer.exe (mssrch.dll, 0xc0000005) correlates with corrupted Windows.edb index pages, which also triggered the Event ID 1002 hang in Explorer.EXE. Recommended Fix: Rebuild Windows Search Index or run sfc /scannow.`;
+          showToast('Central LLM completed root-cause analysis on filtered Windows Event Logs.');
+        });
+      });
+
+      // Health Tools Delegation
+      document.getElementById('health-tools-grid').addEventListener('click', (e) => {
+        const gateBtn = e.target.closest('[data-gate-toggle]');
+        if (gateBtn) {
+          const id = gateBtn.getAttribute('data-gate-toggle');
+          const tool = state.healthTools.find((t) => t.id === id);
+          if (tool) {
+            tool.gatePolicy = tool.gatePolicy === 'pin_required' ? 'auto' : 'pin_required';
+            renderHealthTools();
+            showToast(`Updated MCP gate policy for windows-health:${tool.id} to "${tool.gatePolicy}".`);
+          }
+          return;
+        }
+
+        const runBtn = e.target.closest('[data-run-health]');
+        if (runBtn) {
+          const id = runBtn.getAttribute('data-run-health');
+          const tool = state.healthTools.find((t) => t.id === id);
+          const dryRun = document.getElementById('health-dry-run-toggle').checked;
+          const out = document.getElementById('health-console-output');
+          if (!tool) return;
+
+          if (dryRun) {
+            out.textContent = `[DRY-RUN MODE] Command: ${tool.cmd}\n${tool.dryRunText}`;
+            return;
+          }
+
+          if (tool.requiresAdmin && !state.isElevatedAdmin) {
+            out.textContent = `[STANDARD USER GUARD] "${tool.name}" (${tool.cmd}) requires Administrator privileges.\n\nSelf-Elevation Command Ready:\n  aegis-win.exe --elevate-tool windows-health:${tool.id}\n\n(Tip: Click 'Simulate "Run as Admin"' in the top header to test elevated execution.)`;
+            return;
+          }
+
+          out.textContent = `> ${tool.cmd}\n\n${tool.execText}`;
+          showToast(`Executed ${tool.cmd} successfully.`);
+        }
+      });
+
+      document.getElementById('btn-health-llm-explain').addEventListener('click', () => {
+        checkLlmAccessOrWarn('windows-health', () => {
+          const out = document.getElementById('health-console-output');
+          out.textContent += `\n\n[Central LLM Advisor (${state.llmBaseUrl})]: Output indicates clean execution. If Winsock was reset, schedule a reboot before testing socket bindings.`;
+        });
+      });
+
+      // Usage Monitor
+      document.getElementById('btn-capture-clues').addEventListener('click', () => {
+        renderUsageMonitor();
+        showToast('Captured correlated resource spike & crash clues for active timeframe.');
+      });
+
+      // MCP Portal interactions
+      document.getElementById('btn-simulate-mcp-call').addEventListener('click', () => {
+        const newId = 'T-' + Math.floor(100000 + Math.random() * 900000);
+        state.tickets.unshift({
+          ticketId: newId,
+          pluginId: 'windows-health',
+          toolId: 'sfc_scan',
+          args: { dryRun: false, requestedBy: 'external-mcp-agent' },
+          status: 'pending_approval',
+          comment: '',
+          createdAt: new Date().toTimeString().slice(0, 8),
+          resultText: '',
+        });
+        state.selectedTicketId = newId;
+        renderMcpPortal();
+        showToast(`MCP Agent called gated tool "windows-health:sfc_scan". Returned approval URL: http://127.0.0.1:${state.mcpPort}/approve/${newId}`);
+      });
+
+      document.getElementById('btn-toggle-mcp-server').addEventListener('click', (e) => {
+        state.mcpServerRunning = !state.mcpServerRunning;
+        const pill = document.getElementById('mcp-header-pill');
+        const fwCmd = document.getElementById('mcp-fw-cmd');
+        const sideFw = document.getElementById('sidebar-fw-state');
+        if (state.mcpServerRunning) {
+          e.target.textContent = 'Stop MCP Server (Close Port)';
+          pill.textContent = `MCP HTTP :${state.mcpPort} Active (Firewall Open)`;
+          pill.className = 'text-xs font-mono px-2.5 py-1 rounded-full bg-emerald-950 border border-emerald-400 text-emerald-200';
+          fwCmd.textContent = `netsh advfirewall firewall add rule name="AegisWin_MCP_${state.mcpPort}" dir=in action=allow protocol=TCP localport=${state.mcpPort}`;
+          sideFw.textContent = 'Auto-Opened';
+          showToast(`MCP Server started on port ${state.mcpPort} and Windows Firewall port opened automatically.`);
+        } else {
+          e.target.textContent = 'Start MCP Server (Auto-Open Port)';
+          pill.textContent = 'MCP HTTP Server Stopped (Port Closed)';
+          pill.className = 'text-xs font-mono px-2.5 py-1 rounded-full bg-slate-800 border border-slate-600 text-slate-300';
+          fwCmd.textContent = `netsh advfirewall firewall delete rule name="AegisWin_MCP_${state.mcpPort}" protocol=TCP localport=${state.mcpPort}`;
+          sideFw.textContent = 'Closed (Cleaned Up)';
+          showToast(`MCP Server stopped and Windows Firewall rule removed.`);
+        }
+      });
+
+      document.getElementById('mcp-tickets-list').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-select-ticket]');
+        if (btn) {
+          state.selectedTicketId = btn.getAttribute('data-select-ticket');
+          renderMcpPortal();
+        }
+      });
+
+      document.getElementById('portal-ticket-body').addEventListener('click', (e) => {
+        if (e.target.id === 'btn-submit-portal-decision') {
+          const enteredPin = document.getElementById('portal-pin').value;
+          const comment = document.getElementById('portal-comment').value.trim();
+          const decisionEl = document.querySelector('input[name="portal-decision"]:checked');
+          const decision = decisionEl ? decisionEl.value : 'accept';
+
+          if (enteredPin !== state.pin) {
+            showToast('403 INVALID_PIN: Security PIN did not match Startup PIN. Action remains blocked.');
+            return;
+          }
+
+          const ticket = state.tickets.find((t) => t.ticketId === state.selectedTicketId);
+          if (!ticket) return;
+
+          ticket.comment = comment;
+          if (decision === 'accept') {
+            ticket.status = 'approved';
+            ticket.resultText = `Executed ${ticket.pluginId}:${ticket.toolId} -> Completed successfully.`;
+            showToast(`Ticket ${ticket.ticketId} APPROVED with valid PIN. Result + comment made available to MCP agent.`);
+          } else {
+            ticket.status = 'declined';
+            ticket.resultText = 'Action declined by operator.';
+            showToast(`Ticket ${ticket.ticketId} DECLINED. Operator comment returned to MCP agent.`);
+          }
+          renderMcpPortal();
+        }
+      });
+
+      // LLM Config & Off-LAN Warning Modal
+      document.getElementById('llm-preset').addEventListener('change', (e) => {
+        state.llmBaseUrl = e.target.value;
+        document.getElementById('llm-base-url').value = state.llmBaseUrl;
+        renderLlmConfig();
+      });
+
+      document.getElementById('llm-base-url').addEventListener('input', (e) => {
+        state.llmBaseUrl = e.target.value.trim();
+        renderLlmConfig();
+      });
+
+      document.getElementById('llm-trust-matrix').addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-toggle-llm-trust]');
+        if (btn) {
+          const id = btn.getAttribute('data-toggle-llm-trust');
+          state.trustedExternalPlugins[id] = !state.trustedExternalPlugins[id];
+          renderLlmConfig();
+        }
+      });
+
+      document.getElementById('btn-cancel-offlan').addEventListener('click', () => {
+        state.pendingOffLanAction = null;
+        const m = document.getElementById('modal-offlan-warning');
+        m.classList.add('hidden');
+        m.classList.remove('flex');
+        showToast('Blocked external Off-LAN LLM request.');
+      });
+
+      document.getElementById('btn-confirm-offlan').addEventListener('click', () => {
+        const pending = state.pendingOffLanAction;
+        const m = document.getElementById('modal-offlan-warning');
+        m.classList.add('hidden');
+        m.classList.remove('flex');
+        if (pending) {
+          state.trustedExternalPlugins[pending.pluginId] = true;
+          state.pendingOffLanAction = null;
+          renderLlmConfig();
+          pending.onAllowed();
+        }
+      });
+
+      document.getElementById('btn-close-toast').addEventListener('click', () => {
+        document.getElementById('toast-banner').classList.add('hidden');
+      });
+    });
+  </script>
+</body>
+</html>
