@@ -13,7 +13,7 @@
 ### 2.1 Rust Core Requirements ([ADR 0001](adr/0001-rust-core.md))
 - **Algorithms**: Argon2id (`argon2` crate) for new vaults, AES-256-GCM (`aes-gcm`), `OsRng` for every salt, nonce, ticket ID, and CSRF token. No hand-rolled cryptography.
 - **Secret memory**: the PIN, derived key, and decrypted secrets are held in `zeroize`-on-drop types inside the Rust process and wiped when the vault locks. Comparisons of verifiers and tokens use constant-time equality (`subtle`).
-- **Webview boundary**: the webview is untrusted for secrets. It sends the startup PIN to exactly one Tauri command (`unlock_vault`), keeps no copy, and never receives API keys, bearer tokens, or derived keys back. Secret-bearing types do not implement `Serialize` or `Debug`, so they cannot leak into an `invoke` response or a log line by accident.
+- **Webview boundary**: the webview is untrusted for secrets. It sends the startup PIN to exactly one Tauri command (`unlock_vault`), keeps no copy, and never receives API keys or derived keys back. The MCP bearer token is the one exception: the user needs it to configure an MCP client, so it is returned only by an explicit, PIN-confirmed `reveal_mcp_token` action. API keys are write-only from the UI. Secret-bearing types do not implement `Serialize` or `Debug`, so they cannot leak into an `invoke` response or a log line by accident.
 - **No demo credentials**: no build may ship a default or hardcoded PIN. A vault that doesn't exist yet means first-run PIN setup.
 - **Process execution**: system binaries are launched by absolute path with argument vectors only. No shell, no `PATH` lookup, no string-built command lines (see [PLUGIN_SPEC §4](PLUGIN_SPEC.md)).
 

@@ -94,3 +94,54 @@ The prototype's vault format is **not** carried over; there are no real users or
 
 - How the elevated process gets the job-bridge key without asking for the PIN again (step 6).
 - React or plain TypeScript for the UI (step 8). `react` is declared in `package.json` but unused.
+
+---
+
+## Amendment 1: plan review before implementation (2026-10-24)
+
+I re-read the whole prototype (core, plugins, UI, tests) before starting the port and checked the plan against the vision. These corrections take precedence over the sections above where they conflict.
+
+### Definition of "basic functioning app"
+
+A Windows user can, from one portable `aegis-win.exe`:
+
+1. Create a PIN on first launch and unlock with it on later launches. Wrong PINs are rate-limited; no PIN is preset.
+2. Pick which plugins and components to enable in the first-run wizard.
+3. Read **real** Application/System event log entries, filter them by Event ID, and ask an LLM to explain them.
+4. Run the repair tools for real (`ipconfig /flushdns`, `/release` + `/renew`, `sfc /scannow`, `netsh winsock reset`). Each one confirms with the PIN, previews its impact with `dryRun`, and gives clear guidance when it needs admin rights.
+5. See live CPU/RAM usage by process, recorded spikes, and crash events correlated within a watch window.
+6. Start an MCP server that real MCP clients (Claude Code, Claude Desktop, etc.) can connect to. `auto` tools return results directly. `pin_required` tools return an approval link, and the action runs only after the user approves it with the PIN, in the browser or in the app.
+7. Point the LLM service at Ollama or LM Studio, or at an external endpoint, which requires per-plugin trust and scrubs PII before sending.
+8. Nothing is written outside `./data/`, and nothing is loaded from the internet at runtime.
+
+### Assumptions challenged → corrections
+
+| # | Assumption in the plan or prototype | Problem | Correction |
+| :--- | :--- | :--- | :--- |
+| 1 | "Nothing is written outside `./data/`" holds automatically with Tauri | WebView2 stores its profile in `%LOCALAPPDATA%\<identifier>\EBWebView` by default | Create the window in code with its WebView2 data directory set to `./data/webview` |
+| 2 | Tool names like `event-logs:query_logs` | Claude clients (and the Claude API) only accept tool names matching `^[a-zA-Z0-9_-]{1,64}$`; the colon breaks them | MCP tool names are `<plugin>__<tool>` (e.g. `event-logs__query_logs`) and `aegis__check_ticket`; internal IDs keep `plugin:tool` |
+| 3 | The prototype's `/mcp` is MCP | No `initialize` handshake, no `ping`, and results aren't MCP `content` blocks, so real clients can't connect | Implement MCP Streamable HTTP (JSON responses): `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, with `content` + `structuredContent` + `isError`; validate `Origin` as well as `Host` |
+| 4 | 3-strike lockout per ticket stops brute force | An agent can create unlimited tickets and get 3 guesses on each. CSRF doesn't help either, because the agent can fetch the page and its token itself | Add a **global** PIN guard shared by unlock and all approvals: after 5 consecutive failures, exponential cooldown (30 s doubling, capped at 1 h), reset on success. Keep the per-ticket 3-strike lockout too |
+| 5 | The approval page is safe | The prototype puts agent-supplied `args` into the HTML without escaping, so an agent could inject script into the page where the user types their PIN. CSRF is also skipped when the token is simply omitted | HTML-escape everything, require CSRF, and send a strict CSP (`default-src 'none'`), `X-Frame-Options: DENY`, `no-store`, `no-referrer` |
+| 6 | A 4-character PIN protects the vault | Offline, the vault's security depends only on how hard the PIN is to guess | Minimum 6 characters, any characters allowed, with a strength hint in the UI. **Open for the user:** whether to also bind the vault to the Windows account (DPAPI), which is stronger at rest but breaks moving the app to another PC |
+| 7 | IPv6 private-range detection by string prefix | `host.startsWith('fc')` classifies `fcbarcelona.com` as LAN | Only check private ranges on addresses that actually parse as IP addresses (`std::net::IpAddr`) |
+| 8 | The webview never receives the MCP bearer token | The user has to copy it into their MCP client | The token is sent to the webview only through an explicit `reveal_mcp_token(pin)` action; API keys are write-only from the UI |
+| 9 | Gate policies can be changed freely | Downgrading `pin_required` → `auto` removes the human check | Downgrading requires the PIN; upgrading doesn't |
+| 10 | Elevation via the encrypted job bridge | The elevated process has no way to get the vault key without the PIN (the open question above) | **Deferred.** Basic app: admin tools say they need admin and offer "Restart AegisWin as administrator" (`ShellExecuteExW` `runas` on its own exe, then exit). This is already allowed by Guiding Principle 3. The job bridge comes back as its own design decision |
+| 11 | Async execution only when `asyncExecution: true` | Long tools (`sfc`) block the approval HTTP request | Approved tickets always run in the background (`running` → `approved`/`execution_failed`); agents poll `aegis__check_ticket` |
+| 12 | Tool commands are strings like `ipconfig /release "<filter>"` | String-built commands invite injection | Absolute `System32` paths with argument vectors and `CREATE_NO_WINDOW`; validate input against `inputSchema` plus per-tool allow-lists. Decode `sfc` output as UTF-16 |
+| 13 | Usage telemetry persisted to `./data/telemetry.json` | Foreground-app history is privacy-sensitive and would sit on disk in plaintext | Keep telemetry in memory only (capped ring buffer); record process names only, never window titles; `purge_telemetry_history` clears it |
+| 14 | UI: React + Tailwind (CDN) | React is declared but unused; the CDN breaks offline use and is an injection risk | Plain TypeScript modules + hand-written CSS using the existing design tokens. Drop `react`/`react-dom`. Set a strict CSP in `tauri.conf.json` |
+| 15 | Each plugin is fully separate | `usage-monitor`'s crash correlator needs the same event-log reader as `event-logs` | Shared OS primitives (event-log query, `run_system_binary`, `is_elevated`) live in `aegis-core::os`; plugins stay separate crates |
+| 16 | One PR per port step, deleting JS as each lands | The JS modules all import `vault.mjs`, so they can't be deleted one by one | One feature branch with one atomic, signed commit per step (each passes CI and updates the ledger), opened as a single PR. The JS prototype and its tests are deleted in the final commit, once Rust tests cover the behavior. The elevation-bridge spec stays in git history for the deferred work |
+
+### Revised implementation order (commits on `feat/rust-core`)
+
+1. Cargo workspace + `aegis-core::vault` (Argon2id, AES-256-GCM, PIN guard, atomic saves) + `cargo test` in `npm run ci`.
+2. `aegis-core::os` + plugin registry, gate engine, and input validation.
+3. `aegis-core::llm`: LAN classification, Off-LAN trust gate, PII/host scrubbing, OpenAI-compatible client.
+4. Plugins: `event-logs` (Win32 `EvtQuery`), `windows-health`, `usage-monitor`.
+5. `aegis-core::mcp`: MCP server, tickets, approval portal, bind-aware firewall handling.
+6. Tauri app: commands, `./data` paths, WebView2 data directory, CSP, restart-as-admin.
+7. UI rebuild on `invoke`.
+8. Remove the JS prototype and its tests, and bring the docs in line with the shipped design.
