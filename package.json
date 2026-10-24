@@ -1,0 +1,26 @@
+{
+  "name": "aegis-win",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Portable Windows Diagnostic, Health Optimization, and PIN-Gated MCP Utility",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "test": "node --test tests/**/*.test.mjs plugins/**/tests/*.test.mjs",
+    "ci": "node scripts/ci-runner.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

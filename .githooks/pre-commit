@@ -1,0 +1,3 @@
+#!/bin/sh
+# Run the full AegisWin CI pipeline before every commit
+node scripts/ci-runner.mjs

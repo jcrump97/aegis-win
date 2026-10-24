@@ -1,0 +1,8 @@
+# Build & dependency artifacts
+node_modules/
+dist/
+src-tauri/target/
+data/
+*.log
+.DS_Store
+Thumbs.db

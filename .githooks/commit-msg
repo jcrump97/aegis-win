@@ -1,0 +1,9 @@
+#!/bin/sh
+# Enforce prepended commit type: e.g., (feat) message, (fix) message, (doc) message, (chore) message
+COMMIT_MSG_FILE=$1
+FIRST_LINE=$(head -n 1 "$COMMIT_MSG_FILE")
+if ! echo "$FIRST_LINE" | grep -Eq '^\((feat|fix|doc|chore|test|refactor|security|perf)\) .+'; then
+  echo "[Git Hook Error] Commit message must start with a prepended type tag, e.g. '(feat) Add module'"
+  echo "Actual: $FIRST_LINE"
+  exit 1
+fi

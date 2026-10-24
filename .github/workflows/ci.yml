@@ -1,0 +1,27 @@
+name: AegisWin Atomic CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify-atomic-commit-and-tests:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust Toolchain (Tauri v2 Backend)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Atomic CI Verification & All Plugin Tests
+        run: node scripts/ci-runner.mjs
