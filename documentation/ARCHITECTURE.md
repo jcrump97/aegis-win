@@ -119,3 +119,6 @@ aegis-win/
 └── tests/
     └── *.test.mjs              # Core & architectural verification test suites
 ```
+
+### 2.3 Asynchronous Job Streaming for Long-Running Tools (`sfc /scannow`)
+When a slow administrative command is approved on `/approve/:ticketId` with `asyncExecution: true`, the HTTP handler transitions the ticket to `status: "running"` (`progressPercent: 15..100`) and spawns a non-blocking worker so the browser tab never hangs and the MCP agent can poll `mcp:check_ticket` for completion.

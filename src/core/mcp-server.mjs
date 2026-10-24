@@ -152,6 +152,7 @@ export class LocalMcpServer {
       status: ticket.status,
       failedPinAttempts: ticket.failedPinAttempts || 0,
       maxPinAttempts: this.maxPinAttempts,
+      progressPercent: ticket.progressPercent ?? (ticket.status === 'approved' ? 100 : 0),
       approvalUrl: ticket.approvalUrl,
       userComment: this.vault.scrubForExternalOutput(ticket.userComment || ''),
       createdAt: ticket.createdAt,
@@ -444,14 +445,33 @@ export class LocalMcpServer {
     ticket.decidedAt = new Date().toISOString();
 
     if (decision === 'accept') {
-      ticket.status = 'approved';
-      try {
-        ticket.result = await this.registry.executeToolDirect(ticket.pluginId, ticket.toolId, ticket.args, {
-          approvedByTicket: ticket.ticketId,
+      if (ticket.args?.asyncExecution) {
+        ticket.status = 'running';
+        ticket.progressPercent = 15;
+        setImmediate(async () => {
+          try {
+            ticket.progressPercent = 65;
+            ticket.result = await this.registry.executeToolDirect(ticket.pluginId, ticket.toolId, ticket.args, {
+              approvedByTicket: ticket.ticketId,
+            });
+            ticket.progressPercent = 100;
+            ticket.status = 'approved';
+          } catch (execErr) {
+            ticket.status = 'execution_failed';
+            ticket.error = this.vault.scrubForExternalOutput(execErr.message);
+          }
         });
-      } catch (execErr) {
-        ticket.status = 'execution_failed';
-        ticket.error = this.vault.scrubForExternalOutput(execErr.message);
+      } else {
+        ticket.status = 'approved';
+        ticket.progressPercent = 100;
+        try {
+          ticket.result = await this.registry.executeToolDirect(ticket.pluginId, ticket.toolId, ticket.args, {
+            approvedByTicket: ticket.ticketId,
+          });
+        } catch (execErr) {
+          ticket.status = 'execution_failed';
+          ticket.error = this.vault.scrubForExternalOutput(execErr.message);
+        }
       }
     } else {
       ticket.status = 'declined';
