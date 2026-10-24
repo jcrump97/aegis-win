@@ -144,6 +144,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn manifest_property_order_is_kept() {
+        // The UI builds tool forms in this order, so it must match the manifest
+        // (needs serde_json's `preserve_order` feature).
+        let schema: Value = serde_json::from_str(r#"{"properties":{"startTime":{},"endTime":{},"cpuThresholdPercent":{}}}"#).unwrap();
+        let keys: Vec<&str> = schema["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["startTime", "endTime", "cpuThresholdPercent"]);
+    }
+
     fn schema() -> Value {
         json!({
             "type": "object",
