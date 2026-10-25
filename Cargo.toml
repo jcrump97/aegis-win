@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/aegis-core", "plugins/event-logs", "plugins/windows-health", "plugins/usage-monitor"]
+# The one-click launcher is std-only with its own size-optimized release profile and lockfile.
+exclude = ["launcher"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+aegis-core = { path = "crates/aegis-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+
+# Argon2id is unusably slow without optimizations, which would make debug
+# builds and `cargo test` take seconds per unlock.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

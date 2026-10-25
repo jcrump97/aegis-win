@@ -4,7 +4,7 @@
 
 **AegisWin** is a portable Windows utility built on **Tauri v2**. All core logic lives in the **Rust backend**: vault, plugin registry and gate policy engine, LLM service, MCP server, and the plugins themselves. A **Vite + TypeScript** webview UI is a presentation layer only. It has a compile-time modular plugin architecture, a central OpenAI-compatible LLM diagnostic service, and an authenticated HTTP MCP server with PIN-gated human approval.
 
-> **Migration status**: the core is being ported from a Node.js prototype (`src/core/*.mjs`, `plugins/*/index.mjs`) to Rust, one module per PR. See [ADR 0001](adr/0001-rust-core.md) for the decision, the target layout, and the port order. The diagrams below describe the target design. Until a module is ported, its JS prototype and tests are the behavioral spec.
+> **Status**: the port from the Node.js prototype to Rust is complete and the prototype has been removed. See [ADR 0001](adr/0001-rust-core.md) for the decision and its amendment for what "basic functioning app" covers.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -30,8 +30,8 @@
 |             |                           |                           |             |
 |  +----------v-----------+   +-----------v------------+   +----------v----------+  |
 |  |  PORTABLE VAULT      |   |  CENTRAL LLM SERVICE   |   |  LOCAL MCP SERVER   |  |
-|  |  (./data/vault.enc)  |   |  - Ollama / LM Studio  |   |  - Bearer Key Auth  |  |
-|  |  - Scrypt/Argon2 KDF |   |  - OpenAI Compatible   |   |  - Auto Firewall    |  |
+|  | ./data/vault.enc.json|   |  - Ollama / LM Studio  |   |  - Bearer Key Auth  |  |
+|  |  - Argon2id KDF      |   |  - OpenAI Compatible   |   |  - Auto Firewall    |  |
 |  |  - AES-256-GCM Keys  |   |  - RFC1918 LAN Check   |   |  - /mcp JSON-RPC    |  |
 |  |  - Zero-Knowledge PIN|   |  - Per-Plugin Trust    |   |  - /approve/:ticket |  |
 |  +----------------------+   +------------------------+   +---------------------+  |
@@ -51,20 +51,20 @@ sequenceDiagram
     participant Portal as Local Approval Web Page (/approve/:id)
     participant User as Human Operator
 
-    Agent->>MCP: POST /mcp (Bearer Token) -> tools/call "windows-health:winsock_reset"
-    MCP->>Gate: Check tool gate policy for "windows-health:winsock_reset"
+    Agent->>MCP: POST /mcp (Bearer Token) -> tools/call "windows-health__winsock_reset"
+    MCP->>Gate: Check install state, schema, admin, then gate policy
     alt Tool Policy == "auto"
         Gate->>MCP: Execute tool immediately
-        MCP-->>Agent: 200 OK { status: "completed", result: {...} }
+        MCP-->>Agent: 200 OK { content, structuredContent, isError: false }
     else Tool Policy == "pin_required"
-        Gate->>MCP: Create Pending Ticket #T-9042
-        MCP-->>Agent: 200 OK { status: "pending_approval", ticketId: "T-9042", approvalUrl: "http://127.0.0.1:47821/approve/T-9042" }
-        User->>Portal: Opens http://127.0.0.1:47821/approve/T-9042 in browser
-        Portal-->>User: Renders high-contrast action details, Accept/Decline, Comments, PIN input
-        User->>Portal: POST /approve/T-9042 { decision: "accept", comment: "Proceed before reboot", pin: "****" }
-        Portal->>Gate: Verify PIN hash in memory (Zero-Knowledge: PIN never stored in ticket)
-        Gate->>Gate: Execute "windows-health:winsock_reset" (if accepted)
-        Agent->>MCP: POST /mcp -> tools/call "mcp:check_ticket" { ticketId: "T-9042" }
+        Gate->>MCP: Create ticket (128-bit id, CSRF token, 30-minute expiry)
+        MCP-->>Agent: 200 OK { status: "pending_approval", ticketId, approvalUrl: "http://127.0.0.1:47821/approve/{ticketId}" }
+        User->>Portal: Opens the approvalUrl (or approves in the AegisWin app)
+        Portal-->>User: No-script page: tool, arguments, PIN, note, Approve/Decline
+        User->>Portal: POST /approve/{ticketId} { csrf, decision: "approve", comment: "Proceed before reboot", pin }
+        Portal->>Gate: Check PIN through the global PIN guard (never stored in the ticket); 3 wrong PINs lock the ticket
+        Gate->>Gate: Re-check install state, then run "windows-health__winsock_reset" in the background (status: running)
+        Agent->>MCP: POST /mcp -> tools/call "aegis__check_ticket" { ticketId }
         MCP-->>Agent: 200 OK { status: "approved", userComment: "Proceed before reboot", result: {...} }
     end
 ```
@@ -85,10 +85,10 @@ flowchart TD
     I --> E
 ```
 
-### 2.3 Asynchronous Job Streaming for Long-Running Tools (`sfc /scannow`)
-When a slow administrative command is approved on `/approve/:ticketId` with `asyncExecution: true`, the HTTP handler transitions the ticket to `status: "running"` (`progressPercent: 15..100`) and spawns a non-blocking worker so the browser tab never hangs and the MCP agent can poll `mcp:check_ticket` for completion.
+### 2.3 Long-Running Approved Tools (`sfc /scannow`)
+An approved ticket moves to `running` and the tool runs on a background task, so the approval page and the app return at once. The agent polls `aegis__check_ticket` until the status is final: `approved` (with the result), `execution_failed`, `declined`, `locked_out`, or `expired`. There is no progress percentage; `sfc /scannow` reports only its final result.
 
-### 2.4 Process & Trust Layout (Target)
+### 2.4 Process & Trust Layout
 
 ```mermaid
 flowchart LR
@@ -105,70 +105,25 @@ flowchart LR
     CORE -- "Off-LAN only if plugin trusted;<br/>payload sanitized" --> LLM["LLM endpoint"]
 ```
 
-- The PIN crosses the webview→Rust boundary in exactly one command (`unlock_vault`) and is never stored in JS state. Approval PINs go from the browser portal straight to the Rust HTTP handler.
+- The PIN crosses the webview→Rust boundary only as an argument of the one command that needs it (unlock, a gated run, an approval, a gate or trust change) and is never stored in JS state. Approval PINs from the browser portal go straight to the Rust HTTP handler. See [SECURITY_MODEL §2.1](SECURITY_MODEL.md).
 - The UI receives display data only: no API keys, no bearer tokens, no derived keys.
 
 ## 3. Directory Structure
-
-### 3.1 Target (Rust core, per ADR 0001)
 ```
 aegis-win/
 ├── Start AegisWin.exe          # One-click launcher: checks/installs prerequisites, builds, starts the app
-├── launcher/                   # Launcher source (std-only Rust, own Cargo.toml; not part of the app binary)
-├── Cargo.toml                  # Workspace: src-tauri, crates/*, plugins/*
+├── launcher/                   # Its source: std-only Rust, own Cargo.toml, excluded from the workspace
+├── Cargo.toml                  # Workspace: src-tauri, crates/aegis-core, plugins/*
 ├── crates/
-│   └── aegis-core/             # vault, PIN KDF, registry + gate policy, LLM service + sanitizer,
-│                               # MCP server + /approve portal, elevation job bridge
+│   └── aegis-core/             # engine (single enforcement point), vault + PIN guard, registry + gate policy,
+│                               # approval tickets, LLM service + sanitizer, MCP server + /approve portal, OS layer
 ├── plugins/<plugin-id>/        # One crate per plugin: Cargo.toml, manifest.json, src/lib.rs, README.md, tests/
-├── src-tauri/                  # Thin app binary: Tauri commands, wiring, --elevate-tool mode
-├── src/ui/                     # TypeScript UI (invoke-only), Tailwind compiled at build time
+├── src-tauri/                  # Thin app binary: async Tauri commands, window setup, build.rs, app.manifest (asInvoker),
+│                               # tauri.conf.json (CSP), capabilities/default.json, icons/
+├── src/ui/                     # Plain TypeScript UI (invoke-only, DOM via text nodes, no framework)
+├── index.html                  # Vite entry for src/ui/main.ts
+├── scripts/ci-runner.mjs       # npm run ci: Node repo tests, tsc, vite build, cargo test --workspace
+├── scripts/build-launcher.mjs  # npm run launcher:build: rebuilds Start AegisWin.exe from launcher/
 ├── documentation/              # Specs, ADRs, audit ledger
-└── tests/                      # JS tests for UI/docs/repo invariants (Rust tests live beside their crates)
-```
-
-### 3.2 Current (Node.js prototype being ported)
-```
-aegis-win/
-├── AGENT.md
-├── CLAUDE.md
-├── Start AegisWin.exe          # Prebuilt one-click launcher (rebuild: npm run launcher:build)
-├── launcher/
-│   ├── Cargo.toml / Cargo.lock # Std-only at runtime; embed-resource at build time for icon + manifest
-│   ├── launcher.manifest       # asInvoker, so installer detection never forces UAC
-│   └── src/                    # detect.rs (read-only checks), setup.rs (winget / VS Installer fixes),
-│                               # project.rs (npm + rebuild staleness), main.rs (flow, prompts, launch)
-├── package.json
-├── vite.config.ts
-├── scripts/
-│   ├── ci-runner.mjs
-│   └── build-launcher.mjs      # Builds launcher/ and copies it to the root as Start AegisWin.exe
-├── documentation/
-│   ├── ARCHITECTURE.md
-│   ├── AUDIT_LEDGER.md
-│   ├── GUIDING_PRINCIPLES.md
-│   ├── PLUGIN_SPEC.md
-│   └── SECURITY_MODEL.md
-├── src/
-│   ├── core/
-│   │   ├── vault.mjs           # Portable Argon2/Scrypt + AES-256-GCM encrypted store
-│   │   ├── llm-service.mjs     # Central LLM client + LAN/Off-LAN detector + plugin trust gate
-│   │   ├── plugin-registry.mjs # Compile-time plugin loader, first-run wizard state, tool gating
-│   │   └── mcp-server.mjs      # HTTP MCP server, auto-firewall port manager, /approve/:id portal
-│   └── ui/
-│       └── app-shell.mjs       # High-contrast dark UI state & dynamic scale controller
-├── plugins/
-│   ├── event-logs/             # Windows Event Log Explorer & AI log analyzer
-│   ├── windows-health/         # SFC scan, DNS flush, IP release/renew, Winsock reset
-│   └── usage-monitor/          # Modular resource spikes, crash correlator, active window tracker
-├── src-tauri/
-│   ├── Cargo.toml
-│   ├── Cargo.lock              # Pinned Rust dependency tree (committed for reproducible builds)
-│   ├── build.rs                # tauri-build; embeds app.manifest in place of Tauri's default
-│   ├── tauri.conf.json
-│   ├── app.manifest            # Windows UAC asInvoker manifest (+ Common Controls v6)
-│   ├── icons/                  # app-icon.svg source + generated icon.ico / PNGs (`npx tauri icon`)
-│   └── src/
-│       └── main.rs             # Rust native bridge, firewall rule helper, UAC self-elevation
-└── tests/
-    └── *.test.mjs              # Core & architectural verification test suites
+└── tests/                      # Node tests for repo, docs, and UI/Tauri wiring invariants (Rust tests live beside their crates)
 ```

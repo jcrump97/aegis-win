@@ -124,14 +124,19 @@ fn run(opts: &Options) -> Result<Outcome, String> {
         return Ok(Outcome::Launched);
     }
 
-    let app = root.join(project::APP_EXE);
+    let app = root.join(project::PACKAGED_EXE);
     if project::is_running(&app) {
         println!("\nAegisWin is already running. Close it and start the launcher again to pick up changes.");
         return Ok(Outcome::Stopped);
     }
+    // `npm run package` builds and copies the exe to release\AegisWin\, where its vault lives.
+    let package = root.join(project::PACKAGE_SCRIPT);
     if opts.rebuild || project::needs_build(&root) {
         step("Building AegisWin (the first build takes several minutes; later ones are quick)");
-        run_tool("tauri build", &node.exe, &[tauri_cli.as_os_str(), "build".as_ref()], &root, &path_env)?;
+        run_tool("npm run package", &node.exe, &[package.as_os_str()], &root, &path_env)?;
+    } else if project::needs_package(&root) {
+        step("Copying the latest build to release\\AegisWin");
+        run_tool("npm run package -- --no-build", &node.exe, &[package.as_os_str(), "--no-build".as_ref()], &root, &path_env)?;
     } else {
         println!("\nAegisWin is up to date.");
     }

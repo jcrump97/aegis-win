@@ -5,14 +5,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Release binary produced by `tauri build` (bundling is off, so this is the whole app).
-pub const APP_EXE: &str = r"src-tauri\target\release\aegis-win.exe";
+/// Release binary produced by `tauri build` in the Cargo workspace (bundling is off, so this is the whole app).
+pub const BUILT_EXE: &str = r"target\release\aegis-win.exe";
+/// Where `npm run package` copies it. The app keeps its vault in `data\` next to the exe, so users
+/// run this copy: `cargo clean` can't wipe it, and repackaging replaces only the exe.
+pub const PACKAGED_EXE: &str = r"release\AegisWin\AegisWin.exe";
+pub const PACKAGE_SCRIPT: &str = r"scripts\package.mjs";
 pub const TAURI_CLI: &str = r"node_modules\@tauri-apps\cli\tauri.js";
 const NPM_MARKER: &str = r"node_modules\.package-lock.json";
 
 /// Files and folders whose changes mean the app must be rebuilt.
-const BUILD_INPUT_FILES: &[&str] = &["index.html", "package.json", "package-lock.json", "vite.config.ts"];
-const BUILD_INPUT_DIRS: &[&str] = &["src", "plugins", "src-tauri"];
+const BUILD_INPUT_FILES: &[&str] = &[
+    "index.html", "package.json", "package-lock.json", "vite.config.ts", "tsconfig.json", "Cargo.toml", "Cargo.lock",
+];
+const BUILD_INPUT_DIRS: &[&str] = &["src", "crates", "plugins", "src-tauri"];
 /// Build output and dependencies inside those folders.
 const SKIP_DIRS: &[&str] = &["target", "gen", "node_modules", ".git"];
 
@@ -61,9 +67,18 @@ pub fn newest_input(root: &Path) -> Option<SystemTime> {
 }
 
 pub fn needs_build(root: &Path) -> bool {
-    match mtime(&root.join(APP_EXE)) {
+    match mtime(&root.join(BUILT_EXE)) {
         None => true,
         Some(built) => newest_input(root).is_some_and(|newest| newest > built),
+    }
+}
+
+/// The packaged copy is stale when it's missing or older than the latest build.
+/// (Windows file copies keep the source's modified time, so a fresh copy compares equal.)
+pub fn needs_package(root: &Path) -> bool {
+    match (mtime(&root.join(BUILT_EXE)), mtime(&root.join(PACKAGED_EXE))) {
+        (Some(built), Some(packaged)) => built > packaged,
+        _ => true,
     }
 }
 
@@ -144,14 +159,29 @@ mod tests {
             touch(&root.join(input), t0);
         }
         assert!(needs_build(&root), "never built");
-        touch(&root.join(APP_EXE), t0 + Duration::from_secs(10));
+        touch(&root.join(BUILT_EXE), t0 + Duration::from_secs(10));
         // Build output and dependencies must not count as source changes.
-        touch(&root.join(r"src-tauri\target\release\deps\x.rlib"), t0 + Duration::from_secs(60));
+        touch(&root.join(r"target\release\deps\x.rlib"), t0 + Duration::from_secs(60));
+        touch(&root.join(r"src-tauri\target\release\deps\y.rlib"), t0 + Duration::from_secs(60));
         touch(&root.join(r"src-tauri\gen\schemas\s.json"), t0 + Duration::from_secs(60));
         touch(&root.join(r"plugins\p\node_modules\m.js"), t0 + Duration::from_secs(60));
         assert!(!needs_build(&root));
-        touch(&root.join(r"plugins\event-logs\index.mjs"), t0 + Duration::from_secs(20));
+        touch(&root.join(r"crates\aegis-core\src\vault.rs"), t0 + Duration::from_secs(20));
         assert!(needs_build(&root));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packaged_copy_follows_the_build() {
+        let root = scratch("package");
+        let t0 = SystemTime::now() - Duration::from_secs(3600);
+        assert!(needs_package(&root), "nothing built or packaged");
+        touch(&root.join(BUILT_EXE), t0);
+        assert!(needs_package(&root), "built but never packaged");
+        touch(&root.join(PACKAGED_EXE), t0);
+        assert!(!needs_package(&root), "a copy keeps the build's modified time");
+        touch(&root.join(BUILT_EXE), t0 + Duration::from_secs(10));
+        assert!(needs_package(&root), "rebuilt since the last copy");
         fs::remove_dir_all(root).unwrap();
     }
 

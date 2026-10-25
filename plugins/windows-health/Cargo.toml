@@ -1,0 +1,16 @@
+[package]
+name = "aegis-plugin-windows-health"
+description = "AegisWin plugin: PIN-gated Windows repair commands with dry runs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aegis-core.workspace = true
+async-trait = "0.1"
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+aegis-core = { workspace = true, features = ["test-util"] }

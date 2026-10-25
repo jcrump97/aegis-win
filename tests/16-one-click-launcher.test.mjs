@@ -42,7 +42,7 @@ test('One-Click Launcher: no shells, and runtime code uses only the standard lib
 test('One-Click Launcher: wired into npm scripts, CI, gitignore, and the README', () => {
   const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
   assert.equal(pkg.scripts['launcher:build'], 'node scripts/build-launcher.mjs');
-  assert.match(fs.readFileSync('scripts/ci-runner.mjs', 'utf8'), /'launcher', 'Cargo\.toml'/, 'CI must run the launcher Rust tests');
+  assert.match(fs.readFileSync('scripts/ci-runner.mjs', 'utf8'), /--manifest-path launcher\/Cargo\.toml/, 'CI must run the launcher Rust tests');
   assert.match(fs.readFileSync('.gitignore', 'utf8'), /^launcher\/target\/$/m);
 
   const readme = fs.readFileSync('README.md', 'utf8');
