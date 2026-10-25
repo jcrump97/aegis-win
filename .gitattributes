@@ -1,0 +1,2 @@
+# Prebuilt binaries (Start AegisWin.exe): never convert line endings or diff as text
+*.exe binary

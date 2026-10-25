@@ -111,6 +111,8 @@ flowchart LR
 ## 3. Directory Structure
 ```
 aegis-win/
+├── Start AegisWin.exe          # One-click launcher: checks/installs prerequisites, builds, starts the app
+├── launcher/                   # Its source: std-only Rust, own Cargo.toml, excluded from the workspace
 ├── Cargo.toml                  # Workspace: src-tauri, crates/aegis-core, plugins/*
 ├── crates/
 │   └── aegis-core/             # engine (single enforcement point), vault + PIN guard, registry + gate policy,
@@ -121,6 +123,7 @@ aegis-win/
 ├── src/ui/                     # Plain TypeScript UI (invoke-only, DOM via text nodes, no framework)
 ├── index.html                  # Vite entry for src/ui/main.ts
 ├── scripts/ci-runner.mjs       # npm run ci: Node repo tests, tsc, vite build, cargo test --workspace
+├── scripts/build-launcher.mjs  # npm run launcher:build: rebuilds Start AegisWin.exe from launcher/
 ├── documentation/              # Specs, ADRs, audit ledger
 └── tests/                      # Node tests for repo, docs, and UI/Tauri wiring invariants (Rust tests live beside their crates)
 ```

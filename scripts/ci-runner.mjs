@@ -8,7 +8,8 @@
  *  3. Core & Plugin automated test suites via Node built-in test runner (Vite/Vitest compatible)
  *  4. Frontend typecheck (`tsc`) and production build (`vite build`); the
  *     Tauri crate embeds `dist/` at compile time, so this runs before cargo
- *  5. Rust workspace tests (`cargo test --workspace`)
+ *  5. Rust workspace tests (`cargo test --workspace`), then the one-click launcher,
+ *     which has its own manifest outside the workspace
  */
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -89,6 +90,7 @@ if (fs.existsSync(path.join(rootDir, 'Cargo.toml'))) {
   console.log('[AegisWin CI] Running Rust workspace tests...');
   try {
     execSync(`${cargo} test --workspace --quiet`, { stdio: 'inherit' });
+    execSync(`${cargo} test --locked --quiet --manifest-path launcher/Cargo.toml`, { stdio: 'inherit' });
   } catch (err) {
     console.error('[AegisWin CI] FAIL: Rust tests failed.');
     process.exit(1);

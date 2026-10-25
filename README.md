@@ -16,7 +16,21 @@ AegisWin is a single `.exe` you can run from a USB stick or a downloads folder. 
 
 See [`documentation/ARCHITECTURE.md`](documentation/ARCHITECTURE.md) for diagrams and [`documentation/SECURITY_MODEL.md`](documentation/SECURITY_MODEL.md) for the threat model.
 
+## Quick start (Windows)
+
+1. Get the code: clone the repository, or download the ZIP from GitHub and extract it.
+2. Double-click **`Start AegisWin.exe`** in the project folder.
+
+The launcher checks your PC for everything AegisWin needs: the WebView2 Runtime, the Visual Studio C++ Build Tools (with a Windows SDK), Node.js 20 or newer, and Rust. It lists anything missing and, after you say yes, installs it with winget. Then it installs the JavaScript packages, turns on the git hooks, builds the app if the source changed since the last build (the same as `npm run package`), and starts `release\AegisWin\AegisWin.exe`. Your vault is in `release\AegisWin\data\` next to it and is kept when the app is rebuilt.
+
+- **The first run on a fresh PC is slow**, often 30 minutes or more: the C++ Build Tools are a multi-GB download and the first build compiles everything. Later runs start in seconds when nothing has changed.
+- Some installers ask for administrator permission. The launcher itself runs as a standard user.
+- The exe isn't code-signed, so if you downloaded the ZIP, Windows SmartScreen may say it doesn't recognize it. Choose **More info**, then **Run anyway**, or build the launcher yourself with `npm run launcher:build`.
+- Options: `--check` reports what's installed and changes nothing, `--yes` installs without asking, `--rebuild` forces a build, and `--dev` starts the hot-reload dev app. `--help` lists them.
+
 ## Development setup (Windows)
+
+`Start AegisWin.exe` does everything in this section for you. These are the same steps by hand.
 
 ### Prerequisites
 
@@ -54,6 +68,7 @@ npm install
 | `npm run tauri:dev` | Desktop app with hot reload. The first build takes a few minutes. |
 | `npm run tauri:build` | Portable release exe at `target/release/aegis-win.exe` |
 | `npm run package` | Release build copied to `release/AegisWin/AegisWin.exe` (git-ignored). Its vault lives in `release/AegisWin/data/` and survives repackaging. Add `-- --no-build` to copy the last build only. |
+| `npm run launcher:build` | Rebuilds `Start AegisWin.exe` from `launcher/`. Commit the new exe along with any launcher change. |
 
 `npm run dev` and `npm run tauri:dev` both use port 1420, so run only one at a time.
 

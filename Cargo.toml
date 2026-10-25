@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["src-tauri", "crates/aegis-core", "plugins/event-logs", "plugins/windows-health", "plugins/usage-monitor"]
+# The one-click launcher is std-only with its own size-optimized release profile and lockfile.
+exclude = ["launcher"]
 
 [workspace.package]
 version = "0.1.0"
