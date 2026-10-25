@@ -1,0 +1,47 @@
+[package]
+name = "aegis-core"
+description = "AegisWin core: encrypted vault, PIN guard, plugin registry, LLM service, and MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Exposes `aegis_core::testing` helpers to plugin crates' tests.
+test-util = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+getrandom = "0.3"
+hex = "0.4"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio.workspace = true
+# Schannel (the Windows TLS stack and certificate store); the rustls default
+# needs CMake and NASM to build on Windows.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json"] }
+url = "2"
+# MCP server and approval portal (HTTP/1.1 only, no TLS: loopback or private LAN).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Security",
+  "Win32_System_EventLog",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"

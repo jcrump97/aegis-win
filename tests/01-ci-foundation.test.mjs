@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 test('CI Foundation: repository configuration and Vite/Tauri scaffolding exist', () => {
@@ -37,4 +38,62 @@ test('CI Foundation: commit-msg hook rejects AI attribution trailers and footers
   assert.ok(pattern.test('Generated with [Claude Code](https://claude.com/claude-code)'));
   assert.ok(!pattern.test('(feat) Add Claude-compatible MCP tool listing'), 'Mentioning a product in the subject is allowed');
   assert.ok(!pattern.test('Co-Authored-By: Jane Doe <jane@example.com>'), 'Human co-authors are allowed');
+});
+
+test('CI Foundation: npm run ci also runs the Rust workspace tests', () => {
+  const runner = fs.readFileSync('scripts/ci-runner.mjs', 'utf8');
+  assert.match(runner, /test --workspace/);
+  const cargo = fs.readFileSync('Cargo.toml', 'utf8');
+  assert.match(cargo, /\[workspace\]/);
+  assert.match(cargo, /crates\/aegis-core/);
+});
+
+test('CI Foundation: npm run ci typechecks and builds the UI before the Rust tests', () => {
+  const runner = fs.readFileSync('scripts/ci-runner.mjs', 'utf8');
+  const tsc = runner.indexOf("execSync('npx --no-install tsc -p .'");
+  const vite = runner.indexOf("execSync('npx --no-install vite build");
+  const cargo = runner.indexOf('test --workspace --quiet`');
+  assert.ok(tsc > 0 && vite > tsc && cargo > vite, 'tsc, then vite build (Tauri embeds dist/), then cargo test');
+  const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+  assert.equal(pkg.scripts.typecheck, 'tsc -p .');
+  assert.ok(!pkg.dependencies?.react, 'The UI is plain TypeScript; React was removed');
+});
+
+test('Rust core only: the Node.js prototype is gone and live docs no longer point at it', () => {
+  for (const legacy of ['src/core', 'src/ui/app-shell.mjs']) {
+    assert.ok(!fs.existsSync(legacy), `${legacy} was removed by ADR 0001 and must not come back`);
+  }
+  for (const plugin of fs.readdirSync('plugins')) {
+    assert.ok(!fs.existsSync(`plugins/${plugin}/index.mjs`), `plugins/${plugin} must be a Rust crate, not index.mjs`);
+    assert.ok(fs.existsSync(`plugins/${plugin}/src/lib.rs`), `plugins/${plugin} is missing src/lib.rs`);
+  }
+  // The ADR keeps the history; the operating docs must describe what ships.
+  for (const doc of ['AGENT.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
+    assert.doesNotMatch(fs.readFileSync(doc, 'utf8'), /src\/core\/|index\.mjs|CentralLlmService/, `${doc} still references the prototype`);
+  }
+});
+
+test('CI Foundation: npm run package copies the exe and keeps the data folder', async () => {
+  const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+  assert.equal(pkg.scripts.package, 'node scripts/package.mjs');
+  assert.match(fs.readFileSync('.gitignore', 'utf8'), /^\/release\/$/m, 'release/ must be git-ignored');
+
+  const { stage } = await import(new URL('../scripts/package.mjs', import.meta.url));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-package-'));
+  try {
+    const exe = path.join(tmp, 'aegis-win.exe');
+    const out = path.join(tmp, 'release', 'AegisWin');
+    fs.writeFileSync(exe, 'v1');
+    fs.mkdirSync(path.join(out, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(out, 'data', 'vault.enc.json'), 'secret');
+
+    assert.equal(stage(exe, out), path.join(out, 'AegisWin.exe'));
+    fs.writeFileSync(exe, 'v2');
+    stage(exe, out);
+    assert.equal(fs.readFileSync(path.join(out, 'AegisWin.exe'), 'utf8'), 'v2');
+    assert.equal(fs.readFileSync(path.join(out, 'data', 'vault.enc.json'), 'utf8'), 'secret', 'the vault must survive a repackage');
+    assert.throws(() => stage(path.join(tmp, 'missing.exe'), out), /No build/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

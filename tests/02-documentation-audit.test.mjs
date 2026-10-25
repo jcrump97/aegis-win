@@ -66,3 +66,13 @@ test('Documentation Audit: README covers status, Windows dev setup, and the Clau
   }
   assert.match(readme, /## Acknowledgements[\s\S]*Claude/, 'README must credit Claude under Acknowledgements');
 });
+
+test('Documentation Audit: ADR 0001 amendment defines the basic app and the MCP tool-name rule', () => {
+  const adr = fs.readFileSync('documentation/adr/0001-rust-core.md', 'utf8');
+  assert.match(adr, /## Amendment 1/);
+  assert.match(adr, /Definition of "basic functioning app"/);
+  // MCP clients reject tool names outside this pattern, so the colon form must not leak into MCP.
+  assert.match(adr, /\^\[a-zA-Z0-9_-\]\{1,64\}\$/);
+  const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
+  assert.match(sec, /reveal_mcp_token/);
+});

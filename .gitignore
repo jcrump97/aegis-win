@@ -1,6 +1,8 @@
 # Build & dependency artifacts
 node_modules/
 dist/
+/target/
+/release/
 src-tauri/target/
 data/
 *.log

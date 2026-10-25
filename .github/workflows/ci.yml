@@ -23,5 +23,11 @@ jobs:
       - name: Setup Rust Toolchain (Tauri v2 Backend)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Cargo Registry and Build Output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install npm Dependencies
+        run: npm ci
+
       - name: Run Atomic CI Verification & All Plugin Tests
         run: node scripts/ci-runner.mjs

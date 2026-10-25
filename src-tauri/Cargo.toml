@@ -4,11 +4,17 @@ version = "1.0.0"
 description = "Portable Windows Diagnostic, Health Optimization, and PIN-Gated MCP Utility"
 authors = ["AegisWin Contributors"]
 edition = "2021"
+license.workspace = true
+publish.workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
 tauri = { version = "2.0.0", features = [] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+aegis-core.workspace = true
+aegis-plugin-event-logs = { path = "../plugins/event-logs" }
+aegis-plugin-windows-health = { path = "../plugins/windows-health" }
+aegis-plugin-usage-monitor = { path = "../plugins/usage-monitor" }
