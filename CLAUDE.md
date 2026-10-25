@@ -7,6 +7,8 @@
 - **Start Vite dev server**: `npm run dev` (port 1420, strict)
 - **Run the desktop app in dev mode**: `npm run tauri:dev` (uses port 1420 too, so stop `npm run dev` first)
 - **Build portable Tauri v2 Windows binary**: `npm run tauri:build`
+- **One-click setup + launch (user entry point)**: double-click `Start AegisWin.exe`; `--check` reports without changing anything
+- **Rebuild the launcher exe after editing `launcher/`**: `npm run launcher:build` (commit the new `Start AegisWin.exe`)
 
 ## Pre-Commit Checklist for Every Turn
 Before running `git commit -m "(<type>) <description>"`:

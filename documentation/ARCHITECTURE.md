@@ -113,6 +113,8 @@ flowchart LR
 ### 3.1 Target (Rust core, per ADR 0001)
 ```
 aegis-win/
+├── Start AegisWin.exe          # One-click launcher: checks/installs prerequisites, builds, starts the app
+├── launcher/                   # Launcher source (std-only Rust, own Cargo.toml; not part of the app binary)
 ├── Cargo.toml                  # Workspace: src-tauri, crates/*, plugins/*
 ├── crates/
 │   └── aegis-core/             # vault, PIN KDF, registry + gate policy, LLM service + sanitizer,
@@ -129,10 +131,17 @@ aegis-win/
 aegis-win/
 ├── AGENT.md
 ├── CLAUDE.md
+├── Start AegisWin.exe          # Prebuilt one-click launcher (rebuild: npm run launcher:build)
+├── launcher/
+│   ├── Cargo.toml / Cargo.lock # Std-only at runtime; embed-resource at build time for icon + manifest
+│   ├── launcher.manifest       # asInvoker, so installer detection never forces UAC
+│   └── src/                    # detect.rs (read-only checks), setup.rs (winget / VS Installer fixes),
+│                               # project.rs (npm + rebuild staleness), main.rs (flow, prompts, launch)
 ├── package.json
 ├── vite.config.ts
 ├── scripts/
-│   └── ci-runner.mjs
+│   ├── ci-runner.mjs
+│   └── build-launcher.mjs      # Builds launcher/ and copies it to the root as Start AegisWin.exe
 ├── documentation/
 │   ├── ARCHITECTURE.md
 │   ├── AUDIT_LEDGER.md
