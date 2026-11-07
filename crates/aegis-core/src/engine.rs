@@ -16,7 +16,8 @@ use zeroize::Zeroizing;
 use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
-use crate::registry::{self, Gate, GatePolicy, Plugin, Registry, ToolContext, ToolManifest};
+use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
+use crate::registry::{self, Gate, GatePolicy, Plugin, Registry, ToolContext, ToolManifest, UnlockContext};
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::VaultState;
@@ -359,7 +360,7 @@ impl Engine {
         *lock(&self.vault) = Some(vault);
         for (id, components) in installed {
             if let Some(plugin) = self.registry.plugin(&id) {
-                plugin.on_unlock(&components);
+                plugin.on_unlock(&self.unlock_context(&id, components));
             }
         }
         if mcp_enabled {
@@ -609,7 +610,7 @@ impl Engine {
                 plugin.on_lock();
             }
             if let Some(components) = after {
-                plugin.on_unlock(components);
+                plugin.on_unlock(&self.unlock_context(id, components.clone()));
             }
         }
         self.plugins()
@@ -653,6 +654,64 @@ impl Engine {
     pub fn revoke_llm_trust(&self, plugin_id: &str) -> AegisResult<()> {
         self.mutate(|s| {
             s.trusted_external_llm_plugins.retain(|p| p != plugin_id);
+            Ok(())
+        })
+    }
+
+    // ---- plugin data -----------------------------------------------------
+
+    fn store_for(&self, plugin_id: &str) -> PluginStore {
+        PluginStore::new(self.me.clone(), plugin_id)
+    }
+
+    fn unlock_context(&self, plugin_id: &str, enabled_components: Vec<String>) -> UnlockContext {
+        UnlockContext { enabled_components, store: Some(self.store_for(plugin_id)) }
+    }
+
+    fn require_installed(&self, s: &VaultState, plugin_id: &str) -> AegisResult<()> {
+        if s.is_installed(plugin_id) && self.registry.plugin(plugin_id).is_some() {
+            Ok(())
+        } else {
+            Err(AegisError::new(ErrorCode::PluginDisabled, format!("plugin '{plugin_id}' is not installed")))
+        }
+    }
+
+    pub(crate) fn plugin_data_get(&self, plugin_id: &str, key: &str) -> AegisResult<Option<Value>> {
+        self.with_state(|s| {
+            self.require_installed(s, plugin_id)?;
+            Ok(s.plugin_data.get(plugin_id).and_then(|records| records.get(key)).cloned())
+        })?
+    }
+
+    /// `None` removes the key. A write that would take the plugin over its
+    /// size limit is refused and nothing changes.
+    pub(crate) fn plugin_data_set(&self, plugin_id: &str, key: &str, value: Option<Value>) -> AegisResult<()> {
+        self.mutate(|s| {
+            self.require_installed(s, plugin_id)?;
+            let records = s.plugin_data.entry(plugin_id.to_owned()).or_default();
+            match value {
+                Some(v) => {
+                    records.insert(key.to_owned(), v);
+                }
+                None => {
+                    records.remove(key);
+                }
+            }
+            let size = serde_json::to_vec(&*records).map_err(internal)?.len();
+            if records.is_empty() {
+                s.plugin_data.remove(plugin_id);
+            }
+            if size > MAX_PLUGIN_DATA_BYTES {
+                return Err(AegisError::invalid(format!("plugin data for '{plugin_id}' would exceed {} KiB", MAX_PLUGIN_DATA_BYTES / 1024)));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn plugin_data_clear(&self, plugin_id: &str) -> AegisResult<()> {
+        self.mutate(|s| {
+            self.require_installed(s, plugin_id)?;
+            s.plugin_data.remove(plugin_id);
             Ok(())
         })
     }
@@ -711,7 +770,7 @@ impl Engine {
             tool: tool.clone(),
             args,
             gate,
-            ctx: ToolContext { elevated: self.elevated, enabled_components: components, llm },
+            ctx: ToolContext { elevated: self.elevated, enabled_components: components, llm, store: Some(self.store_for(plugin_id)) },
         })
     }
 

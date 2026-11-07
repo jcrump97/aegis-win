@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aegis_core::os::{self, eventlog};
-use aegis_core::registry::{Plugin, PluginManifest, ToolContext};
+use aegis_core::registry::{Plugin, PluginManifest, ToolContext, UnlockContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
 use chrono::{DateTime, Local, NaiveTime, Utc};
@@ -411,8 +411,9 @@ impl Plugin for UsageMonitorPlugin {
         }
     }
 
-    fn on_unlock(&self, enabled_components: &[String]) {
-        self.telemetry.lock().unwrap().components = enabled_components.to_vec();
+    fn on_unlock(&self, ctx: &UnlockContext) {
+        let enabled_components = &ctx.enabled_components;
+        self.telemetry.lock().unwrap().components = enabled_components.clone();
         let wants_sampling = [COMPONENT_SPIKES, COMPONENT_FOREGROUND].iter().any(|c| enabled_components.iter().any(|e| e == c));
         if wants_sampling {
             self.start_sampler();

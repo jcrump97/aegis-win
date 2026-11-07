@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aegis_core::engine::{Engine, EngineOptions, Origin, RunOutcome};
-use aegis_core::registry::{GatePolicy, Plugin, Registry, ToolContext};
+use aegis_core::registry::{GatePolicy, Plugin, Registry, ToolContext, UnlockContext};
 use aegis_core::tickets::TicketStatus;
 use aegis_core::vault::KdfParams;
 use aegis_core::{schema, ErrorCode};
@@ -135,7 +135,7 @@ async fn mcp_watch_window_changes_wait_for_pin_approval() {
 #[tokio::test]
 async fn sampler_runs_only_while_unlocked_and_purge_is_pin_gated() {
     let plugin = UsageMonitorPlugin::default();
-    plugin.on_unlock(&all_components());
+    plugin.on_unlock(&UnlockContext { enabled_components: all_components(), ..Default::default() });
     assert!(plugin.is_sampling());
     let snap = call(&plugin, "capture_diagnostic_snapshot", json!({}), ToolContext { enabled_components: all_components(), ..Default::default() })
         .await

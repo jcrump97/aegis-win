@@ -70,6 +70,8 @@ The governing rule for every part of this design: **the AI proposes, code valida
 - **Privacy flags** shown on review: `foreground` conditions, `"*"` process scope, and all-day schedules.
 - The existing watch window becomes a built-in rule named "Default" (Phase 1), so there is one model, not two.
 
+**Rule storage (Phase 1b).** Rules are kept with the new `aegis-core` plugin data store (`PLUGIN_SPEC.md` §5): records inside the encrypted vault, bound to the plugin's id, reachable only while unlocked and installed, capped at 256 KiB per plugin. Uninstalling `usage-monitor` keeps its rules but makes them unreachable until it is installed again; `purge_telemetry_history` does not delete rules. A one-line pointer in `SECURITY_MODEL.md` waits until the owner's pending edits to that file land.
+
 **Decided while implementing the rule language (Phase 1a, `plugins/usage-monitor/src/rules.rs`):**
 
 - **Strict parsing.** Unknown top-level, schedule, or condition fields are rejected, not ignored, so a rule cannot carry anything the description does not show. `HH:MM` must be exactly two-digit hours and minutes.
@@ -230,7 +232,7 @@ Timeline example: "Not monitoring 23:14–23:52 (unexpected shutdown, Kernel-Pow
 | `GUIDING_PRINCIPLES.md` | §2: telemetry is persisted encrypted under `./data/history/`; the opt-in Startup shortcut is the one file outside `./data/` |
 | `SECURITY_MODEL.md` | New sections: monitor key and HPKE files, *locked, monitoring* state, idle auto-lock, Startup shortcut, AI output treated as untrusted input, question filter. §1: add LLM output and a local attacker with `./data` write access as threat boundaries. §2.1: new PIN-taking commands (`activate_monitor`, enabling the shortcut) |
 | `ARCHITECTURE.md` | Tray and the shared history service in the system diagram, the app-state table, a propose → approve sequence diagram, `./data/monitor/` and `./data/history/` in the layout |
-| `PLUGIN_SPEC.md` | Plugin trait lifecycle hook for monitoring while locked; `HistoryHandle` (own stream only); monitor tools never set `planEligible` ([ADR 0003](0003-action-plans.md)) |
+| `PLUGIN_SPEC.md` | Plugin trait lifecycle hook for monitoring while locked; `HistoryHandle` (own stream only); monitor tools never set `planEligible` ([ADR 0003](0003-action-plans.md)). §5 plugin data in the vault: done in Phase 1b |
 | `plugins/usage-monitor/README.md`, `manifest.json`, `src/lib.rs` header | New tools, persistence and retention, new `purge_telemetry_history` description, `configure_watch_window` gate |
 | `README.md` | Feature list: AI monitor creator, tray, background monitoring, Startup shortcut |
 | `AUDIT_LEDGER.md` | One row per phase |

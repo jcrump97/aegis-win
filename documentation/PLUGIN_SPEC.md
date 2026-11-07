@@ -63,3 +63,11 @@ A tool that declares a boolean `dryRun` property MUST make `dryRun: true` side-e
 2. **When a system binary is unavoidable** (e.g. `sfc.exe`, `netsh.exe`), launch it by absolute path under `%SystemRoot%\System32` with an argument vector (`std::process::Command::new(path).args([...])`). Never go through `cmd /c`, PowerShell, or string-built command lines, and never resolve via `PATH`.
 3. **Validate every tool input** against `inputSchema` and an allow-list (e.g. event channel names) before it reaches an API or argument vector.
 4. **Never return canned output as if it were real.** Tool results come from the OS. A tool that cannot run says so (`executed: false` with a reason).
+
+## 5. Plugin Data in the Vault
+A plugin that must remember owner-approved configuration (such as `usage-monitor`'s monitor rules, ADR 0002) uses the `PluginStore` the engine hands it in `ToolContext::store` on every tool call and in `UnlockContext::store` on `on_unlock`.
+1. **Own records only.** The engine binds each store to the calling plugin's id. A plugin cannot open another plugin's records.
+2. **Encrypted, and only while unlocked.** Records live inside `vault.enc.json` (AES-256-GCM). Every call fails with `VAULT_LOCKED` while the vault is locked and with `PLUGIN_DISABLED` while the plugin is uninstalled. Uninstalling keeps the records; installing again makes them reachable again. The store holds no data or secret itself, so keeping a handle in a background thread is safe.
+3. **Small and rare.** Keys are 1-64 characters of `a-z`, `0-9`, `_`, `-`. One plugin's records are capped at 256 KiB, and a write over the cap is refused with nothing changed. Each write re-encrypts and saves the vault, so the store is for configuration that changes when the owner acts, never for telemetry.
+4. **Gating is the tool's job.** The store does not ask for the PIN. A tool that changes what a plugin records or does must declare `defaultGatePolicy: "pin_required"`.
+5. **Never store the PIN** or any credential in plugin data, and never return records verbatim to an LLM without the scrubbing in `SECURITY_MODEL.md` §6.

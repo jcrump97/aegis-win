@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::llm::LlmConfig;
 use crate::registry::GatePolicy;
@@ -44,6 +45,9 @@ pub struct VaultState {
     pub ui_scale: u32,
     pub llm: LlmConfig,
     pub mcp: McpConfig,
+    /// Plugin id → key → record (`plugin_data::PluginStore`). Kept when a
+    /// plugin is uninstalled, but unreachable until it is installed again.
+    pub plugin_data: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Default for VaultState {
@@ -57,6 +61,7 @@ impl Default for VaultState {
             ui_scale: 100,
             llm: LlmConfig::default(),
             mcp: McpConfig::default(),
+            plugin_data: BTreeMap::new(),
         }
     }
 }
@@ -86,5 +91,6 @@ mod tests {
         assert_eq!(state.ui_scale, 100);
         assert_eq!(state.mcp.port, DEFAULT_MCP_PORT);
         assert_eq!(state.mcp.auth_token.expose().len(), 48);
+        assert!(state.plugin_data.is_empty());
     }
 }

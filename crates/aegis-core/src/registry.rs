@@ -124,6 +124,8 @@ pub struct ToolContext {
     pub enabled_components: Vec<String>,
     /// Present for plugins with `usesLlm: true`; already bound to this plugin's id and trust grant.
     pub llm: Option<crate::llm::LlmHandle>,
+    /// This plugin's own records in the vault. Always set by the engine.
+    pub store: Option<crate::plugin_data::PluginStore>,
 }
 
 impl ToolContext {
@@ -134,6 +136,19 @@ impl ToolContext {
     pub fn llm(&self) -> AegisResult<&crate::llm::LlmHandle> {
         self.llm.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::LlmNotConfigured, "this plugin is not allowed to use the LLM service"))
     }
+
+    pub fn store(&self) -> AegisResult<&crate::plugin_data::PluginStore> {
+        self.store.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::Internal, "no plugin data store in this context"))
+    }
+}
+
+/// Handed to [`Plugin::on_unlock`]. The store stays usable from background
+/// threads, but only while the vault is unlocked and the plugin installed.
+#[derive(Clone, Default)]
+pub struct UnlockContext {
+    pub enabled_components: Vec<String>,
+    /// This plugin's own records in the vault. Always set by the engine.
+    pub store: Option<crate::plugin_data::PluginStore>,
 }
 
 #[async_trait]
@@ -144,8 +159,9 @@ pub trait Plugin: Send + Sync {
     /// `inputSchema` with defaults applied, and the gate has already passed.
     async fn call(&self, tool: &str, args: Value, ctx: ToolContext) -> AegisResult<Value>;
 
-    /// Called when the vault unlocks with this plugin installed (start background work here).
-    fn on_unlock(&self, _enabled_components: &[String]) {}
+    /// Called when the vault unlocks with this plugin installed, and again
+    /// when its components change (start background work here).
+    fn on_unlock(&self, _ctx: &UnlockContext) {}
 
     /// Called when the vault locks or the plugin is uninstalled.
     fn on_lock(&self) {}

@@ -91,6 +91,11 @@ test('Documentation Audit: ADRs 0002 and 0003 are accepted and keep their trust 
   assert.match(plans, /hashed with SHA-256/);
   assert.match(plans, /It always requires the PIN\./);
   assert.match(plans, /one global serial executor/);
+  // Plugin data in the vault: own records only, and the store never replaces the gate.
+  const spec = fs.readFileSync('documentation/PLUGIN_SPEC.md', 'utf8');
+  assert.match(spec, /## 5\. Plugin Data in the Vault/);
+  assert.match(spec, /\*\*Own records only\.\*\*/);
+  assert.match(spec, /\*\*Gating is the tool's job\.\*\*/);
   for (const doc of [monitor, plans]) {
     assert.doesNotMatch(doc, /\*Recommendation:/, 'every open question records its decision');
   }

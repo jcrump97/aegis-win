@@ -6,6 +6,7 @@ pub mod error;
 pub mod llm;
 pub mod mcp;
 pub mod os;
+pub mod plugin_data;
 pub mod registry;
 pub mod schema;
 pub mod secret;

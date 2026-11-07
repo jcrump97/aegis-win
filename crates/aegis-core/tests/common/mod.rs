@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aegis_core::engine::{Engine, EngineOptions};
-use aegis_core::registry::{Plugin, PluginManifest, Registry, ToolContext};
+use aegis_core::plugin_data::PluginStore;
+use aegis_core::registry::{Plugin, PluginManifest, Registry, ToolContext, UnlockContext};
 use aegis_core::vault::KdfParams;
 use aegis_core::AegisResult;
 use async_trait::async_trait;
@@ -17,10 +18,20 @@ pub struct DemoPlugin {
     manifest: PluginManifest,
     pub unlocks: AtomicUsize,
     pub locks: AtomicUsize,
+    /// The store handed to the last `on_unlock` and the last tool call.
+    pub unlock_store: Mutex<Option<PluginStore>>,
+    pub call_store: Mutex<Option<PluginStore>>,
 }
 
 impl Default for DemoPlugin {
     fn default() -> Self {
+        Self::with_id("demo")
+    }
+}
+
+impl DemoPlugin {
+    /// The same plugin under another id (for isolation tests).
+    pub fn with_id(id: &str) -> Self {
         let manifest = PluginManifest::from_json(
             &json!({
                 "id": "demo",
@@ -43,10 +54,11 @@ impl Default for DemoPlugin {
                       "defaultGatePolicy": "auto", "readOnly": true, "component": "demo:extra", "inputSchema": { "type": "object", "properties": {} } }
                 ]
             })
-            .to_string(),
+            .to_string()
+            .replace("\"demo", &format!("\"{id}")),
         )
         .unwrap();
-        Self { manifest, unlocks: AtomicUsize::new(0), locks: AtomicUsize::new(0) }
+        Self { manifest, unlocks: AtomicUsize::new(0), locks: AtomicUsize::new(0), unlock_store: Mutex::new(None), call_store: Mutex::new(None) }
     }
 }
 
@@ -56,7 +68,8 @@ impl Plugin for DemoPlugin {
         &self.manifest
     }
 
-    async fn call(&self, tool: &str, args: Value, _ctx: ToolContext) -> AegisResult<Value> {
+    async fn call(&self, tool: &str, args: Value, ctx: ToolContext) -> AegisResult<Value> {
+        *self.call_store.lock().unwrap() = ctx.store;
         Ok(match tool {
             "echo" => json!({ "echo": args }),
             "fix" if args["dryRun"] == true => json!({ "dryRun": true, "wouldRun": ["fix.exe"] }),
@@ -64,7 +77,8 @@ impl Plugin for DemoPlugin {
         })
     }
 
-    fn on_unlock(&self, _components: &[String]) {
+    fn on_unlock(&self, ctx: &UnlockContext) {
+        *self.unlock_store.lock().unwrap() = ctx.store.clone();
         self.unlocks.fetch_add(1, Ordering::SeqCst);
     }
 
