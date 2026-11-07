@@ -45,7 +45,7 @@
     {
       "id": "propose_monitor",
       "name": "Check a Proposed Monitor",
-      "description": "Validates a monitor rule and returns the plain-language description AegisWin generates from it, its privacy flags, and any problems. Starts nothing. Use it before activate_monitor.",
+      "description": "Validates a monitor rule and returns the plain-language description AegisWin generates from it, its privacy flags, how often it would have fired over the last 30 minutes of the watch window, and any problems. Starts nothing. Use it before activate_monitor.",
       "requiresAdmin": false,
       "defaultGatePolicy": "auto",
       "readOnly": true,

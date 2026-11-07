@@ -93,6 +93,8 @@ async fn proposing_describes_the_rule_and_starts_nothing() {
     assert!(out["reasoning"]["label"].as_str().unwrap().starts_with("Supplied by the requesting agent"));
     assert!(!out["reasoning"]["text"].as_str().unwrap().contains('\u{202E}'), "hidden characters are stripped from AI text");
     assert_eq!(list(&engine).await["monitors"], json!([]), "proposing saves nothing");
+    // No sampler runs here, so there is no history: replay says so instead of guessing.
+    assert_eq!((out["replay"]["samples"].as_u64(), out["replay"]["wouldHaveFired"].as_u64()), (Some(0), Some(0)), "{out}");
 
     // Problems come back as data the AI can fix, not as a failed call.
     let bad = run(&engine, Origin::Mcp, "propose_monitor", json!({ "rule": { "version": 1 } })).await.unwrap();

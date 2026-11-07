@@ -20,10 +20,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use monitors::{MonitorBook, MonitorHit, MonitorRuntime};
+use replay::RecordedTick;
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 pub mod monitors;
+pub mod replay;
 pub mod rules;
 
 pub const COMPONENT_SPIKES: &str = "usage-monitor:resource-spikes";
@@ -130,6 +132,8 @@ struct Telemetry {
     sampling_since: Option<String>,
     monitors: MonitorRuntime,
     hits: VecDeque<MonitorHit>,
+    /// The last 30 minutes of samples, for replaying a proposed rule.
+    recent: VecDeque<RecordedTick>,
 }
 
 impl Telemetry {
@@ -137,8 +141,18 @@ impl Telemetry {
         self.components.iter().any(|c| c == component)
     }
 
+    fn in_watch_window(&self, now_local: NaiveTime) -> bool {
+        let (Some(start), Some(end)) = (parse_hhmm(&self.watch.start_time), parse_hhmm(&self.watch.end_time)) else { return false };
+        in_window(now_local, start, end)
+    }
+
     /// Runs every saved monitor against this tick and records their hits.
+    /// Inside the watch window, like all other telemetry, it also keeps what
+    /// the enabled components allow for replay.
     fn evaluate_monitors(&mut self, tick: &rules::Tick) {
+        if self.in_watch_window(tick.local_time) {
+            replay::remember(&mut self.recent, RecordedTick::keep(tick, &self.components));
+        }
         let Self { monitors, hits, .. } = self;
         for m in &mut monitors.active {
             if let Some(hit) = m.evaluator.tick(tick) {
@@ -149,20 +163,11 @@ impl Telemetry {
 
     /// Channels and event ids the running monitors need, de-duplicated.
     fn event_needs(&self) -> Vec<(rules::Channel, Vec<u32>)> {
-        let mut out: Vec<(rules::Channel, Vec<u32>)> = Vec::new();
-        for (channel, id) in self.monitors.active.iter().flat_map(|m| rules::event_needs(m.evaluator.rule())) {
-            match out.iter_mut().find(|(c, _)| *c == channel) {
-                Some((_, ids)) if !ids.contains(&id) => ids.push(id),
-                Some(_) => {}
-                None => out.push((channel, vec![id])),
-            }
-        }
-        out
+        group_needs(self.monitors.active.iter().flat_map(|m| rules::event_needs(m.evaluator.rule())))
     }
 
     fn record(&mut self, samples: &[ProcSample], foreground: Option<String>, now_local: NaiveTime, now: Instant) {
-        let (Some(start), Some(end)) = (parse_hhmm(&self.watch.start_time), parse_hhmm(&self.watch.end_time)) else { return };
-        if !in_window(now_local, start, end) {
+        if !self.in_watch_window(now_local) {
             return;
         }
         let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -195,6 +200,7 @@ impl Telemetry {
 
     fn clear(&mut self) {
         self.hits.clear();
+        self.recent.clear();
         self.spikes.clear();
         self.foreground.clear();
         self.last_spike.clear();
@@ -231,6 +237,18 @@ fn samples(sys: &System) -> Vec<ProcSample> {
             ram_mb: p.memory() / (1024 * 1024),
         })
         .collect()
+}
+
+fn group_needs(needs: impl IntoIterator<Item = (rules::Channel, u32)>) -> Vec<(rules::Channel, Vec<u32>)> {
+    let mut out: Vec<(rules::Channel, Vec<u32>)> = Vec::new();
+    for (channel, id) in needs {
+        match out.iter_mut().find(|(c, _)| *c == channel) {
+            Some((_, ids)) if !ids.contains(&id) => ids.push(id),
+            Some(_) => {}
+            None => out.push((channel, vec![id])),
+        }
+    }
+    out
 }
 
 fn system_memory_percent(sys: &System) -> f64 {
@@ -425,10 +443,17 @@ impl UsageMonitorPlugin {
         rules::validate(args.get("rule").unwrap_or(&Value::Null), &ctx.enabled_components)
     }
 
-    fn propose(&self, args: &Value, ctx: &ToolContext) -> AegisResult<Value> {
+    async fn propose(&self, args: &Value, ctx: &ToolContext) -> AegisResult<Value> {
         let rule = match Self::validated(args, ctx) {
             Ok(rule) => rule,
             Err(problems) => return Ok(json!({ "valid": false, "problems": problems, "activated": false })),
+        };
+        let recent: Vec<RecordedTick> = self.telemetry.lock().unwrap().recent.iter().cloned().collect();
+        let needs = group_needs(rules::event_needs(&rule));
+        let events = if recent.is_empty() || needs.is_empty() {
+            Vec::new()
+        } else {
+            tokio::task::spawn_blocking(move || poll_events(&needs)).await.unwrap_or_default()
         };
         let reasoning = args.get("reasoning").and_then(Value::as_str).map(rules::clean_text).filter(|r| !r.is_empty());
         Ok(json!({
@@ -436,6 +461,7 @@ impl UsageMonitorPlugin {
             "activated": false,
             "rule": rule,
             "review": monitors::review(&rule),
+            "replay": replay::replay(&rule, &recent, &events),
             "reasoning": reasoning.map(|text| json!({ "text": text, "label": "Supplied by the requesting agent (AI-generated, may be wrong). AegisWin did not check it; the description is what the monitor does." })),
             "next": "Nothing runs yet. To start it, call activate_monitor with this exact rule. That needs the owner's PIN.",
         }))
@@ -565,7 +591,7 @@ impl Plugin for UsageMonitorPlugin {
         self.telemetry.lock().unwrap().components = ctx.enabled_components.clone();
         match tool {
             "configure_watch_window" => self.configure(&args),
-            "propose_monitor" => self.propose(&args, &ctx),
+            "propose_monitor" => self.propose(&args, &ctx).await,
             "activate_monitor" => self.activate(&args, &ctx),
             "list_monitors" => self.list(&ctx),
             "pause_monitor" => {
@@ -589,7 +615,7 @@ impl Plugin for UsageMonitorPlugin {
             }
             "purge_telemetry_history" => {
                 let mut t = self.telemetry.lock().unwrap();
-                let removed = t.spikes.len() + t.foreground.len() + t.hits.len();
+                let removed = t.spikes.len() + t.foreground.len() + t.hits.len() + t.recent.len();
                 t.clear();
                 Ok(json!({ "purged": true, "entriesRemoved": removed }))
             }
@@ -650,8 +676,15 @@ mod tests {
         t.evaluate_monitors(&tick(80.0));
         assert_eq!(t.hits.len(), 1);
         assert_eq!((t.hits[0].monitor_id.as_str(), t.hits[0].name.as_str()), ("m1", "Busy"));
+        assert_eq!(t.recent.len(), 2, "each tick is kept for replay");
         t.clear();
-        assert!(t.hits.is_empty(), "purge and lock clear hits");
+        assert!(t.hits.is_empty() && t.recent.is_empty(), "purge and lock clear hits and the replay history");
+
+        // Outside the watch window monitors still run, but nothing is kept for replay.
+        t.watch.start_time = "08:00".into();
+        t.watch.end_time = "09:00".into();
+        t.evaluate_monitors(&tick(20.0));
+        assert!(t.recent.is_empty());
     }
 
     #[test]

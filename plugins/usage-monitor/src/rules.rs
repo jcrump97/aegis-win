@@ -16,6 +16,9 @@ use crate::{in_window, parse_hhmm, ProcSample, COMPONENT_CRASHES, COMPONENT_FORE
 pub const RULE_VERSION: u32 = 1;
 pub const MAX_MONITORS: usize = 20;
 pub const MAX_CONDITIONS: usize = 8;
+/// The lowest thresholds a rule may use. Replay relies on these.
+pub const MIN_CPU_PERCENT: f64 = 1.0;
+pub const MIN_MEMORY_MB: u64 = 64;
 /// Every monitor is evaluated on the shared 5-second sampler tick.
 pub const SAMPLE_SECONDS: u32 = 5;
 /// An event or crash counts as true for this long after it is logged.
@@ -330,13 +333,13 @@ pub fn validate(value: &Value, enabled_components: &[String]) -> Result<Rule, Ve
         }
         match cond {
             Condition::ProcessCpu { at_least_percent, .. } | Condition::SystemCpu { at_least_percent, .. } | Condition::SystemMemory { at_least_percent, .. } => {
-                if !(1.0..=100.0).contains(at_least_percent) {
-                    errors.push(format!("condition {n}: atLeastPercent must be 1-100"));
+                if !(MIN_CPU_PERCENT..=100.0).contains(at_least_percent) {
+                    errors.push(format!("condition {n}: atLeastPercent must be {MIN_CPU_PERCENT}-100"));
                 }
             }
             Condition::ProcessMemory { at_least_mb, .. } => {
-                if !(64..=1_048_576).contains(at_least_mb) {
-                    errors.push(format!("condition {n}: atLeastMb must be 64-1048576"));
+                if !(MIN_MEMORY_MB..=1_048_576).contains(at_least_mb) {
+                    errors.push(format!("condition {n}: atLeastMb must be {MIN_MEMORY_MB}-1048576"));
                 }
             }
             Condition::Event { event_id, .. } if *event_id > 65_535 => {

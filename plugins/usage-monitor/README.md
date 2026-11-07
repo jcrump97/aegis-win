@@ -34,9 +34,10 @@ The sampler only runs when `resource-spikes` or `active-window` is enabled, or a
 
 A monitor is a rule that says when something worth recording happens, for example "game.exe uses 80 % CPU for 30 seconds while an Application Hang is logged, on Friday and Saturday evenings". The rule language is defined in [ADR 0002 §1](../../documentation/adr/0002-ai-monitor-creator.md).
 
-- **Anyone can propose, only you can start.** `propose_monitor` checks a rule and returns the description AegisWin writes from the rule itself, its privacy flags, and any problems. It saves nothing. `activate_monitor`, `pause_monitor`, and `delete_monitor` need your PIN, so an AI agent gets an approval request that shows the full rule it wants to run.
+- **Anyone can propose, only you can start.** `propose_monitor` checks a rule and returns the description AegisWin writes from the rule itself, its privacy flags, a replay, and any problems. It saves nothing. `activate_monitor`, `pause_monitor`, and `delete_monitor` need your PIN, so an AI agent gets an approval request that shows the full rule it wants to run.
 - **Monitors only watch.** A hit is recorded in memory (shown in the snapshot and counted in `list_monitors`). A monitor never runs anything or changes Windows.
 - **Components still decide.** A rule that needs a turned-off component is refused, and a saved monitor stops while its component is off, then runs again when it is back.
+- **Replay.** A proposal shows how often the rule would have fired on the samples kept in memory for the last 30 minutes of the watch window. Event and crash conditions are checked against the event logs as they are when you propose. Few samples means little was checked; it is not a prediction.
 - **Limits.** 20 monitors, 1-8 conditions each, all evaluated on the shared 5-second sample. Event and crash conditions read the logs they need every 15 seconds and count for 10 minutes after the event.
 
 ## Privacy
@@ -44,6 +45,7 @@ A monitor is a rule that says when something worth recording happens, for exampl
 - Telemetry is kept in memory only, in ring buffers of 500 entries. It is never written to `./data`, and it is cleared when the vault locks or with `purge_telemetry_history`.
 - The watch window settings also reset when the vault locks.
 - Saved monitors are kept inside the encrypted vault (`documentation/PLUGIN_SPEC.md` §5), so they survive a restart. Their hits are telemetry: memory only, cleared on lock and by `purge_telemetry_history`, which keeps the monitors themselves.
+- For replay, the last 30 minutes of samples inside the watch window are kept in memory: process names with CPU and memory (only those at 1 % CPU or 64 MB and up, the lowest a rule can use) and system load while `resource-spikes` is on, and the foreground process name while `active-window` is on. They are cleared on lock and by `purge_telemetry_history` and are never sent to the LLM.
 
 ## How it talks to Windows
 
@@ -53,4 +55,4 @@ A monitor is a rule that says when something worth recording happens, for exampl
 
 ## Tests
 
-`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), and the monitor tools' PIN gates through the real engine (`tests/monitors.rs`).
+`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), and the monitor tools' PIN gates through the real engine (`tests/monitors.rs`).
