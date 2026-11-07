@@ -11,6 +11,8 @@ const REQUIRED_DOCS = [
   'documentation/SECURITY_MODEL.md',
   'documentation/AUDIT_LEDGER.md',
   'documentation/adr/0001-rust-core.md',
+  'documentation/adr/0002-ai-monitor-creator.md',
+  'documentation/adr/0003-action-plans.md',
 ];
 
 test('Documentation Audit: all required agent and architecture docs exist and are non-empty', () => {
@@ -75,4 +77,21 @@ test('Documentation Audit: ADR 0001 amendment defines the basic app and the MCP 
   assert.match(adr, /\^\[a-zA-Z0-9_-\]\{1,64\}\$/);
   const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
   assert.match(sec, /reveal_mcp_token/);
+});
+
+test('Documentation Audit: ADRs 0002 and 0003 are accepted and keep their trust rules', () => {
+  const monitor = fs.readFileSync('documentation/adr/0002-ai-monitor-creator.md', 'utf8');
+  assert.match(monitor, /\*\*Status\*\*: Accepted/);
+  // Monitors only observe; the AI never activates anything.
+  assert.match(monitor, /the AI proposes, code validates and describes, the owner approves with the PIN/);
+  assert.match(monitor, /`activate_monitor` \| \*\*pin_required\*\*/);
+  const plans = fs.readFileSync('documentation/adr/0003-action-plans.md', 'utf8');
+  assert.match(plans, /\*\*Status\*\*: Accepted/);
+  // One PIN approves exactly the stored plan, and the browser page never skips the PIN.
+  assert.match(plans, /hashed with SHA-256/);
+  assert.match(plans, /It always requires the PIN\./);
+  assert.match(plans, /one global serial executor/);
+  for (const doc of [monitor, plans]) {
+    assert.doesNotMatch(doc, /\*Recommendation:/, 'every open question records its decision');
+  }
 });
