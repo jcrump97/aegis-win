@@ -260,3 +260,19 @@ async fn trust_is_reset_when_the_llm_destination_changes() {
     assert!(view.llm.endpoint.as_ref().unwrap().relayed);
     assert!(!trusted(&f), "moving to a cloud model needs a new grant");
 }
+
+#[tokio::test]
+async fn a_rejected_settings_change_changes_nothing() {
+    let f = ready().await;
+    // The scale and URL are valid; the port is not, so the whole update must be rejected.
+    let bad = SettingsUpdate { ui_scale: Some(130), llm_base_url: Some("http://192.168.1.50:11434/v1".into()), mcp_port: Some(80), ..Default::default() };
+    assert_eq!(f.engine.update_settings(bad).await.unwrap_err().code, ErrorCode::InvalidArguments);
+    let view = f.engine.settings().await.unwrap();
+    assert_eq!(view.ui_scale, 100);
+    assert_ne!(view.llm.base_url, "http://192.168.1.50:11434/v1");
+    // A later, unrelated save must not write the rejected values to disk either.
+    f.engine.set_llm_api_key(String::new()).unwrap();
+    f.engine.lock().await;
+    f.engine.unlock(PIN.into()).await.unwrap();
+    assert_eq!(f.engine.settings().await.unwrap().ui_scale, 100);
+}

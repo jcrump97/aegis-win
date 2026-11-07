@@ -265,13 +265,20 @@ impl Engine {
         guard.as_ref().map(|v| f(&v.state)).ok_or_else(locked)
     }
 
-    /// Applies a change to the vault state and saves it; on a failed save the
-    /// in-memory state is rolled back.
+    /// Applies a change to the vault state and saves it. If the change is
+    /// rejected part-way or the save fails, the in-memory state is rolled
+    /// back, so a rejected change never reaches disk with a later save.
     fn mutate<R>(&self, f: impl FnOnce(&mut VaultState) -> AegisResult<R>) -> AegisResult<R> {
         let mut guard = lock(&self.vault);
         let vault = guard.as_mut().ok_or_else(locked)?;
         let before = vault.state.clone();
-        let out = f(&mut vault.state)?;
+        let out = match f(&mut vault.state) {
+            Ok(out) => out,
+            Err(e) => {
+                vault.state = before;
+                return Err(e);
+            }
+        };
         if let Err(e) = vault.save() {
             vault.state = before;
             return Err(vault_err(e));
