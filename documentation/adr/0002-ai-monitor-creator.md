@@ -70,6 +70,18 @@ The governing rule for every part of this design: **the AI proposes, code valida
 - **Privacy flags** shown on review: `foreground` conditions, `"*"` process scope, and all-day schedules.
 - The existing watch window becomes a built-in rule named "Default" (Phase 1), so there is one model, not two.
 
+**Decided while implementing the rule language (Phase 1a, `plugins/usage-monitor/src/rules.rs`):**
+
+- **Strict parsing.** Unknown top-level, schedule, or condition fields are rejected, not ignored, so a rule cannot carry anything the description does not show. `HH:MM` must be exactly two-digit hours and minutes.
+- **Components.** `process_cpu`, `process_memory`, `system_cpu`, and `system_memory` need `usage-monitor:resource-spikes`. `event` and `crash` need `usage-monitor:crash-correlator`. `foreground` needs `usage-monitor:active-window`.
+- **`foreground` needs a named process.** `"*"` is rejected there, since "any app is in the foreground" is always true and only records usage.
+- **Hidden characters.** Names, process names, and providers reject control characters and invisible format characters (bidi overrides, zero-width marks), so the review text cannot read differently from the rule. Errors that echo input strip those characters and are length-capped.
+- **Names are names.** Process names also reject `\ / : * ? " < > |`. Matching is case-insensitive. A `crash` condition matches the process as a whole word in the event text, so `game.exe` does not match `mygame.exe`.
+- **Duration.** `forSeconds` means that many consecutive 5-second samples (rounded up, at least one). Any sample where the condition is false, a tick gap over 15 seconds (sleep, a stalled sampler), the clock moving backwards, or leaving the schedule resets the count. The sample after a gap starts a new count.
+- **Schedule.** Times are local. An overnight window belongs to the day it started on: with `days: ["fri"]` and 22:00–02:00, Saturday 01:00 is active and Saturday 23:00 is not.
+- **Cooldown.** Measured from the last hit. If the clock moves backwards, the cooldown ends rather than stretching.
+- **Duplicate conditions** in one trigger are rejected.
+
 ### New and changed tools (`usage-monitor`)
 
 | Tool | Gate | readOnly | Purpose |

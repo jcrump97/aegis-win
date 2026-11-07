@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+pub mod rules;
+
 pub const COMPONENT_SPIKES: &str = "usage-monitor:resource-spikes";
 pub const COMPONENT_CRASHES: &str = "usage-monitor:crash-correlator";
 pub const COMPONENT_FOREGROUND: &str = "usage-monitor:active-window";
