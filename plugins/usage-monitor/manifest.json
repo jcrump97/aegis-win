@@ -2,7 +2,7 @@
   "id": "usage-monitor",
   "name": "Diagnostic Usage & Time-Window Monitor",
   "version": "1.0.0",
-  "description": "Samples per-process CPU and memory while AegisWin is unlocked, records spikes inside a daily watch window, correlates them with application crash and hang events, and tracks which app was in the foreground.",
+  "description": "Samples per-process CPU and memory while AegisWin is unlocked, records spikes inside a daily watch window, correlates them with application crash and hang events, tracks which app was in the foreground, and runs the monitors you approve.",
   "optionalInstallDefault": true,
   "usesLlm": true,
   "subComponents": [
@@ -43,9 +43,85 @@
       }
     },
     {
+      "id": "propose_monitor",
+      "name": "Check a Proposed Monitor",
+      "description": "Validates a monitor rule and returns the plain-language description AegisWin generates from it, its privacy flags, and any problems. Starts nothing. Use it before activate_monitor.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule"],
+        "properties": {
+          "rule": { "type": "object", "description": "A monitor rule, version 1 (see the usage-monitor README): version, name, schedule {startTime, endTime, days?}, trigger {all|any: 1-8 conditions of type process_cpu, process_memory, system_cpu, system_memory, event, crash, foreground}, cooldownSeconds 60-86400, notify tray|none." },
+          "reasoning": { "type": "string", "maxLength": 4000, "description": "Why this monitor fits the owner's problem. Shown to the owner as supplied by the requesting agent, cut to 600 characters." }
+        }
+      }
+    },
+    {
+      "id": "activate_monitor",
+      "name": "Start a Monitor",
+      "description": "Saves a monitor rule and starts watching for it, or replaces the rule of an existing monitor. Monitors only watch and record; they never run anything or change Windows.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "readOnly": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rule"],
+        "properties": {
+          "rule": { "type": "object", "description": "A monitor rule, version 1 (see the usage-monitor README): version, name, schedule {startTime, endTime, days?}, trigger {all|any: 1-8 conditions of type process_cpu, process_memory, system_cpu, system_memory, event, crash, foreground}, cooldownSeconds 60-86400, notify tray|none." },
+          "replaceId": { "type": "string", "maxLength": 20, "description": "Id of the monitor to replace (for example m3)." }
+        }
+      }
+    },
+    {
+      "id": "list_monitors",
+      "name": "List Monitors",
+      "description": "Lists saved monitors with their generated descriptions, whether each is running, paused, or blocked by a turned-off component, and hits since unlock.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "readOnly": true,
+      "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+    },
+    {
+      "id": "pause_monitor",
+      "name": "Pause or Resume a Monitor",
+      "description": "Pauses a monitor (paused: true) or resumes it (paused: false).",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "readOnly": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "maxLength": 20 },
+          "paused": { "type": "boolean", "default": true }
+        }
+      }
+    },
+    {
+      "id": "delete_monitor",
+      "name": "Delete a Monitor",
+      "description": "Deletes a saved monitor. Its hits recorded so far stay until they are purged or AegisWin locks.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "readOnly": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "maxLength": 20 }
+        }
+      }
+    },
+    {
       "id": "capture_diagnostic_snapshot",
       "name": "Capture Correlated Diagnostic Clues",
-      "description": "Returns current system load, top processes by CPU and memory, recorded spikes, crash and hang events from the last 24 hours with related spikes, and foreground app changes.",
+      "description": "Returns current system load, top processes by CPU and memory, recorded spikes, crash and hang events from the last 24 hours with related spikes, foreground app changes, and monitor hits.",
       "requiresAdmin": false,
       "defaultGatePolicy": "auto",
       "readOnly": true,
@@ -76,7 +152,7 @@
     {
       "id": "purge_telemetry_history",
       "name": "Purge Recorded Telemetry",
-      "description": "Deletes all recorded spikes and foreground app history from memory. Telemetry is never written to disk.",
+      "description": "Deletes all recorded spikes, foreground app history, and monitor hits from memory. Saved monitors are kept. Telemetry is never written to disk.",
       "requiresAdmin": false,
       "defaultGatePolicy": "pin_required",
       "readOnly": false,

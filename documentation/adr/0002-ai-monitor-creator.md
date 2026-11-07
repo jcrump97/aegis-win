@@ -70,6 +70,8 @@ The governing rule for every part of this design: **the AI proposes, code valida
 - **Privacy flags** shown on review: `foreground` conditions, `"*"` process scope, and all-day schedules.
 - The existing watch window becomes a built-in rule named "Default" (Phase 1), so there is one model, not two.
 
+**Activation takes the full rule (Phase 1c).** The first draft had `propose_monitor` return a `proposalId` that `activate_monitor` referenced. Instead, `activate_monitor` takes the whole rule, so the approval request shows exactly what will run and there is no proposal store to expire or clear. The rule is validated again when the approved call runs, against the components enabled at that moment. Monitor ids are `m1`, `m2`, … and are never reused.
+
 **Rule storage (Phase 1b).** Rules are kept with the new `aegis-core` plugin data store (`PLUGIN_SPEC.md` §5): records inside the encrypted vault, bound to the plugin's id, reachable only while unlocked and installed, capped at 256 KiB per plugin. Uninstalling `usage-monitor` keeps its rules but makes them unreachable until it is installed again; `purge_telemetry_history` does not delete rules. A one-line pointer in `SECURITY_MODEL.md` waits until the owner's pending edits to that file land.
 
 **Decided while implementing the rule language (Phase 1a, `plugins/usage-monitor/src/rules.rs`):**
@@ -88,8 +90,8 @@ The governing rule for every part of this design: **the AI proposes, code valida
 
 | Tool | Gate | readOnly | Purpose |
 | :--- | :--- | :--- | :--- |
-| `propose_monitor` | auto | true | Validates a rule. Returns a `proposalId` (memory only, 30-minute expiry, cleared on lock), a code-generated description, privacy flags, and a replay result. Activates nothing. Takes an optional `reasoning` string from an MCP agent. |
-| `activate_monitor` | **pin_required** | false | Saves and starts a proposal. Edits are a new proposal that replaces a monitor id. |
+| `propose_monitor` | auto | true | Validates a rule. Returns the normalized rule, a code-generated description, privacy flags, and a replay result. Activates nothing and stores nothing. Takes an optional `reasoning` string from an MCP agent, returned cleaned, cut to 600 characters, and labelled "Supplied by the requesting agent". |
+| `activate_monitor` | **pin_required** | false | Saves and starts a rule, passed in full. An optional `replaceId` replaces an existing monitor's rule and keeps its id. |
 | `list_monitors` | auto | true | Active and paused monitors, with code-generated descriptions |
 | `delete_monitor`, `pause_monitor` | **pin_required** | false | Weakening monitoring could hide evidence, so it needs the PIN |
 | `read_monitor_history` | **pin_required** (open question 2) | true | Decrypted history, needs the vault unlocked |

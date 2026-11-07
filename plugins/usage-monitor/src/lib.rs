@@ -1,8 +1,10 @@
 //! `usage-monitor`: resource spikes, crash correlation, and foreground-app
-//! tracking during a user-defined daily watch window.
+//! tracking during a user-defined daily watch window, plus owner-approved
+//! monitors (ADR 0002).
 //!
-//! Telemetry lives in memory only (bounded ring buffers) and is cleared when
-//! the vault locks. Only process names are recorded, never window titles.
+//! Telemetry, including monitor hits, lives in memory only (bounded ring
+//! buffers) and is cleared when the vault locks. Saved monitors live in the
+//! encrypted vault. Only process names are recorded, never window titles.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,14 +13,17 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aegis_core::os::{self, eventlog};
+use aegis_core::plugin_data::PluginStore;
 use aegis_core::registry::{Plugin, PluginManifest, ToolContext, UnlockContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
-use chrono::{DateTime, Local, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
+use monitors::{MonitorBook, MonitorHit, MonitorRuntime};
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+pub mod monitors;
 pub mod rules;
 
 pub const COMPONENT_SPIKES: &str = "usage-monitor:resource-spikes";
@@ -28,6 +33,9 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 const SPIKE_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_ENTRIES: usize = 500;
 const CORRELATION_WINDOW_MINUTES: i64 = 10;
+/// How often the sampler re-reads the event logs that active monitors use.
+const EVENT_POLL_EVERY: Duration = Duration::from_secs(15);
+const EVENT_POLL_LIMIT: usize = 200;
 
 const SYSTEM_PROMPT: &str = "You are a Windows performance and stability assistant. The user message is a JSON \
 diagnostic snapshot: top processes by CPU and memory, recorded resource spikes, application crash or hang events, \
@@ -120,11 +128,36 @@ struct Telemetry {
     last_spike: HashMap<(String, &'static str), Instant>,
     last_foreground: Option<String>,
     sampling_since: Option<String>,
+    monitors: MonitorRuntime,
+    hits: VecDeque<MonitorHit>,
 }
 
 impl Telemetry {
     fn enabled(&self, component: &str) -> bool {
         self.components.iter().any(|c| c == component)
+    }
+
+    /// Runs every saved monitor against this tick and records their hits.
+    fn evaluate_monitors(&mut self, tick: &rules::Tick) {
+        let Self { monitors, hits, .. } = self;
+        for m in &mut monitors.active {
+            if let Some(hit) = m.evaluator.tick(tick) {
+                push_capped(hits, MonitorHit::new(&m.id, &m.evaluator.rule().name, hit));
+            }
+        }
+    }
+
+    /// Channels and event ids the running monitors need, de-duplicated.
+    fn event_needs(&self) -> Vec<(rules::Channel, Vec<u32>)> {
+        let mut out: Vec<(rules::Channel, Vec<u32>)> = Vec::new();
+        for (channel, id) in self.monitors.active.iter().flat_map(|m| rules::event_needs(m.evaluator.rule())) {
+            match out.iter_mut().find(|(c, _)| *c == channel) {
+                Some((_, ids)) if !ids.contains(&id) => ids.push(id),
+                Some(_) => {}
+                None => out.push((channel, vec![id])),
+            }
+        }
+        out
     }
 
     fn record(&mut self, samples: &[ProcSample], foreground: Option<String>, now_local: NaiveTime, now: Instant) {
@@ -161,6 +194,7 @@ impl Telemetry {
     }
 
     fn clear(&mut self) {
+        self.hits.clear();
         self.spikes.clear();
         self.foreground.clear();
         self.last_spike.clear();
@@ -199,6 +233,35 @@ fn samples(sys: &System) -> Vec<ProcSample> {
         .collect()
 }
 
+fn system_memory_percent(sys: &System) -> f64 {
+    let total = sys.total_memory();
+    if total == 0 {
+        0.0
+    } else {
+        sys.used_memory() as f64 * 100.0 / total as f64
+    }
+}
+
+/// Reads recent entries of the event ids active monitors use. A channel that
+/// cannot be read is skipped; monitors on it simply do not fire.
+fn poll_events(needs: &[(rules::Channel, Vec<u32>)]) -> Vec<rules::ObservedEvent> {
+    let mut out = Vec::new();
+    for (channel, ids) in needs {
+        let query = eventlog::EventQuery { channel: channel.as_str().into(), event_ids: ids.clone(), lookback_hours: Some(1), limit: EVENT_POLL_LIMIT, ..Default::default() };
+        let Ok(records) = eventlog::query(&query) else { continue };
+        out.extend(records.into_iter().filter_map(|r| {
+            Some(rules::ObservedEvent {
+                channel: *channel,
+                time: DateTime::parse_from_rfc3339(&r.time_created).ok()?.with_timezone(&Utc),
+                provider: r.provider,
+                event_id: r.event_id,
+                message: r.message.unwrap_or_default(),
+            })
+        }));
+    }
+    out
+}
+
 fn foreground_name(sys: &System) -> Option<String> {
     let pid = os::foreground_process_id()?;
     sys.process(Pid::from_u32(pid)).map(|p| p.name().to_string_lossy().into_owned())
@@ -213,6 +276,8 @@ pub struct UsageMonitorPlugin {
     manifest: PluginManifest,
     telemetry: Arc<Mutex<Telemetry>>,
     sampler: Mutex<Option<Sampler>>,
+    /// Serializes read-modify-write of the saved monitors.
+    book: Mutex<()>,
 }
 
 impl Default for UsageMonitorPlugin {
@@ -221,6 +286,7 @@ impl Default for UsageMonitorPlugin {
             manifest: PluginManifest::from_json(include_str!("../manifest.json")).expect("usage-monitor manifest.json is valid"),
             telemetry: Arc::default(),
             sampler: Mutex::new(None),
+            book: Mutex::new(()),
         }
     }
 }
@@ -243,6 +309,8 @@ impl UsageMonitorPlugin {
             .spawn(move || {
                 let mut sys = System::new();
                 refresh(&mut sys);
+                let mut events: Vec<rules::ObservedEvent> = Vec::new();
+                let mut last_poll: Option<Instant> = None;
                 while !flag.load(Ordering::Relaxed) {
                     let mut waited = Duration::ZERO;
                     while waited < SAMPLE_EVERY && !flag.load(Ordering::Relaxed) {
@@ -255,7 +323,24 @@ impl UsageMonitorPlugin {
                     refresh(&mut sys);
                     let current = samples(&sys);
                     let fg = foreground_name(&sys);
-                    telemetry.lock().unwrap().record(&current, fg, Local::now().time(), Instant::now());
+                    if last_poll.is_none_or(|t| t.elapsed() >= EVENT_POLL_EVERY) {
+                        last_poll = Some(Instant::now());
+                        let needs = telemetry.lock().unwrap().event_needs();
+                        events = if needs.is_empty() { Vec::new() } else { poll_events(&needs) };
+                    }
+                    let local = Local::now();
+                    let mut t = telemetry.lock().unwrap();
+                    t.record(&current, fg.clone(), local.time(), Instant::now());
+                    t.evaluate_monitors(&rules::Tick {
+                        now: Utc::now(),
+                        local_time: local.time(),
+                        local_weekday: local.weekday(),
+                        processes: &current,
+                        system_cpu_percent: f64::from(sys.global_cpu_usage()),
+                        system_memory_percent: system_memory_percent(&sys),
+                        foreground: fg.as_deref(),
+                        events: &events,
+                    });
                 }
             })
             .expect("can spawn the sampler thread");
@@ -295,10 +380,97 @@ impl UsageMonitorPlugin {
         Ok(json!({ "watch": watch, "note": "The watch window applies while AegisWin is running and unlocked." }))
     }
 
-    async fn snapshot(&self, label: String) -> AegisResult<Value> {
-        let (watch, components, spikes, foreground, since) = {
+    /// Loads the saved monitors and (re)builds what runs.
+    fn load_monitors(&self, store: Option<&PluginStore>, components: &[String]) {
+        let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        let runtime = match store.map(|s| s.get(monitors::STORE_KEY)) {
+            None => MonitorRuntime::failed("no plugin data store".into()),
+            // Locked again before this ran: start nothing.
+            Some(Err(e)) if e.code == ErrorCode::VaultLocked => return,
+            Some(Err(e)) => MonitorRuntime::failed(e.message),
+            Some(Ok(value)) => match MonitorBook::from_store(value) {
+                Ok(book) => MonitorRuntime::build(&book, components),
+                Err(e) => MonitorRuntime::failed(e),
+            },
+        };
+        self.telemetry.lock().unwrap().monitors = runtime;
+        self.start_sampler_if_needed();
+    }
+
+    /// The sampler runs while a sampling component is on or a monitor runs.
+    fn start_sampler_if_needed(&self) {
+        let needed = {
             let t = self.telemetry.lock().unwrap();
-            (t.watch.clone(), t.components.clone(), t.spikes.iter().cloned().collect::<Vec<_>>(), t.foreground.iter().cloned().collect::<Vec<_>>(), t.sampling_since.clone())
+            [COMPONENT_SPIKES, COMPONENT_FOREGROUND].iter().any(|c| t.enabled(c)) || !t.monitors.active.is_empty()
+        };
+        if needed {
+            self.start_sampler();
+        }
+    }
+
+    /// Applies `change` to the saved monitors, saves them, and restarts the
+    /// runtime from what was saved. Nothing changes if any step fails.
+    fn change_monitors<R>(&self, ctx: &ToolContext, change: impl FnOnce(&mut MonitorBook) -> Result<R, String>) -> AegisResult<R> {
+        let store = ctx.store()?;
+        let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        let mut book = MonitorBook::from_store(store.get(monitors::STORE_KEY)?).map_err(AegisError::failed)?;
+        let out = change(&mut book).map_err(AegisError::invalid)?;
+        store.set(monitors::STORE_KEY, book.to_value())?;
+        self.telemetry.lock().unwrap().monitors = MonitorRuntime::build(&book, &ctx.enabled_components);
+        self.start_sampler_if_needed();
+        Ok(out)
+    }
+
+    fn validated(args: &Value, ctx: &ToolContext) -> Result<rules::Rule, Vec<String>> {
+        rules::validate(args.get("rule").unwrap_or(&Value::Null), &ctx.enabled_components)
+    }
+
+    fn propose(&self, args: &Value, ctx: &ToolContext) -> AegisResult<Value> {
+        let rule = match Self::validated(args, ctx) {
+            Ok(rule) => rule,
+            Err(problems) => return Ok(json!({ "valid": false, "problems": problems, "activated": false })),
+        };
+        let reasoning = args.get("reasoning").and_then(Value::as_str).map(rules::clean_text).filter(|r| !r.is_empty());
+        Ok(json!({
+            "valid": true,
+            "activated": false,
+            "rule": rule,
+            "review": monitors::review(&rule),
+            "reasoning": reasoning.map(|text| json!({ "text": text, "label": "Supplied by the requesting agent (AI-generated, may be wrong). AegisWin did not check it; the description is what the monitor does." })),
+            "next": "Nothing runs yet. To start it, call activate_monitor with this exact rule. That needs the owner's PIN.",
+        }))
+    }
+
+    fn activate(&self, args: &Value, ctx: &ToolContext) -> AegisResult<Value> {
+        let rule = Self::validated(args, ctx).map_err(|p| AegisError::invalid(p.join("; ")))?;
+        let replace = args.get("replaceId").and_then(Value::as_str);
+        let id = self.change_monitors(ctx, |book| book.activate(&rule, replace))?;
+        Ok(json!({ "id": id, "replaced": replace.is_some(), "running": true, "review": monitors::review(&rule) }))
+    }
+
+    fn list(&self, ctx: &ToolContext) -> AegisResult<Value> {
+        let book = MonitorBook::from_store(ctx.store()?.get(monitors::STORE_KEY)?).map_err(AegisError::failed)?;
+        let t = self.telemetry.lock().unwrap();
+        let hits: Vec<MonitorHit> = t.hits.iter().cloned().collect();
+        Ok(json!({
+            "monitors": book.monitors.iter().map(|m| monitors::view(m, &t.monitors, &hits)).collect::<Vec<_>>(),
+            "maxMonitors": rules::MAX_MONITORS,
+            "loadError": t.monitors.load_error,
+            "note": "Monitors only watch and record while AegisWin is running and unlocked. They never run anything or change Windows.",
+        }))
+    }
+
+    async fn snapshot(&self, label: String) -> AegisResult<Value> {
+        let (watch, components, spikes, foreground, since, hits) = {
+            let t = self.telemetry.lock().unwrap();
+            (
+                t.watch.clone(),
+                t.components.clone(),
+                t.spikes.iter().cloned().collect::<Vec<_>>(),
+                t.foreground.iter().cloned().collect::<Vec<_>>(),
+                t.sampling_since.clone(),
+                t.hits.iter().cloned().collect::<Vec<_>>(),
+            )
         };
         let enabled = |c: &str| components.iter().any(|x| x == c);
 
@@ -349,6 +521,7 @@ impl UsageMonitorPlugin {
             "spikes": if enabled(COMPONENT_SPIKES) { json!(spikes) } else { json!("component disabled") },
             "crashes": crashes,
             "foregroundChanges": if enabled(COMPONENT_FOREGROUND) { json!(foreground) } else { json!("component disabled") },
+            "monitorHits": hits,
         }))
     }
 }
@@ -392,6 +565,19 @@ impl Plugin for UsageMonitorPlugin {
         self.telemetry.lock().unwrap().components = ctx.enabled_components.clone();
         match tool {
             "configure_watch_window" => self.configure(&args),
+            "propose_monitor" => self.propose(&args, &ctx),
+            "activate_monitor" => self.activate(&args, &ctx),
+            "list_monitors" => self.list(&ctx),
+            "pause_monitor" => {
+                let (id, paused) = (args["id"].as_str().unwrap_or_default().to_owned(), args["paused"].as_bool().unwrap_or(true));
+                self.change_monitors(&ctx, |book| book.set_paused(&id, paused))?;
+                Ok(json!({ "id": id, "paused": paused }))
+            }
+            "delete_monitor" => {
+                let id = args["id"].as_str().unwrap_or_default().to_owned();
+                let removed = self.change_monitors(&ctx, |book| book.delete(&id))?;
+                Ok(json!({ "id": removed.id, "deleted": true }))
+            }
             "capture_diagnostic_snapshot" => {
                 let label = args.get("windowLabel").and_then(Value::as_str).unwrap_or("Current diagnostic window").to_owned();
                 self.snapshot(label).await
@@ -403,7 +589,7 @@ impl Plugin for UsageMonitorPlugin {
             }
             "purge_telemetry_history" => {
                 let mut t = self.telemetry.lock().unwrap();
-                let removed = t.spikes.len() + t.foreground.len();
+                let removed = t.spikes.len() + t.foreground.len() + t.hits.len();
                 t.clear();
                 Ok(json!({ "purged": true, "entriesRemoved": removed }))
             }
@@ -414,23 +600,73 @@ impl Plugin for UsageMonitorPlugin {
     fn on_unlock(&self, ctx: &UnlockContext) {
         let enabled_components = &ctx.enabled_components;
         self.telemetry.lock().unwrap().components = enabled_components.clone();
-        let wants_sampling = [COMPONENT_SPIKES, COMPONENT_FOREGROUND].iter().any(|c| enabled_components.iter().any(|e| e == c));
-        if wants_sampling {
-            self.start_sampler();
-        }
+        self.load_monitors(ctx.store.as_ref(), enabled_components);
     }
 
     fn on_lock(&self) {
+        // Waits for a monitor change in progress, so it cannot restart the
+        // sampler after this. Later changes fail: the vault is already locked.
+        let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
         self.stop_sampler();
         let mut t = self.telemetry.lock().unwrap();
         t.clear();
         t.sampling_since = None;
+        t.monitors = MonitorRuntime::default();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn monitor_runtime(trigger: Value) -> MonitorRuntime {
+        let rule = json!({
+            "version": 1, "name": "Busy", "schedule": { "startTime": "00:00", "endTime": "00:00" },
+            "trigger": trigger, "cooldownSeconds": 60, "notify": "none"
+        });
+        let components = vec![COMPONENT_SPIKES.to_owned(), COMPONENT_CRASHES.to_owned()];
+        let mut book = MonitorBook::default();
+        book.activate(&rules::validate(&rule, &components).unwrap(), None).unwrap();
+        MonitorRuntime::build(&book, &components)
+    }
+
+    #[test]
+    fn the_sampler_tick_records_monitor_hits() {
+        let mut t = Telemetry { monitors: monitor_runtime(json!({ "any": [{ "type": "system_cpu", "atLeastPercent": 50, "forSeconds": 5 }] })), ..Default::default() };
+        let now = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let tick = |cpu: f64| rules::Tick {
+            now,
+            local_time: now.time(),
+            local_weekday: now.weekday(),
+            processes: &[],
+            system_cpu_percent: cpu,
+            system_memory_percent: 10.0,
+            foreground: None,
+            events: &[],
+        };
+        t.evaluate_monitors(&tick(20.0));
+        assert!(t.hits.is_empty());
+        t.evaluate_monitors(&tick(80.0));
+        assert_eq!(t.hits.len(), 1);
+        assert_eq!((t.hits[0].monitor_id.as_str(), t.hits[0].name.as_str()), ("m1", "Busy"));
+        t.clear();
+        assert!(t.hits.is_empty(), "purge and lock clear hits");
+    }
+
+    #[test]
+    fn only_the_event_ids_monitors_use_are_polled() {
+        let t = Telemetry {
+            monitors: monitor_runtime(json!({ "any": [
+                { "type": "crash", "process": "game.exe" },
+                { "type": "event", "channel": "Application", "eventId": 1000 },
+                { "type": "event", "channel": "System", "eventId": 41 }
+            ] })),
+            ..Default::default()
+        };
+        assert_eq!(t.event_needs(), vec![(rules::Channel::Application, vec![1000, 1002]), (rules::Channel::System, vec![41])]);
+        assert!(Telemetry::default().event_needs().is_empty(), "no monitors, no event polling");
+    }
 
     fn t(s: &str) -> NaiveTime {
         parse_hhmm(s).unwrap()

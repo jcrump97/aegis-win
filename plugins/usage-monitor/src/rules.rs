@@ -23,6 +23,7 @@ pub const EVENT_HOLD_MINUTES: i64 = 10;
 const MAX_NAME_CHARS: usize = 60;
 const MAX_PROCESS_CHARS: usize = 260;
 const MAX_PROVIDER_CHARS: usize = 128;
+const MAX_REASONING_CHARS: usize = 600;
 /// A gap this long between ticks (sleep, a stalled sampler) resets "for N seconds" counters.
 const MAX_TICK_GAP_SECONDS: i64 = 15;
 
@@ -161,6 +162,12 @@ pub enum Condition {
 /// what the rule does.
 fn is_hidden(c: char) -> bool {
     c.is_control() || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
+/// Free text such as an AI's reasoning, cleaned for display: hidden
+/// characters removed, trimmed, and capped.
+pub fn clean_text(s: &str) -> String {
+    echo(s.trim(), MAX_REASONING_CHARS).trim().to_owned()
 }
 
 /// Input echoed back in an error message: bounded and with hidden characters removed.
@@ -314,8 +321,9 @@ pub fn validate(value: &Value, enabled_components: &[String]) -> Result<Rule, Ve
             }
             Condition::Event { provider: Some(p), .. } => {
                 *p = p.trim().to_owned();
-                if p.is_empty() || p.chars().count() > MAX_PROVIDER_CHARS || p.chars().any(is_hidden) {
-                    errors.push(format!("condition {n}: provider must be 1-{MAX_PROVIDER_CHARS} characters"));
+                // The same characters the event log query accepts.
+                if p.is_empty() || p.len() > MAX_PROVIDER_CHARS || !p.chars().all(|c| c.is_ascii_alphanumeric() || " ._-()/".contains(c)) {
+                    errors.push(format!("condition {n}: provider must be 1-{MAX_PROVIDER_CHARS} letters, digits, spaces or . _ - ( ) /"));
                 }
             }
             _ => {}
@@ -371,6 +379,19 @@ fn check_process(name: &str, allow_any: bool) -> Result<(), String> {
         return Err("process must be an executable name such as game.exe, not a path or pattern".into());
     }
     Ok(())
+}
+
+/// The event-log entries a rule needs the sampler to poll for.
+pub fn event_needs(rule: &Rule) -> Vec<(Channel, u32)> {
+    let mut out = Vec::new();
+    for c in rule.trigger.conditions() {
+        match c {
+            Condition::Event { channel, event_id, .. } => out.push((*channel, *event_id)),
+            Condition::Crash { .. } => out.extend([(Channel::Application, 1000), (Channel::Application, 1002)]),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub fn privacy_flags(rule: &Rule) -> Vec<PrivacyFlag> {
