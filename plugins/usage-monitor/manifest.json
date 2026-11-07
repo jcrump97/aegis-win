@@ -28,7 +28,7 @@
       "name": "Configure Diagnostic Watch Window",
       "description": "Sets the daily time window (24-hour HH:MM; equal start and end means all day), the CPU and memory thresholds, and optionally which process names to watch. Only changes this monitor's own settings, not Windows.",
       "requiresAdmin": false,
-      "defaultGatePolicy": "auto",
+      "defaultGatePolicy": "pin_required",
       "readOnly": false,
       "inputSchema": {
         "type": "object",

@@ -1,7 +1,16 @@
-use aegis_core::registry::{Plugin, ToolContext};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use aegis_core::engine::{Engine, EngineOptions, Origin, RunOutcome};
+use aegis_core::registry::{GatePolicy, Plugin, Registry, ToolContext};
+use aegis_core::tickets::TicketStatus;
+use aegis_core::vault::KdfParams;
 use aegis_core::{schema, ErrorCode};
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES, COMPONENT_FOREGROUND, COMPONENT_SPIKES};
 use serde_json::{json, Value};
+
+const PIN: &str = "246810";
 
 fn all_components() -> Vec<String> {
     vec![COMPONENT_SPIKES.into(), COMPONENT_CRASHES.into(), COMPONENT_FOREGROUND.into()]
@@ -46,6 +55,81 @@ async fn configures_and_validates_the_watch_window() {
     assert_eq!(err.code, ErrorCode::InvalidArguments);
     let err = call(&plugin, "configure_watch_window", json!({ "cpuThresholdPercent": 0 }), ToolContext::default()).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArguments);
+}
+
+/// An unlocked engine with only usage-monitor installed (no components, so no sampler).
+async fn engine() -> (Arc<Engine>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::new(vec![Arc::new(UsageMonitorPlugin::default()) as Arc<dyn Plugin>]).unwrap();
+    let engine = Engine::new(dir.path().join("data"), registry, EngineOptions { kdf: KdfParams::INSECURE_TEST, elevated: false });
+    engine.setup(PIN.into()).await.unwrap();
+    engine.set_installed(BTreeMap::from([("usage-monitor".to_owned(), vec![])])).unwrap();
+    (engine, dir)
+}
+
+async fn watch_start(engine: &Engine) -> Value {
+    let RunOutcome::Completed { result } =
+        engine.run_tool(Origin::Ui { pin: None }, "usage-monitor", "capture_diagnostic_snapshot", json!({})).await.unwrap()
+    else {
+        panic!("snapshot is auto and read-only");
+    };
+    result["watch"]["startTime"].clone()
+}
+
+#[test]
+fn changing_the_watch_window_is_pin_gated_by_default() {
+    let plugin = UsageMonitorPlugin::default();
+    let tool = plugin.manifest().tool("configure_watch_window").unwrap();
+    assert_eq!(tool.default_gate_policy, GatePolicy::PinRequired);
+    assert!(!tool.read_only);
+}
+
+#[tokio::test]
+async fn in_app_watch_window_changes_need_the_right_pin() {
+    let (engine, _dir) = engine().await;
+    let args = json!({ "startTime": "21:00", "endTime": "23:00" });
+    let ui = |pin: Option<&str>| Origin::Ui { pin: pin.map(str::to_owned) };
+
+    let err = engine.run_tool(ui(None), "usage-monitor", "configure_watch_window", args.clone()).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::PinRequired);
+    let err = engine.run_tool(ui(Some("000000")), "usage-monitor", "configure_watch_window", args.clone()).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::PinInvalid);
+    assert_eq!(watch_start(&engine).await, "00:00", "rejected calls change nothing");
+
+    let out = engine.run_tool(ui(Some(PIN)), "usage-monitor", "configure_watch_window", args).await.unwrap();
+    let RunOutcome::Completed { result } = out else { panic!("expected the change to run") };
+    assert_eq!(result["watch"]["startTime"], "21:00");
+    assert_eq!(watch_start(&engine).await, "21:00");
+}
+
+#[tokio::test]
+async fn mcp_watch_window_changes_wait_for_pin_approval() {
+    let (engine, _dir) = engine().await;
+    let outcome = engine
+        .run_tool(Origin::Mcp, "usage-monitor", "configure_watch_window", json!({ "startTime": "21:00", "endTime": "23:00" }))
+        .await
+        .unwrap();
+    assert_eq!(serde_json::to_value(&outcome).unwrap()["status"], "pending_approval");
+    let RunOutcome::PendingApproval { ticket } = outcome else { panic!("expected a ticket") };
+    assert_eq!(ticket.status, TicketStatus::PendingApproval);
+    assert_eq!(watch_start(&engine).await, "00:00", "nothing changes before approval");
+
+    let err = engine.decide_ticket(&ticket.ticket_id, true, "000000".into(), None, "app").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::PinInvalid);
+    assert_eq!(engine.ticket(&ticket.ticket_id).unwrap().status, TicketStatus::PendingApproval);
+    assert_eq!(watch_start(&engine).await, "00:00", "a wrong PIN changes nothing");
+
+    engine.decide_ticket(&ticket.ticket_id, true, PIN.into(), None, "app").await.unwrap();
+    let mut status = TicketStatus::Running;
+    for _ in 0..200 {
+        status = engine.ticket(&ticket.ticket_id).unwrap().status;
+        if status.is_final() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(status, TicketStatus::Approved);
+    assert_eq!(watch_start(&engine).await, "21:00");
 }
 
 #[tokio::test]

@@ -16,12 +16,13 @@ The sampler only runs when `resource-spikes` or `active-window` is enabled.
 
 | Tool | MCP name | Gate |
 | :--- | :--- | :--- |
-| `configure_watch_window` | `usage-monitor__configure_watch_window` | auto |
+| `configure_watch_window` | `usage-monitor__configure_watch_window` | pin_required |
 | `capture_diagnostic_snapshot` | `usage-monitor__capture_diagnostic_snapshot` | auto (read-only) |
 | `analyze_clues_with_llm` | `usage-monitor__analyze_clues_with_llm` | auto (read-only) |
 | `purge_telemetry_history` | `usage-monitor__purge_telemetry_history` | pin_required |
 
 - Watch window: 24-hour `HH:MM` start and end, local time. It wraps past midnight when the end is earlier than the start; equal start and end means all day (the default). Defaults: CPU 85 %, memory 2048 MB, all processes.
+- Changing the watch window needs your PIN: an AI agent over MCP gets an approval request instead of changing it, because the window decides what gets recorded.
 - Snapshot: system CPU and memory, top 10 processes by CPU and by memory, recorded spikes, correlated crash and hang events, and foreground changes. Disabled components show as `"component disabled"`.
 
 ## Privacy
