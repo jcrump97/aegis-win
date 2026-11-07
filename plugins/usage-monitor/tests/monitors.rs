@@ -92,6 +92,11 @@ async fn proposing_describes_the_rule_and_starts_nothing() {
     assert!(text.contains("Active Fri, 20:00-23:00 local time."), "{text}");
     assert!(out["reasoning"]["label"].as_str().unwrap().starts_with("Supplied by the requesting agent"));
     assert!(!out["reasoning"]["text"].as_str().unwrap().contains('\u{202E}'), "hidden characters are stripped from AI text");
+    assert_eq!(out["reasoning"]["warning"], Value::Null, "the reasoning only names what the rule watches");
+
+    // Reasoning that names something the rule does not watch is flagged.
+    let off = run(&engine, Origin::Mcp, "propose_monitor", json!({ "rule": crash_rule("x"), "reasoning": "launcher.exe crashes too." })).await.unwrap();
+    assert_eq!(off["reasoning"]["warning"], "The AI's explanation mentions things this monitor does not watch.");
     assert_eq!(list(&engine).await["monitors"], json!([]), "proposing saves nothing");
     // No sampler runs here, so there is no history: replay says so instead of guessing.
     assert_eq!((out["replay"]["samples"].as_u64(), out["replay"]["wouldHaveFired"].as_u64()), (Some(0), Some(0)), "{out}");

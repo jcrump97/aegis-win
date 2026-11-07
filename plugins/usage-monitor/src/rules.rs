@@ -174,7 +174,7 @@ pub fn clean_text(s: &str) -> String {
 }
 
 /// Input echoed back in an error message: bounded and with hidden characters removed.
-fn echo(s: &str, max: usize) -> String {
+pub(crate) fn echo(s: &str, max: usize) -> String {
     s.chars().filter(|c| !is_hidden(*c)).take(max).collect()
 }
 

@@ -113,7 +113,7 @@ Each proposal shows two visually separate panels:
 
 - The reasoning is never parsed for settings.
 - It is a summary the model writes, not a dump of its step-by-step reasoning.
-- **Consistency check**: if the reasoning names a process or event ID that is not in the rule, the review shows "The AI's explanation mentions things this monitor does not watch."
+- **Consistency check**: if the reasoning names a process or event ID that is not in the rule, the review shows "The AI's explanation mentions things this monitor does not watch." (Phase 2: a process is a word ending in `.exe`; an event ID is a number right after "event" or "ID". A `"*"` process covers every app, and a crash condition covers events 1000 and 1002. It also runs on reasoning an MCP agent passes to `propose_monitor`.)
 - **Before activating**, the owner can adjust fields in a form; each edit is validated again. A **replay** shows "this would have fired N times" against recorded history (unlocked only).
 
 ## 3. Clarifying-question loop (in-app only)
@@ -128,13 +128,15 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
   - `{ "unsupported": { "reason" } }`, for requests outside the vocabulary such as GPU temperature
 
   Invalid output gets one retry; a second failure ends the turn with "The AI gave an answer AegisWin could not use."
+
+  **Decided in Phase 2:** a fourth reply, `{ "requestRunningApps": { "reason" } }`, is how the AI asks for the one consented lookup below; it is allowed once per conversation. `reasoning` may be a string or 1-3 strings (bullets), cleaned of hidden characters and cut to 600 characters in total. Each reply is one JSON object with exactly one of these keys and no unknown fields; text around it or a code fence is tolerated.
 - **Limits:**
   - at most 3 question rounds, after which the AI must propose or say the request is unsupported
   - at most 3 questions per round, ≤200 characters each
   - up to 4 answer choices per question, plus free text
 - **User controls:** the owner can skip any question, or press **Propose now** at any time.
 - **Allowed topics:** the monitor only. Which app, the symptom, when it happens, how long it lasts, how severe it is.
-- **Code filter.** It is a backstop; the main protection is that the AI cannot act. Questions are dropped, with a visible note, if they contain:
+- **Code filter.** It is a backstop; the main protection is that the AI cannot act. Questions (and single answer choices) are dropped, with a visible note, if they contain the following. The word lists are narrow on purpose, so fair questions such as "does it freeze when you click play?" get through:
   - URLs
   - requests for passwords, PINs, keys, tokens, or other secrets
   - code or command text

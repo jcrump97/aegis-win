@@ -24,6 +24,7 @@ use replay::RecordedTick;
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+pub mod creator;
 pub mod monitors;
 pub mod replay;
 pub mod rules;
@@ -462,7 +463,11 @@ impl UsageMonitorPlugin {
             "rule": rule,
             "review": monitors::review(&rule),
             "replay": replay::replay(&rule, &recent, &events),
-            "reasoning": reasoning.map(|text| json!({ "text": text, "label": "Supplied by the requesting agent (AI-generated, may be wrong). AegisWin did not check it; the description is what the monitor does." })),
+            "reasoning": reasoning.map(|text| json!({
+                "text": text,
+                "label": "Supplied by the requesting agent (AI-generated, may be wrong). AegisWin did not check it; the description is what the monitor does.",
+                "warning": creator::mentions_unwatched(&text, &rule).then_some(creator::INCONSISTENT),
+            })),
             "next": "Nothing runs yet. To start it, call activate_monitor with this exact rule. That needs the owner's PIN.",
         }))
     }

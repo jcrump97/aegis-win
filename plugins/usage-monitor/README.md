@@ -55,4 +55,4 @@ A monitor is a rule that says when something worth recording happens, for exampl
 
 ## Tests
 
-`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), and the monitor tools' PIN gates through the real engine (`tests/monitors.rs`).
+`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), the AI creator's reply format, question filter, and consistency check (`src/creator.rs`), and the monitor tools' PIN gates through the real engine (`tests/monitors.rs`).
