@@ -25,6 +25,7 @@ The sampler only runs when `resource-spikes` or `active-window` is enabled, or a
 | `capture_diagnostic_snapshot` | `usage-monitor__capture_diagnostic_snapshot` | auto (read-only) |
 | `analyze_clues_with_llm` | `usage-monitor__analyze_clues_with_llm` | auto (read-only) |
 | `purge_telemetry_history` | `usage-monitor__purge_telemetry_history` | pin_required |
+| `monitor_chat_start`, `monitor_chat_reply`, `monitor_chat_cancel` | none: in the app only | auto (read-only) |
 
 - Watch window: 24-hour `HH:MM` start and end, local time. It wraps past midnight when the end is earlier than the start; equal start and end means all day (the default). Defaults: CPU 85 %, memory 2048 MB, all processes.
 - Changing the watch window needs your PIN: an AI agent over MCP gets an approval request instead of changing it, because the window decides what gets recorded.
@@ -37,6 +38,7 @@ A monitor is a rule that says when something worth recording happens, for exampl
 - **Anyone can propose, only you can start.** `propose_monitor` checks a rule and returns the description AegisWin writes from the rule itself, its privacy flags, a replay, and any problems. It saves nothing. `activate_monitor`, `pause_monitor`, and `delete_monitor` need your PIN, so an AI agent gets an approval request that shows the full rule it wants to run.
 - **Monitors only watch.** A hit is recorded in memory (shown in the snapshot and counted in `list_monitors`). A monitor never runs anything or changes Windows.
 - **Components still decide.** A rule that needs a turned-off component is refused, and a saved monitor stops while its component is off, then runs again when it is back.
+- **Describe it to the AI (in the app).** The chat tools send your description and answers to the configured LLM, which asks up to 3 rounds of questions and then proposes a rule, shown like any proposal. It can ask once to see running app names; nothing is sent unless you agree. Each step says whether it went to an on-LAN or Off-LAN LLM. AI agents over MCP cannot see or call these tools.
 - **Replay.** A proposal shows how often the rule would have fired on the samples kept in memory for the last 30 minutes of the watch window. Event and crash conditions are checked against the event logs as they are when you propose. Few samples means little was checked; it is not a prediction.
 - **Limits.** 20 monitors, 1-8 conditions each, all evaluated on the shared 5-second sample. Event and crash conditions read the logs they need every 15 seconds and count for 10 minutes after the event.
 
@@ -55,4 +57,4 @@ A monitor is a rule that says when something worth recording happens, for exampl
 
 ## Tests
 
-`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), the AI creator's reply format, question filter, and consistency check (`src/creator.rs`), and the monitor tools' PIN gates through the real engine (`tests/monitors.rs`).
+`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), the AI creator's reply format, question filter, and consistency check (`src/creator.rs`), the in-app chat against a loopback LLM mock, including retries, the round limit, app-name consent, and that agents cannot reach it (`src/chat.rs`, `tests/chat.rs`), and the monitor tools' PIN gates through the real engine (`tests/monitors.rs`).

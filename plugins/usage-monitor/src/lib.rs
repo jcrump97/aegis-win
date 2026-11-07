@@ -7,11 +7,12 @@
 //! encrypted vault. Only process names are recorded, never window titles.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aegis_core::llm::LlmHandle;
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
 use aegis_core::registry::{Plugin, PluginManifest, ToolContext, UnlockContext};
@@ -24,6 +25,7 @@ use replay::RecordedTick;
 use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+pub mod chat;
 pub mod creator;
 pub mod monitors;
 pub mod replay;
@@ -281,6 +283,33 @@ fn poll_events(needs: &[(rules::Channel, Vec<u32>)]) -> Vec<rules::ObservedEvent
     out
 }
 
+/// Running process names, for the one lookup the owner agrees to in the chat.
+fn running_app_names() -> Vec<String> {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    chat::clean_app_names(sys.processes().values().map(|p| p.name().to_string_lossy().into_owned()))
+}
+
+/// Where the next LLM request would go, without sending anything.
+fn destination(llm: &LlmHandle) -> Value {
+    match llm.preflight() {
+        Ok(e) => json!({ "offLan": !e.stays_on_lan(), "host": e.host }),
+        Err(e) => json!({ "problem": e.message }),
+    }
+}
+
+/// A chat reply that passed every check.
+enum Checked {
+    Proposal(rules::Rule, Vec<String>),
+    Other(creator::Reply),
+}
+
+const MCP_REASONING_LABEL: &str = "Supplied by the requesting agent (AI-generated, may be wrong). AegisWin did not check it; the description is what the monitor does.";
+
+fn chat_ended() -> AegisError {
+    AegisError::invalid("This conversation ended (AegisWin locked, or a new one started). Start a new one.")
+}
+
 fn foreground_name(sys: &System) -> Option<String> {
     let pid = os::foreground_process_id()?;
     sys.process(Pid::from_u32(pid)).map(|p| p.name().to_string_lossy().into_owned())
@@ -297,6 +326,9 @@ pub struct UsageMonitorPlugin {
     sampler: Mutex<Option<Sampler>>,
     /// Serializes read-modify-write of the saved monitors.
     book: Mutex<()>,
+    /// The in-app monitor chat (memory only, cleared on lock).
+    chat: Mutex<Option<chat::Session>>,
+    chat_generation: AtomicU64,
 }
 
 impl Default for UsageMonitorPlugin {
@@ -306,6 +338,8 @@ impl Default for UsageMonitorPlugin {
             telemetry: Arc::default(),
             sampler: Mutex::new(None),
             book: Mutex::new(()),
+            chat: Mutex::new(None),
+            chat_generation: AtomicU64::new(0),
         }
     }
 }
@@ -449,27 +483,147 @@ impl UsageMonitorPlugin {
             Ok(rule) => rule,
             Err(problems) => return Ok(json!({ "valid": false, "problems": problems, "activated": false })),
         };
+        let reasoning = args.get("reasoning").and_then(Value::as_str).map(rules::clean_text).filter(|r| !r.is_empty());
+        Ok(self.review_proposal(&rule, reasoning.map(|t| (t, MCP_REASONING_LABEL))).await)
+    }
+
+    /// How a rule that nothing has started is shown: the generated
+    /// description and privacy flags, the replay, and the labelled reasoning.
+    async fn review_proposal(&self, rule: &rules::Rule, reasoning: Option<(String, &'static str)>) -> Value {
         let recent: Vec<RecordedTick> = self.telemetry.lock().unwrap().recent.iter().cloned().collect();
-        let needs = group_needs(rules::event_needs(&rule));
+        let needs = group_needs(rules::event_needs(rule));
         let events = if recent.is_empty() || needs.is_empty() {
             Vec::new()
         } else {
             tokio::task::spawn_blocking(move || poll_events(&needs)).await.unwrap_or_default()
         };
-        let reasoning = args.get("reasoning").and_then(Value::as_str).map(rules::clean_text).filter(|r| !r.is_empty());
-        Ok(json!({
+        json!({
             "valid": true,
             "activated": false,
             "rule": rule,
-            "review": monitors::review(&rule),
-            "replay": replay::replay(&rule, &recent, &events),
-            "reasoning": reasoning.map(|text| json!({
+            "review": monitors::review(rule),
+            "replay": replay::replay(rule, &recent, &events),
+            "reasoning": reasoning.map(|(text, label)| json!({
+                "warning": creator::mentions_unwatched(&text, rule).then_some(creator::INCONSISTENT),
                 "text": text,
-                "label": "Supplied by the requesting agent (AI-generated, may be wrong). AegisWin did not check it; the description is what the monitor does.",
-                "warning": creator::mentions_unwatched(&text, &rule).then_some(creator::INCONSISTENT),
+                "label": label,
             })),
             "next": "Nothing runs yet. To start it, call activate_monitor with this exact rule. That needs the owner's PIN.",
-        }))
+        })
+    }
+
+    // ---- in-app monitor chat (ADR 0002 §3) --------------------------------
+
+    fn chat_start(&self, args: &Value) -> AegisResult<()> {
+        let generation = self.chat_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let session = chat::Session::new(generation, args["request"].as_str().unwrap_or_default()).map_err(AegisError::invalid)?;
+        *self.chat.lock().unwrap() = Some(session);
+        Ok(())
+    }
+
+    /// Takes the owner's answers or consent, then runs the AI's turn.
+    async fn chat_reply(&self, args: &Value) -> AegisResult<bool> {
+        let propose_now = args["proposeNow"].as_bool().unwrap_or(false);
+        let share = args.get("shareRunningApps").and_then(Value::as_bool);
+        let (generation, awaiting) = {
+            let guard = self.chat.lock().unwrap();
+            let s = guard.as_ref().ok_or_else(|| AegisError::invalid("There is no monitor conversation. Start one first."))?;
+            (s.generation, s.awaiting)
+        };
+        let apps = match awaiting {
+            chat::Awaiting::Done => return Err(AegisError::invalid("This conversation is finished. Start a new one.")),
+            chat::Awaiting::AppsConsent => match share.or(propose_now.then_some(false)) {
+                Some(true) => Some(tokio::task::spawn_blocking(running_app_names).await.unwrap_or_default()),
+                Some(false) => None,
+                None => return Err(AegisError::invalid("Say whether the AI may see running app names (shareRunningApps).")),
+            },
+            chat::Awaiting::Answers | chat::Awaiting::Turn => None,
+        };
+        let mut guard = self.chat.lock().unwrap();
+        let s = guard.as_mut().filter(|s| s.generation == generation).ok_or_else(chat_ended)?;
+        match awaiting {
+            chat::Awaiting::AppsConsent => s.running_apps = apps,
+            chat::Awaiting::Answers => {
+                let answers: Vec<String> = args["answers"].as_array().into_iter().flatten().map(|a| a.as_str().unwrap_or_default().to_owned()).collect();
+                s.record_answers(&answers).map_err(AegisError::invalid)?;
+            }
+            chat::Awaiting::Turn | chat::Awaiting::Done => {}
+        }
+        s.awaiting = chat::Awaiting::Turn;
+        Ok(propose_now)
+    }
+
+    /// One AI turn: at most two LLM requests (one retry), each checked
+    /// against the reply format, the conversation, and the rule language.
+    async fn chat_turn(&self, ctx: &ToolContext, propose_now: bool) -> AegisResult<Value> {
+        let llm = ctx.llm()?;
+        let session = self.chat.lock().unwrap().clone().ok_or_else(chat_ended)?;
+        let must = session.must_conclude(propose_now);
+        let mut problem: Option<String> = None;
+        let mut sent = Value::Null;
+        for _ in 0..2 {
+            let answer = llm.complete(chat::SYSTEM_PROMPT, session.payload(&ctx.enabled_components, must, problem.as_deref())).await?;
+            sent = json!({ "offLan": answer.off_lan, "host": answer.endpoint_host, "model": answer.model, "scrubbed": answer.scrubbed });
+            let checked = creator::parse_reply(&answer.text).and_then(|reply| session.accept(&reply, must).map(|()| reply)).and_then(|reply| match reply {
+                creator::Reply::Proposal { rule, reasoning } => rules::validate(&rule, &ctx.enabled_components)
+                    .map(|rule| Checked::Proposal(rule, reasoning))
+                    .map_err(|p| format!("the rule is not valid: {}", p.join("; "))),
+                other => Ok(Checked::Other(other)),
+            });
+            match checked {
+                Ok(checked) => {
+                    let mut view = self.chat_apply(session.generation, checked).await?;
+                    view["sentTo"] = sent;
+                    view["nextSendGoesTo"] = destination(llm);
+                    return Ok(view);
+                }
+                Err(p) => problem = Some(p),
+            }
+        }
+        // The owner can reply again (or press "Propose now") to retry.
+        Ok(json!({ "status": "failed", "message": chat::UNUSABLE, "problem": problem, "sentTo": sent, "nextSendGoesTo": destination(llm) }))
+    }
+
+    async fn chat_apply(&self, generation: u64, checked: Checked) -> AegisResult<Value> {
+        let proposal = match &checked {
+            Checked::Proposal(rule, bullets) => Some(self.review_proposal(rule, Some((bullets.join("\n"), chat::REASONING_LABEL))).await),
+            Checked::Other(_) => None,
+        };
+        let mut guard = self.chat.lock().unwrap();
+        let s = guard.as_mut().filter(|s| s.generation == generation).ok_or_else(chat_ended)?;
+        // Two replies sent at once both run a turn; only the first result counts.
+        if s.awaiting != chat::Awaiting::Turn {
+            return Err(AegisError::invalid("The conversation already moved on. Show its latest step."));
+        }
+        Ok(match checked {
+            Checked::Proposal(..) => {
+                s.awaiting = chat::Awaiting::Done;
+                json!({ "status": "proposal", "proposal": proposal })
+            }
+            Checked::Other(creator::Reply::Questions(questions)) => {
+                let (kept, dropped) = creator::filter_questions(questions);
+                s.rounds.push(chat::Round { questions: kept.clone(), answers: Vec::new() });
+                s.awaiting = chat::Awaiting::Answers;
+                json!({
+                    "status": "questions",
+                    "questions": kept.iter().map(|q| json!({ "text": q.text, "choices": q.choices })).collect::<Vec<_>>(),
+                    "dropped": dropped.iter().map(|d| format!("A question from the AI was not shown because {}.", d.reason)).collect::<Vec<_>>(),
+                    "round": s.rounds.len(),
+                    "maxRounds": creator::MAX_ROUNDS,
+                    "note": "You can skip any question, or ask for a proposal now.",
+                })
+            }
+            Checked::Other(creator::Reply::RequestRunningApps { reason }) => {
+                s.apps_requested = true;
+                s.awaiting = chat::Awaiting::AppsConsent;
+                json!({ "status": "requestRunningApps", "consent": "Let the AI see running app names?", "reason": reason, "note": "Only process names are sent, once. Nothing is sent unless you agree." })
+            }
+            Checked::Other(creator::Reply::Unsupported { reason }) => {
+                s.awaiting = chat::Awaiting::Done;
+                json!({ "status": "unsupported", "reason": reason })
+            }
+            Checked::Other(creator::Reply::Proposal { .. }) => unreachable!("proposals are checked into Checked::Proposal"),
+        })
     }
 
     fn activate(&self, args: &Value, ctx: &ToolContext) -> AegisResult<Value> {
@@ -597,6 +751,21 @@ impl Plugin for UsageMonitorPlugin {
         match tool {
             "configure_watch_window" => self.configure(&args),
             "propose_monitor" => self.propose(&args, &ctx).await,
+            "monitor_chat_start" => {
+                ctx.llm()?;
+                self.chat_start(&args)?;
+                self.chat_turn(&ctx, false).await
+            }
+            "monitor_chat_reply" => {
+                ctx.llm()?;
+                let propose_now = self.chat_reply(&args).await?;
+                self.chat_turn(&ctx, propose_now).await
+            }
+            "monitor_chat_cancel" => {
+                self.chat_generation.fetch_add(1, Ordering::SeqCst);
+                let had = self.chat.lock().unwrap().take().is_some();
+                Ok(json!({ "cancelled": had }))
+            }
             "activate_monitor" => self.activate(&args, &ctx),
             "list_monitors" => self.list(&ctx),
             "pause_monitor" => {
@@ -638,6 +807,8 @@ impl Plugin for UsageMonitorPlugin {
         // Waits for a monitor change in progress, so it cannot restart the
         // sampler after this. Later changes fail: the vault is already locked.
         let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        self.chat_generation.fetch_add(1, Ordering::SeqCst);
+        *self.chat.lock().unwrap() = None;
         self.stop_sampler();
         let mut t = self.telemetry.lock().unwrap();
         t.clear();

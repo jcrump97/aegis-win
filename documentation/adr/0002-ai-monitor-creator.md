@@ -146,6 +146,13 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
 - **Where data goes.** Each round shows whether answers go to an on-LAN or Off-LAN LLM. The existing trust gate and scrubbing ([SECURITY_MODEL §6](../SECURITY_MODEL.md)) apply.
 - **Storage.** The conversation lives in Rust memory only, within the LLM service's prompt-size cap, and is cleared on lock.
 
+**Decided in Phase 2 (backend):**
+- **Tools.** `monitor_chat_start { request }` (at most 1000 characters; a longer one is refused, not cut), `monitor_chat_reply { answers?, shareRunningApps?, proposeNow? }`, and `monitor_chat_cancel`. All three are `appOnly`, `auto`, and read-only: they save and start nothing, and a proposal comes back exactly as `propose_monitor` returns it (generated description, privacy flags, replay), with the AI's bullets under their own label.
+- **One conversation at a time.** Starting one replaces the last. Each conversation has a generation number that changes on start, cancel, and lock, so an AI answer that arrives late never lands in a newer conversation. When two replies are sent at once, only the first AI turn that finishes is applied.
+- **A failed turn can be retried.** After two unusable answers, the owner's answers stay recorded and replying again (or pressing **Propose now**) runs the turn again. A rule that does not validate against the enabled components counts as an unusable answer, and the retry tells the AI what was wrong.
+- **Consent.** After `requestRunningApps`, the next reply must say yes or no (`shareRunningApps`); **Propose now** counts as no. Yes sends up to 200 running process names, cleaned and checked like rule process names, once. No tells the AI the owner declined. Either way the AI may not ask again.
+- **Where data goes.** Every turn reports where it was sent (`sentTo`: host, model, Off-LAN, scrubbed) and where the next one would go (`nextSendGoesTo`), from the LLM service's preflight, without sending anything.
+
 ## 4. App lifecycle: tray and locked-but-monitoring
 
 | State | Vault key | MCP server, tickets, LLM | Sampler + history writer | Can view data |

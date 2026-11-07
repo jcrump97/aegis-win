@@ -371,7 +371,7 @@ pub fn validate(value: &Value, enabled_components: &[String]) -> Result<Rule, Ve
 }
 
 /// An executable name like `game.exe`, or `"*"` for any process when allowed.
-fn check_process(name: &str, allow_any: bool) -> Result<(), String> {
+pub(crate) fn check_process(name: &str, allow_any: bool) -> Result<(), String> {
     if name == "*" {
         return if allow_any { Ok(()) } else { Err("this condition needs a named process, not \"*\"".into()) };
     }

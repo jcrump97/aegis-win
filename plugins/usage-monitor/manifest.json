@@ -119,6 +119,51 @@
       }
     },
     {
+      "id": "monitor_chat_start",
+      "name": "Describe a Monitor to the AI",
+      "description": "In the app only: starts a conversation in which the AI asks up to 3 rounds of questions and then proposes a monitor rule. Your text and answers go to the configured LLM. Starts nothing.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "readOnly": true,
+      "appOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["request"],
+        "properties": {
+          "request": { "type": "string", "maxLength": 1000, "description": "What you want to watch, in your own words." }
+        }
+      }
+    },
+    {
+      "id": "monitor_chat_reply",
+      "name": "Answer the AI",
+      "description": "In the app only: answers the AI's questions (an empty answer skips one), says whether it may see running app names, or asks it to propose now.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "readOnly": true,
+      "appOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "answers": { "type": "array", "maxItems": 3, "items": { "type": "string", "maxLength": 300 } },
+          "shareRunningApps": { "type": "boolean" },
+          "proposeNow": { "type": "boolean", "default": false }
+        }
+      }
+    },
+    {
+      "id": "monitor_chat_cancel",
+      "name": "End the Monitor Conversation",
+      "description": "In the app only: forgets the current monitor conversation.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "readOnly": true,
+      "appOnly": true,
+      "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+    },
+    {
       "id": "capture_diagnostic_snapshot",
       "name": "Capture Correlated Diagnostic Clues",
       "description": "Returns current system load, top processes by CPU and memory, recorded spikes, crash and hang events from the last 24 hours with related spikes, foreground app changes, and monitor hits.",
