@@ -43,6 +43,10 @@ pub struct ToolManifest {
     /// Component that must be enabled for this tool to run, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
+    /// Only the AegisWin app may call this tool. It is left out of MCP
+    /// `tools/list`, and an MCP call gets the same error as an unknown tool.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub app_only: bool,
     pub input_schema: Value,
 }
 

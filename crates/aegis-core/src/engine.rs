@@ -718,7 +718,8 @@ impl Engine {
 
     // ---- tools -----------------------------------------------------------
 
-    /// Tools an MCP client may call: installed plugins, enabled components.
+    /// Tools an MCP client may call: installed plugins, enabled components,
+    /// never `appOnly` tools.
     pub fn exposed_tools(&self) -> AegisResult<Vec<ExposedTool>> {
         self.with_state(|s| {
             let mut out = Vec::new();
@@ -728,7 +729,7 @@ impl Engine {
                     continue;
                 }
                 let components = s.components_for(&m.id);
-                for tool in &m.tools {
+                for tool in m.tools.iter().filter(|t| !t.app_only) {
                     if tool.component.as_ref().is_none_or(|c| components.contains(c)) {
                         out.push(ExposedTool {
                             plugin_id: m.id.clone(),
@@ -775,6 +776,10 @@ impl Engine {
     }
 
     pub async fn run_tool(&self, origin: Origin, plugin_id: &str, tool_id: &str, args: Value) -> AegisResult<RunOutcome> {
+        // Checked before anything else, so an agent learns nothing about an app-only tool.
+        if matches!(origin, Origin::Mcp) && self.registry.tool(plugin_id, tool_id).is_some_and(|(_, t)| t.app_only) {
+            return Err(AegisError::new(ErrorCode::UnknownTool, format!("unknown tool {plugin_id}:{tool_id}")));
+        }
         let prepared = self.prepare(plugin_id, tool_id, args)?;
         match prepared.gate {
             Gate::NeedsAdmin => Err(AegisError::requires_admin(&prepared.tool.name)),

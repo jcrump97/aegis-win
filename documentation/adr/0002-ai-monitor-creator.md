@@ -120,6 +120,8 @@ Each proposal shows two visually separate panels:
 
 The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`) and the central LLM service under `usage-monitor`'s `LlmHandle`. External MCP agents do not use it; they hold their own conversation with the user and call `propose_monitor`.
 
+**Decision (Phase 2): the chat steps are `appOnly` plugin tools, not plugin-specific Tauri commands.** A tool marked `appOnly` ([PLUGIN_SPEC §2](../PLUGIN_SPEC.md)) is left out of MCP `tools/list`, and an MCP call to it gets the same error as a tool that does not exist. The app reaches it through the existing `run_tool` command, so the engine still binds the `LlmHandle` to `usage-monitor`'s id and Off-LAN trust, checks installation and components, and applies the gate, with no plugin code in the Tauri shell.
+
 - **Reply format.** Each AI turn must be exactly one of these, validated against a schema:
   - `{ "questions": [ { "text", "choices"? } ] }`
   - `{ "proposal": { "rule", "reasoning" } }`
