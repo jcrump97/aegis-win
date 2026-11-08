@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phase 3 on `feat/plans-mcp`; see "As built" in §10. Phases 4-5 are not.
+- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phases 3-4 on `feat/plans-mcp`; see "As built" in §10. Phase 5 is not (it waits for ADR 0002 Phase 4).
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 
@@ -218,6 +218,14 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 - **The app's Approvals tab** shows a plan the way the browser page does: AegisWin's summary, fingerprint, each step (arguments, commands, admin flag, and, once approved, its status and result), then the supplied text in a labelled block, flags, and the stop reason. Approving sends the plan hash it displayed. "Stop after this step" and "Cancel before it starts" need no PIN.
 - **A plan's name is written by code**: "Action plan (N steps)". The supplied title appears only under its label. The ticket name also shows in the top bar, the tray tooltip, and the new-request notification, where the title would otherwise appear unlabelled.
 - **Found while building this: two approvals of the same request could both run it.** The decision re-read the ticket only before the PIN check, so two correct-PIN approvals arriving together (the app and the browser page at once) could both start it. The decision now re-checks that the ticket is still pending at the moment it changes it, so exactly one wins. The race predates this ADR.
+
+**As built, Phase 4** (decided 2026-11-07, during implementation):
+
+- **The app builds plans through the same engine call as agents** (`propose_plan`, with the owner as origin): the same limits, eligibility and admin checks, dry runs, hash, and expiry. Creating the plan runs nothing; it opens on the Approvals tab, where approving needs the PIN and sends the hash, exactly as for an agent's plan. The owner's own plans are not exempt from review, because the review is where the exact commands are shown.
+- **"Add to plan"** appears on each eligible tool's card and uses that card's form for the arguments. The draft lives in memory only and is dropped when the vault locks; it is never saved.
+- **The draft panel** sits at the top of the plugin's tab: the steps in order with Remove, an optional title and "Notes for yourself", then "Review and run" and "Clear plan". A plan may mix plugins (§11.1), so the draft survives switching tabs.
+- **Labels follow the origin.** The supplied text is labelled "Written by you"; the card says "Your plan"; the browser page's heading says "Approve your action plan?". The fingerprint line ("if the agent told you one, it should match") is hidden for the owner's plans, and a new owner plan raises no "an agent is asking" notification.
+- **The owner's plans share the limit of five pending plans** with agents. An agent filling it delays the owner's plan until the owner declines one; giving the owner a separate allowance was not worth a second counter.
 
 ## 11. Open questions
 

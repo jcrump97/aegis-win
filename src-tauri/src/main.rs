@@ -12,6 +12,7 @@ use aegis_core::engine::{Engine, EngineOptions, LlmTest, Origin, PluginView, Run
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
 use aegis_core::registry::{GatePolicy, Plugin, Registry};
+use aegis_core::plan::PlanOrigin;
 use aegis_core::tickets::TicketView;
 use aegis_core::{AegisError, ErrorCode};
 use serde_json::Value;
@@ -223,6 +224,13 @@ async fn decide_ticket(
     engine.decide(&ticket_id, approve, pin, comment, "app", plan_hash.as_deref()).await
 }
 
+/// Opens a plan the owner built in the app. Nothing runs until it is approved
+/// with the PIN on the Approvals tab, like any other plan.
+#[tauri::command]
+async fn propose_plan(engine: EngineState<'_>, request: Value) -> Cmd<TicketView> {
+    engine.propose_plan(PlanOrigin::Owner, request).await
+}
+
 /// Withdraws a request or stops a plan before its next step; needs no PIN.
 #[tauri::command]
 async fn cancel_ticket(engine: EngineState<'_>, ticket_id: String) -> Cmd<TicketView> {
@@ -340,6 +348,7 @@ fn main() {
             list_tickets,
             decide_ticket,
             cancel_ticket,
+            propose_plan,
             start_mcp,
             stop_mcp,
             reveal_mcp_token,

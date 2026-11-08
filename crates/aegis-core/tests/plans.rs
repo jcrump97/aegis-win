@@ -270,3 +270,24 @@ async fn concurrent_approvals_run_a_request_once() {
     assert_eq!(runs.len(), 20, "each request ran exactly once");
     assert_eq!(fixed(&f).len(), 20);
 }
+
+#[tokio::test]
+async fn the_owner_builds_plans_through_the_same_checks() {
+    let f = ready().await;
+    let plugins = f.engine.plugins().unwrap();
+    let tools = &plugins[0].tools;
+    let eligible: Vec<(&str, bool)> = tools.iter().map(|t| (t.id.as_str(), t.plan_eligible)).collect();
+    assert!(eligible.contains(&("fix", true)) && eligible.contains(&("echo", false)), "the app knows which tools can be steps");
+
+    let t = f.engine.propose_plan(PlanOrigin::Owner, json!({ "title": "Mine", "steps": [fix("own")] })).await.unwrap();
+    let plan = t.plan.as_ref().unwrap();
+    assert_eq!((plan.origin, plan.supplied_label), (PlanOrigin::Owner, "Written by you"));
+    assert!(fixed(&f).is_empty(), "creating it runs nothing");
+    let e = f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__echo" }] })).await.unwrap_err();
+    assert!(e.message.contains("cannot be a plan step"));
+    // It still needs the PIN and its hash.
+    assert_eq!(f.engine.decide(&t.ticket_id, true, PIN.into(), None, "app", None).await.unwrap_err().code, ErrorCode::Conflict);
+    let t = done(&f, &approve(&f, &t).await.ticket_id).await;
+    assert_eq!(t.status, TicketStatus::Approved);
+    assert_eq!(fixed(&f), ["own"]);
+}

@@ -137,6 +137,21 @@ test('Action plans: the app shows the plan as AegisWin describes it and approves
   assert.match(main, /if \(t\.plan\) return planCard\(t, t\.plan\);/);
 });
 
+test('In-app plans: the owner builds a draft in memory and approves it like any plan', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // The app's plans go through the same engine entry point, marked as the owner's.
+  assert.match(mainRs, /async fn propose_plan\(engine: EngineState<'_>, request: Value\) -> Cmd<TicketView> \{\s*engine\.propose_plan\(PlanOrigin::Owner, request\)\.await\s*\}/);
+  assert.match(apiTs, /proposePlan: \(request: PlanRequest\) => call<TicketView>\('propose_plan', \{ request \}\)/);
+  // Creating the plan runs nothing: it opens the review on the Approvals tab, where the PIN is asked.
+  const panel = main.slice(main.indexOf('function planDraftPanel('), main.indexOf('/** Runs a tool from the app'));
+  assert.match(panel, /api\.proposePlan\(/);
+  assert.match(panel, /selectTab\('approvals'\)/);
+  assert.doesNotMatch(panel, /askPin|decideTicket|runTool/, 'the draft never runs or approves anything itself');
+  // Only eligible tools offer "Add to plan"; the draft is dropped when the vault locks.
+  assert.match(main, /if \(tool\.planEligible\) \{\s*const addButton = h\('button', \{\}, 'Add to plan'\);/);
+  assert.match(main, /if \(!status\.unlocked\) planDraft = \[\];/);
+});
+
 test('Serial executor: the app shows the change in progress, and the shell never cuts one off', () => {
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   assert.match(main, /const \{ running, queued \} = status\.change;/);

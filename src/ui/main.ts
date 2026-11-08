@@ -17,6 +17,9 @@ let activeTab = '';
 let pollTimer: number | undefined;
 let mainEl: HTMLElement | null = null;
 let shellParts: { approvalsCount: HTMLElement; mcpPill: HTMLElement; changePill: HTMLElement } | null = null;
+/** Steps the owner is collecting for an action plan. Memory only; dropped on lock. */
+let planDraft: Array<{ tool: string; name: string; args: Record<string, unknown> }> = [];
+const MAX_PLAN_STEPS = 5;
 
 const PIN_MIN = 6;
 
@@ -89,6 +92,7 @@ function route(): void {
   shellParts = null;
   mainEl = null;
   forgetMonitorPanel();
+  if (!status.unlocked) planDraft = [];
   if (!status.vaultExists) setupScreen();
   else if (!status.unlocked) unlockScreen();
   else if (!status.firstRunCompleted) void wizardScreen();
@@ -332,7 +336,8 @@ function ticketSignature(list: TicketView[]): string {
   return list.map((t) => `${t.ticketId}:${t.status}:${t.queuePosition ?? ''}:${(t.steps ?? []).map((s) => s.status).join(',')}`).join('|');
 }
 
-function askedFor(t: TicketView): string {
+function askedFor(t: TicketView): string | null {
+  if (t.plan?.origin === 'owner') return null;
   return t.plan ? `An AI agent proposes an action plan with ${t.steps?.length ?? 0} step(s). Open Approvals to review it.` : `An AI agent is asking to run "${t.toolName}". Open Approvals to decide.`;
 }
 
@@ -346,7 +351,10 @@ function startPolling(): void {
       if (!now.unlocked) return route();
       const next = await api.listTickets();
       const before = new Set(tickets.filter((t) => t.status === 'pending_approval').map((t) => t.ticketId));
-      for (const t of next) if (t.status === 'pending_approval' && !before.has(t.ticketId)) toast(askedFor(t));
+      for (const t of next) {
+        const text = t.status === 'pending_approval' && !before.has(t.ticketId) ? askedFor(t) : null;
+        if (text) toast(text);
+      }
       const changed = ticketSignature(next) !== ticketSignature(tickets);
       tickets = next;
       updateShellBadges();
@@ -411,6 +419,7 @@ function pluginTab(pluginId: string): HTMLElement {
     'div',
     { class: 'stack' },
     h('div', {}, h('h2', {}, plugin.name), h('p', { class: 'hint' }, plugin.description)),
+    planDraftPanel(),
     monitors ? monitorPanel(monitorDeps(pluginId)) : null,
     monitors ? h('h3', {}, 'Other tools') : null,
     ...plugin.tools.filter((t) => !t.appOnly && !(monitors && MONITOR_TOOLS.has(t.id))).map((tool) => toolCard(plugin, tool)),
@@ -459,13 +468,76 @@ function toolCard(plugin: PluginView, tool: ToolView): HTMLElement {
   run.addEventListener('click', () => start(false, run));
   dry?.addEventListener('click', () => start(true, dry));
   if (!tool.available) run.disabled = true;
+  let add: HTMLButtonElement | null = null;
+  if (tool.planEligible) {
+    const addButton = h('button', {}, 'Add to plan');
+    addButton.disabled = !tool.available || planDraft.length >= MAX_PLAN_STEPS;
+    addButton.addEventListener('click', () => {
+      const read = form.read();
+      if ('error' in read) return replace(result, errorNotice({ code: 'INVALID_ARGUMENTS', message: read.error }));
+      planDraft.push({ tool: tool.mcpName, name: tool.name, args: read.args });
+      toast(`${tool.name} added to your plan (step ${planDraft.length} of ${MAX_PLAN_STEPS}).`);
+      renderTab();
+    });
+    add = addButton;
+  }
   return h(
     'section',
     { class: 'card' },
     h('div', { class: 'tool-head' }, h('div', {}, h('h3', {}, tool.name), h('p', { class: 'hint' }, tool.description)), toolBadges(tool)),
     Object.keys(tool.inputSchema.properties ?? {}).some((k) => k !== 'dryRun') ? form.element : null,
-    h('div', { class: 'row', style: 'margin-top:0.8rem' }, run, dry),
+    h('div', { class: 'row', style: 'margin-top:0.8rem' }, run, dry, add),
     result,
+  );
+}
+
+/** The plan the owner is building. "Review and run" opens it as a plan ticket,
+ * checked and dry-run by the engine, to approve with the PIN on the Approvals tab. */
+function planDraftPanel(): HTMLElement | null {
+  if (planDraft.length === 0) return null;
+  const title = h('input', { type: 'text', maxlength: 80, id: 'plan-title' });
+  const reasoning = h('textarea', { rows: 2, maxlength: 600, id: 'plan-reasoning' });
+  const message = h('div');
+  const review = h('button', { class: 'primary' }, 'Review and run');
+  const discard = h('button', {}, 'Clear plan');
+  review.addEventListener('click', async () => {
+    try {
+      const ticket = await busy(review, () =>
+        api.proposePlan({ title: title.value.trim() || undefined, reasoning: reasoning.value.trim() || undefined, steps: planDraft.map((s) => ({ tool: s.tool, args: s.args })) }),
+      );
+      planDraft = [];
+      tickets = await api.listTickets();
+      if (!tickets.some((t) => t.ticketId === ticket.ticketId)) tickets = [ticket, ...tickets];
+      updateShellBadges();
+      selectTab('approvals');
+    } catch (e) {
+      const err = asError(e);
+      if (err.code === 'VAULT_LOCKED') return handleError(e);
+      replace(message, errorNotice(err));
+    }
+  });
+  discard.addEventListener('click', () => {
+    planDraft = [];
+    renderTab();
+  });
+  const steps = h('ol', {});
+  planDraft.forEach((s, i) => {
+    const remove = h('button', { class: 'link' }, 'Remove');
+    remove.addEventListener('click', () => {
+      planDraft.splice(i, 1);
+      renderTab();
+    });
+    append(steps, h('li', {}, h('strong', {}, s.name), ' ', h('code', {}, JSON.stringify(s.args)), ' ', remove));
+  });
+  return h(
+    'section',
+    { class: 'card stack' },
+    h('h3', {}, `Your plan: ${planDraft.length} of ${MAX_PLAN_STEPS} steps`),
+    h('p', { class: 'hint' }, 'Steps run one at a time, in this order, and the plan stops at the first failure. Review and run checks every step and shows the exact commands; nothing runs until you approve it with your PIN.'),
+    steps,
+    h('div', { class: 'grid2' }, h('div', {}, h('label', { for: 'plan-title' }, 'Title (optional)'), title), h('div', {}, h('label', { for: 'plan-reasoning' }, 'Notes for yourself (optional)'), reasoning)),
+    message,
+    h('div', { class: 'row' }, review, discard),
   );
 }
 
@@ -643,15 +715,12 @@ function planCard(t: TicketView, plan: NonNullable<TicketView['plan']>): HTMLEle
   const head = h(
     'div',
     { class: 'tool-head' },
-    h('div', {}, h('h3', {}, t.toolName), h('p', { class: 'hint' }, `Action plan · requested ${new Date(t.createdAt).toLocaleString()}${pending ? ` · expires ${new Date(plan.expiresAt).toLocaleTimeString()}` : ''}`)),
+    h('div', {}, h('h3', {}, t.toolName), h('p', { class: 'hint' }, `${plan.origin === 'owner' ? 'Your plan' : 'From an AI agent'} · requested ${new Date(t.createdAt).toLocaleString()}${pending ? ` · expires ${new Date(plan.expiresAt).toLocaleTimeString()}` : ''}`)),
     h('div', { class: 'badges' }, t.requiresAdmin ? h('span', { class: 'badge danger' }, 'administrator') : null, h('span', { class: `badge ${tone}` }, t.status === 'queued' && t.queuePosition ? `${base} (#${t.queuePosition})` : base)),
   );
-  const body: Node[] = [
-    head,
-    h('p', {}, h('strong', {}, plan.summary)),
-    h('p', { class: 'hint' }, 'Plan fingerprint: ', h('code', {}, plan.shortHash), '. If the agent told you one, it should match.'),
-    h('p', { class: 'hint' }, 'The steps run one at a time, in this order. The plan stops at the first failure, and changes made by earlier steps stay: Windows repairs cannot be undone.'),
-  ];
+  const body: Node[] = [head, h('p', {}, h('strong', {}, plan.summary))];
+  if (plan.origin !== 'owner') body.push(h('p', { class: 'hint' }, 'Plan fingerprint: ', h('code', {}, plan.shortHash), '. If the agent told you one, it should match.'));
+  body.push(h('p', { class: 'hint' }, 'The steps run one at a time, in this order. The plan stops at the first failure, and changes made by earlier steps stay: Windows repairs cannot be undone.'));
   const list = h('ol', { class: 'stack' });
   for (const s of steps) {
     const [stepText, stepTone] = STEP_TEXT[s.status] ?? [s.status, ''];

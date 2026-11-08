@@ -596,7 +596,12 @@ fn cancel_form(csrf: Option<&str>, label: &str) -> String {
 /// then the supplied text under its label, then the decision.
 fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message: Option<(&str, bool)>) -> String {
     let pending = ticket.status == TicketStatus::PendingApproval;
-    let mut body = String::from(if pending { "<h1>Approve an action plan from an AI agent?</h1>" } else { "<h1>Action plan from an AI agent</h1>" });
+    let mut body = String::from(match (plan.origin, pending) {
+        (PlanOrigin::Agent, true) => "<h1>Approve an action plan from an AI agent?</h1>",
+        (PlanOrigin::Agent, false) => "<h1>Action plan from an AI agent</h1>",
+        (PlanOrigin::Owner, true) => "<h1>Approve your action plan?</h1>",
+        (PlanOrigin::Owner, false) => "<h1>Your action plan</h1>",
+    });
     if let Some((text, ok)) = message {
         body.push_str(&format!("<div class=\"msg{}\">{}</div>", if ok { " ok" } else { "" }, escape_html(text)));
     }

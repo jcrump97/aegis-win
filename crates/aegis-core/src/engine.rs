@@ -159,6 +159,8 @@ pub struct ToolView {
     pub mcp_name: String,
     /// Reached only from the app; agents never see it (PLUGIN_SPEC §2).
     pub app_only: bool,
+    /// Can be a step of an action plan (ADR 0003 §4).
+    pub plan_eligible: bool,
     pub input_schema: Value,
 }
 
@@ -644,6 +646,7 @@ impl Engine {
                                 effective_policy: registry::effective_policy(&m.id, t, &s.tool_gate_overrides),
                                 mcp_name: registry::mcp_tool_name(&m.id, &t.id),
                                 app_only: t.app_only,
+                                plan_eligible: t.plan_eligible,
                                 input_schema: t.input_schema.clone(),
                             })
                             .collect(),

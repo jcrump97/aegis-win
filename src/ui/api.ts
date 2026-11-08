@@ -59,6 +59,8 @@ export interface ToolView {
   mcpName: string;
   /** Reached only from the app, never listed for agents. */
   appOnly: boolean;
+  /** Can be a step of an action plan. */
+  planEligible: boolean;
   inputSchema: JsonSchema;
 }
 
@@ -105,6 +107,13 @@ export interface PlanStep {
   status: StepStatus;
   result?: unknown;
   error?: AegisError;
+}
+
+/** A plan the owner builds in the app; the engine checks it like an agent's. */
+export interface PlanRequest {
+  title?: string;
+  reasoning?: string;
+  steps: Array<{ tool: string; args: Record<string, unknown> }>;
 }
 
 export interface PlanMeta {
@@ -233,6 +242,7 @@ export const api = {
   decideTicket: (ticketId: string, approve: boolean, pin: string, comment: string | null, planHash: string | null) =>
     call<TicketView>('decide_ticket', { ticketId, approve, pin, comment, planHash }),
   cancelTicket: (ticketId: string) => call<TicketView>('cancel_ticket', { ticketId }),
+  proposePlan: (request: PlanRequest) => call<TicketView>('propose_plan', { request }),
   startMcp: () => call<McpStatus>('start_mcp'),
   stopMcp: () => call<McpStatus>('stop_mcp'),
   revealMcpToken: (pin: string) => call<string>('reveal_mcp_token', { pin }),
