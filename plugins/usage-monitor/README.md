@@ -72,7 +72,7 @@ There are no crash records: crashes and hangs come from the Application log in t
 - In memory, telemetry is kept in ring buffers of 500 entries, only while unlocked, and cleared when the vault locks or with `purge_telemetry_history`.
 - On disk, it is only in the encrypted history above. Only the PIN can read it; AegisWin itself cannot read it while locked. Process names only, never window titles.
 - `purge_telemetry_history` (PIN) clears memory, deletes every history file, and gives the history a new key, so a deleted file recovered from the disk cannot be read. Saved monitors are kept.
-- The watch window settings reset when the vault locks.
+- The watch window settings are kept in memory only, never saved: they last until AegisWin closes (lock keeps them) and are back to the defaults at the next start. The samples they let in are cleared on lock (below).
 - Saved monitors are kept inside the encrypted vault (`documentation/PLUGIN_SPEC.md` §5), so they survive a restart.
 - For replay, the last 30 minutes of samples inside the watch window are kept in memory: process names with CPU and memory (only those at 1 % CPU or 64 MB and up, the lowest a rule can use) and system load while `resource-spikes` is on, and the foreground process name while `active-window` is on. They are cleared on lock and by `purge_telemetry_history` and are never sent to the LLM.
 
