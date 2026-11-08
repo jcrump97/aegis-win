@@ -225,3 +225,10 @@ async fn only_running_monitors_keep_aegiswin_in_the_tray() {
     engine.lock().await;
     assert!(!engine.background_active(), "locking stops monitors");
 }
+
+#[test]
+fn monitor_tools_are_never_plan_steps() {
+    // They have their own review screen (ADR 0003 §4), and purge is never batched.
+    let plugin = UsageMonitorPlugin::default();
+    assert!(plugin.manifest().tools.iter().all(|t| !t.plan_eligible));
+}

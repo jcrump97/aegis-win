@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`; see "As built" in §10. Phases 2-5 are not.
+- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor` and Phase 2 (`planEligible`) on `feat/plan-eligible`; see "As built" in §10. Phases 3-5 are not.
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 
@@ -200,6 +200,8 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 - **Cancel buttons** for queued items come with `aegis__cancel_ticket` in Phase 3. Until then, Lock cancels everything waiting.
 - **Quit while running** asks in a Windows Yes/No box (No is the default). Closing the window while a change runs or waits hides to the tray instead.
 - **The top bar** shows "Change in progress: <tool> · N waiting"; the tray tooltip names the running tool.
+
+**As built, Phase 2**: `planEligible` also refuses `appOnly` tools, since a plan step must be reachable from both MCP and the app. Nothing reads the flag yet; Phase 3 does.
 
 ## 11. Open questions
 

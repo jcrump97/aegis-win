@@ -26,6 +26,13 @@ fn every_repair_is_pin_gated_and_supports_dry_run() {
     }
 }
 
+#[test]
+fn the_four_repairs_can_be_plan_steps() {
+    let plugin = WindowsHealthPlugin::default();
+    let eligible: Vec<&str> = plugin.manifest().tools.iter().filter(|t| t.plan_eligible).map(|t| t.id.as_str()).collect();
+    assert_eq!(eligible, ["sfc_scan", "flush_dns", "ip_release_renew", "winsock_reset"]);
+}
+
 #[tokio::test]
 async fn dry_runs_describe_commands_without_running_them() {
     for (tool, expected) in [

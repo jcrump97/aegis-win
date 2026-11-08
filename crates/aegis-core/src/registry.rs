@@ -47,6 +47,10 @@ pub struct ToolManifest {
     /// `tools/list`, and an MCP call gets the same error as an unknown tool.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub app_only: bool,
+    /// May be a step of an action plan (ADR 0003 §4). Only pin-gated,
+    /// state-changing tools with a boolean `dryRun` qualify.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_eligible: bool,
     pub input_schema: Value,
 }
 
@@ -105,6 +109,14 @@ impl PluginManifest {
                 if dry.get("type").and_then(Value::as_str) != Some("boolean") {
                     return Err(format!("{at}: dryRun must be a boolean"));
                 }
+            }
+            if tool.plan_eligible
+                && (tool.default_gate_policy != GatePolicy::PinRequired
+                    || tool.read_only
+                    || tool.app_only
+                    || tool.input_schema.pointer("/properties/dryRun").is_none())
+            {
+                return Err(format!("{at}: planEligible needs defaultGatePolicy pin_required, readOnly false, a boolean dryRun, and no appOnly"));
             }
             if let Some(component) = &tool.component {
                 if !self.sub_components.iter().any(|c| &c.id == component) {
@@ -325,6 +337,29 @@ mod tests {
         assert!(m.validate().is_err());
 
         assert!(PluginManifest::from_json(r#"{"id":"x"}"#).is_err(), "requiresAdmin/defaultGatePolicy must be declared");
+    }
+
+    #[test]
+    fn only_pin_gated_changes_with_a_dry_run_can_be_plan_steps() {
+        let mut m = manifest();
+        m.tools[1].plan_eligible = true;
+        m.validate().unwrap();
+        let broken: [fn(&mut ToolManifest); 4] = [
+            |t| t.default_gate_policy = GatePolicy::Auto,
+            |t| t.read_only = true,
+            |t| t.app_only = true,
+            |t| t.input_schema = json!({ "type": "object", "properties": {} }),
+        ];
+        for (i, breaks) in broken.iter().enumerate() {
+            let mut m = manifest();
+            m.tools[1].plan_eligible = true;
+            breaks(&mut m.tools[1]);
+            assert!(m.validate().unwrap_err().contains("planEligible"), "case {i}");
+        }
+        // A read-only tool can never be a step.
+        let mut m = manifest();
+        m.tools[0].plan_eligible = true;
+        assert!(m.validate().is_err());
     }
 
     #[test]
