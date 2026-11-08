@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aegis_core::engine::{Engine, EngineOptions};
+use aegis_core::history_service::HistoryHandle;
 use aegis_core::plugin_data::PluginStore;
 use aegis_core::registry::{CallReview, Plugin, PluginManifest, Registry, ToolContext, UnlockContext};
 use aegis_core::vault::KdfParams;
@@ -21,6 +22,8 @@ pub struct DemoPlugin {
     /// The store handed to the last `on_unlock` and the last tool call.
     pub unlock_store: Mutex<Option<PluginStore>>,
     pub call_store: Mutex<Option<PluginStore>>,
+    /// The history handle handed to the last `on_unlock`.
+    pub unlock_history: Mutex<Option<HistoryHandle>>,
     /// `fix` with a note starting "wait" records the note, then blocks until
     /// a permit is added to `release`. A note starting "fail" makes `fix`
     /// fail, "unwell" makes it report `"success": false`, and "nodry" makes
@@ -73,6 +76,7 @@ impl DemoPlugin {
             locks: AtomicUsize::new(0),
             unlock_store: Mutex::new(None),
             call_store: Mutex::new(None),
+            unlock_history: Mutex::new(None),
             started: Mutex::new(Vec::new()),
             release: tokio::sync::Semaphore::new(0),
             running: AtomicUsize::new(0),
@@ -122,6 +126,7 @@ impl Plugin for DemoPlugin {
 
     fn on_unlock(&self, ctx: &UnlockContext) {
         *self.unlock_store.lock().unwrap() = ctx.store.clone();
+        *self.unlock_history.lock().unwrap() = ctx.history.clone();
         self.unlocks.fetch_add(1, Ordering::SeqCst);
     }
 

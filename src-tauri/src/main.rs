@@ -103,6 +103,8 @@ fn start_idle_watch(app: AppHandle, engine: Arc<Engine>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
         tauri::async_runtime::block_on(engine.lock_if_idle(Instant::now()));
+        // Flushes history frames to disk every 30 seconds, even when nothing new is written.
+        engine.history_tick();
         if let Some(tray) = app.tray_by_id("main") {
             let _ = tray.set_tooltip(Some(tray_text(&engine)));
         }

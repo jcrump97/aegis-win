@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::history::{Retention, StreamKey};
 use crate::llm::LlmConfig;
 use crate::registry::GatePolicy;
 use crate::secret::Secret;
@@ -54,6 +55,14 @@ pub struct VaultState {
     /// Plugin id → key → record (`plugin_data::PluginStore`). Kept when a
     /// plugin is uninstalled, but unreachable until it is installed again.
     pub plugin_data: BTreeMap<String, BTreeMap<String, Value>>,
+    /// History stream → its keypair (ADR 0002 §5). The private half never
+    /// leaves the vault; the public half is cached for writing while locked.
+    pub history_keys: BTreeMap<String, StreamKey>,
+    /// History stream → retention, when the owner changed the default.
+    pub history_retention: BTreeMap<String, Retention>,
+    /// Plugin id → what it runs while locked: the copy each runtime file is
+    /// checked against on unlock (`history_service::RuntimeFile::plugin`).
+    pub runtime: BTreeMap<String, Value>,
 }
 
 impl Default for VaultState {
@@ -69,6 +78,9 @@ impl Default for VaultState {
             llm: LlmConfig::default(),
             mcp: McpConfig::default(),
             plugin_data: BTreeMap::new(),
+            history_keys: BTreeMap::new(),
+            history_retention: BTreeMap::new(),
+            runtime: BTreeMap::new(),
         }
     }
 }
@@ -100,5 +112,6 @@ mod tests {
         assert_eq!(state.mcp.port, DEFAULT_MCP_PORT);
         assert_eq!(state.mcp.auth_token.expose().len(), 48);
         assert!(state.plugin_data.is_empty());
+        assert!(state.history_keys.is_empty() && state.runtime.is_empty());
     }
 }

@@ -72,3 +72,12 @@ A plugin that must remember owner-approved configuration (such as `usage-monitor
 3. **Small and rare.** Keys are 1-64 characters of `a-z`, `0-9`, `_`, `-`. One plugin's records are capped at 256 KiB, and a write over the cap is refused with nothing changed. Each write re-encrypts and saves the vault, so the store is for configuration that changes when the owner acts, never for telemetry.
 4. **Gating is the tool's job.** The store does not ask for the PIN. A tool that changes what a plugin records or does must declare `defaultGatePolicy: "pin_required"`.
 5. **Never store the PIN** or any credential in plugin data, and never return records verbatim to an LLM without the scrubbing in `SECURITY_MODEL.md` §6.
+
+## 6. History Streams and Locked Work ([ADR 0002 §5](adr/0002-ai-monitor-creator.md))
+A plugin that keeps a record over time (such as `usage-monitor`'s timeline) uses the `HistoryHandle` in `ToolContext::history` and `UnlockContext::history`.
+1. **Own stream only.** The handle is bound to the plugin's id; the stream is named after it. The id `approvals` is reserved for the engine's own stream.
+2. **Write-only while locked.** `append` seals one JSON object (the engine adds `at`) and keeps working after the vault locks, once the stream has a key (created in the vault the first time the stream is written while unlocked). `read`, `purge`, `retention` and `set_retention` need the vault unlocked and the plugin installed.
+3. **Records are small and summarized.** At most 64 KiB each. Write events and periodic summaries, never raw high-rate samples. Process names only, never window titles.
+4. **Purge replaces the key.** `purge` deletes every file of the stream and gives it a new keypair, so a deleted file recovered from the disk cannot be read later.
+5. **Locked work is declared.** `set_runtime(Some(section))` saves what the plugin runs while locked in the vault and writes it, with the stream's public key and retention, to `./data/runtime/<plugin>.json`. On every unlock the engine compares that file with the vault before any plugin starts; a file that differs (other than the tray's `paused` flag), cannot be read, or was never written by AegisWin is moved aside and waits for the owner. `set_runtime(None)` removes the file. Uninstalling a plugin removes it too.
+6. **Gating is the tool's job.** The handle does not ask for the PIN. A tool that reads, purges, or changes the retention of a stream declares `defaultGatePolicy: "pin_required"`.

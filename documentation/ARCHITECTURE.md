@@ -152,3 +152,12 @@ aegis-win/
 ├── documentation/              # Specs, ADRs, audit ledger
 └── tests/                      # Node tests for repo, docs, and UI/Tauri wiring invariants (Rust tests live beside their crates)
 ```
+
+At run time, next to the executable:
+```
+data/
+├── vault.enc.json              # Encrypted vault: settings, plugin data, history private keys
+├── webview/                    # WebView2 profile
+├── history/<stream>/           # Encrypted, write-only history segments (seg-YYYYMMDD-NNN.bin), one folder per stream
+└── runtime/<plugin>.json       # Plaintext: what a plugin runs while locked, with its stream's public key (checked on unlock)
+```

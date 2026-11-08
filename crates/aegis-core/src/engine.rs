@@ -15,6 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
+use crate::history::{Retention, StreamKey, StreamRead};
+use crate::history_service::{self, HistoryHandle, HistoryService, RuntimeFile, RuntimeReview, MAX_RUNTIME_BYTES, RUNTIME_VERSION};
 use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
@@ -58,6 +60,10 @@ pub struct Engine {
     activity: Mutex<Instant>,
     /// One state-changing run at a time.
     executor: Executor,
+    /// Encrypted history streams (public keys and open files only).
+    history: HistoryService,
+    /// Runtime files that did not match the vault, until the owner rewrites them.
+    runtime_reviews: Mutex<BTreeMap<String, RuntimeReview>>,
 }
 
 /// Where a tool call came from. Only the desktop UI can pass a PIN inline;
@@ -244,9 +250,12 @@ fn plugin_component_ids(plugin: &dyn Plugin) -> Vec<String> {
 
 impl Engine {
     pub fn new(data_dir: impl Into<PathBuf>, registry: Registry, options: EngineOptions) -> Arc<Self> {
+        let data_dir: PathBuf = data_dir.into();
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
-            data_dir: data_dir.into(),
+            history: HistoryService::new(&data_dir),
+            runtime_reviews: Mutex::new(BTreeMap::new()),
+            data_dir,
             registry,
             vault: Mutex::new(None),
             guard: Mutex::new(PinGuard::default()),
@@ -376,6 +385,8 @@ impl Engine {
         let installed: Vec<(String, Vec<String>)> =
             vault.state.installed_plugins.iter().map(|id| (id.clone(), vault.state.components_for(id))).collect();
         *lock(&self.vault) = Some(vault);
+        self.load_history_keys();
+        self.check_runtime_files();
         for (id, components) in installed {
             if let Some(plugin) = self.registry.plugin(&id) {
                 plugin.on_unlock(&self.unlock_context(&id, components));
@@ -443,6 +454,7 @@ impl Engine {
                 plugin.on_lock();
             }
         }
+        self.history.close_all();
         lock(&self.tickets).clear();
         self.status()
     }
@@ -673,6 +685,8 @@ impl Engine {
                 self.registry.plugins().iter().map(|p| p.manifest().id.clone()).filter(|id| selection.contains_key(id)).collect();
             s.installed_components = selection.clone();
             s.trusted_external_llm_plugins.retain(|id| selection.contains_key(id));
+            // An uninstalled plugin runs nothing while locked.
+            s.runtime.retain(|id, _| selection.contains_key(id));
             s.first_run_completed = true;
             Ok((old, selection.clone()))
         })?;
@@ -684,6 +698,9 @@ impl Engine {
             }
             if before.is_some() {
                 plugin.on_lock();
+                if after.is_none() {
+                    let _ = self.history.write_runtime(id, None);
+                }
             }
             if let Some(components) = after {
                 plugin.on_unlock(&self.unlock_context(id, components.clone()));
@@ -741,7 +758,7 @@ impl Engine {
     }
 
     fn unlock_context(&self, plugin_id: &str, enabled_components: Vec<String>) -> UnlockContext {
-        UnlockContext { enabled_components, store: Some(self.store_for(plugin_id)) }
+        UnlockContext { enabled_components, store: Some(self.store_for(plugin_id)), history: Some(self.history_for(plugin_id)) }
     }
 
     fn require_installed(&self, s: &VaultState, plugin_id: &str) -> AegisResult<()> {
@@ -790,6 +807,209 @@ impl Engine {
             s.plugin_data.remove(plugin_id);
             Ok(())
         })
+    }
+
+    // ---- history (ADR 0002 §5) --------------------------------------------
+
+    fn history_for(&self, plugin_id: &str) -> HistoryHandle {
+        HistoryHandle::new(self.me.clone(), plugin_id)
+    }
+
+    /// Forces pending history frames to disk every 30 seconds. Called from
+    /// the app's 5-second idle check, so a quiet stream is not left unsynced.
+    pub fn history_tick(&self) {
+        self.history.sync_due();
+    }
+
+    fn retention_of(s: &VaultState, stream: &str) -> Retention {
+        s.history_retention.get(stream).copied().unwrap_or_else(|| history_service::default_retention(stream))
+    }
+
+    /// Caches every stream's public key (and retention) from the vault,
+    /// replacing any key read from a runtime file, and applies retention.
+    fn load_history_keys(&self) {
+        let keys = self
+            .with_state(|s| s.history_keys.iter().map(|(stream, k)| (stream.clone(), k.public(), Self::retention_of(s, stream))).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (stream, key, retention) in keys {
+            self.history.set_key(&stream, key, retention);
+        }
+        self.history.enforce_retention(chrono::Utc::now());
+    }
+
+    /// Creates the stream's keypair in the vault the first time it is used.
+    fn ensure_history_key(&self, stream: &str) -> AegisResult<()> {
+        let (key, retention) = self.mutate(|s| {
+            let key = s.history_keys.entry(stream.to_owned()).or_insert_with(StreamKey::generate).public();
+            Ok((key, Self::retention_of(s, stream)))
+        })?;
+        self.history.set_key(stream, key, retention);
+        Ok(())
+    }
+
+    pub(crate) fn history_append(&self, stream: &str, mut record: Value) -> AegisResult<()> {
+        let Value::Object(fields) = &mut record else {
+            return Err(AegisError::invalid("a history record is a JSON object"));
+        };
+        let now = chrono::Utc::now();
+        fields.insert("at".into(), Value::String(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)));
+        if !self.history.knows(stream) {
+            self.ensure_history_key(stream)?;
+        }
+        self.history.append(stream, &record, now)
+    }
+
+    pub(crate) fn history_read(&self, stream: &str, since: Option<chrono::NaiveDate>) -> AegisResult<StreamRead> {
+        let key = self.with_state(|s| self.require_installed(s, stream).map(|()| s.history_keys.get(stream).cloned()))??;
+        match key {
+            Some(key) => self.history.read(stream, &key, since),
+            None => Ok(StreamRead::default()),
+        }
+    }
+
+    /// Deletes the stream's files and replaces its keypair, so a deleted
+    /// file recovered from the disk cannot be read with the vault later.
+    pub(crate) fn history_purge(&self, stream: &str) -> AegisResult<usize> {
+        let (key, retention) = self.mutate(|s| {
+            self.require_installed(s, stream)?;
+            let key = StreamKey::generate();
+            let public = key.public();
+            s.history_keys.insert(stream.to_owned(), key);
+            Ok((public, Self::retention_of(s, stream)))
+        })?;
+        let removed = self.history.purge(stream, key, retention)?;
+        self.rewrite_runtime(stream)?;
+        Ok(removed)
+    }
+
+    pub(crate) fn history_retention(&self, stream: &str) -> AegisResult<Retention> {
+        self.with_state(|s| self.require_installed(s, stream).map(|()| Self::retention_of(s, stream)))?
+    }
+
+    pub(crate) fn set_history_retention(&self, stream: &str, retention: Retention) -> AegisResult<()> {
+        if !retention.is_valid() {
+            return Err(AegisError::invalid(format!(
+                "history is kept for {}-{} days and {}-{} MB",
+                Retention::DAYS.start(),
+                Retention::DAYS.end(),
+                Retention::MB.start(),
+                Retention::MB.end()
+            )));
+        }
+        self.mutate(|s| {
+            self.require_installed(s, stream)?;
+            s.history_retention.insert(stream.to_owned(), retention);
+            s.history_keys.entry(stream.to_owned()).or_insert_with(StreamKey::generate);
+            Ok(())
+        })?;
+        self.load_history_keys();
+        self.rewrite_runtime(stream)
+    }
+
+    /// What the runtime file of `plugin_id` should say, from the vault.
+    fn expected_runtime(s: &VaultState, plugin_id: &str) -> Option<RuntimeFile> {
+        let plugin = s.runtime.get(plugin_id)?;
+        let key = s.history_keys.get(plugin_id)?.public();
+        Some(RuntimeFile {
+            version: RUNTIME_VERSION,
+            stream: plugin_id.to_owned(),
+            key_id: key.key_id,
+            public_key: key.public_key,
+            retention: Self::retention_of(s, plugin_id),
+            paused: false,
+            plugin: plugin.clone(),
+        })
+    }
+
+    /// Saves what a plugin runs while locked (`None`: nothing) in the vault,
+    /// then writes its runtime file, unless that file waits for the owner's
+    /// review.
+    pub(crate) fn set_runtime(&self, plugin_id: &str, plugin: Option<Value>) -> AegisResult<()> {
+        if let Some(v) = &plugin {
+            if serde_json::to_vec(v).map_err(internal)?.len() > MAX_RUNTIME_BYTES {
+                return Err(AegisError::invalid(format!("the runtime settings would exceed {} KiB", MAX_RUNTIME_BYTES / 1024)));
+            }
+        }
+        self.mutate(|s| {
+            self.require_installed(s, plugin_id)?;
+            match plugin {
+                Some(v) => {
+                    s.history_keys.entry(plugin_id.to_owned()).or_insert_with(StreamKey::generate);
+                    s.runtime.insert(plugin_id.to_owned(), v);
+                }
+                None => {
+                    s.runtime.remove(plugin_id);
+                }
+            }
+            Ok(())
+        })?;
+        self.load_history_keys();
+        self.rewrite_runtime(plugin_id)
+    }
+
+    /// Writes the runtime file from the vault, keeping a tray pause. Does
+    /// nothing while the file waits for the owner's review.
+    fn rewrite_runtime(&self, plugin_id: &str) -> AegisResult<()> {
+        if lock(&self.runtime_reviews).contains_key(plugin_id) {
+            return Ok(());
+        }
+        let expected = self.with_state(|s| Self::expected_runtime(s, plugin_id))?;
+        let paused = matches!(self.history.read_runtime(plugin_id), Some(Ok(f)) if f.paused);
+        self.history.write_runtime(plugin_id, expected.map(|f| RuntimeFile { paused, ..f }).as_ref())
+    }
+
+    /// The tamper check (ADR 0002 §5), run before any plugin starts. A
+    /// runtime file that differs from the vault, cannot be read, or that
+    /// AegisWin never wrote is moved aside and waits for the owner, also
+    /// across restarts. A missing file is written again from the vault.
+    fn check_runtime_files(&self) {
+        let Ok(expected) = self.with_state(|s| {
+            let mut ids: Vec<String> = s.runtime.keys().cloned().collect();
+            ids.extend(self.history.runtime_files());
+            ids.sort();
+            ids.dedup();
+            ids.into_iter().map(|id| (Self::expected_runtime(s, &id), id)).collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        let mut reviews = BTreeMap::new();
+        for (want, id) in expected {
+            let found = self.history.read_runtime(&id);
+            let differences: Vec<String> = match (&found, &want) {
+                (None, _) => Vec::new(),
+                (Some(Ok(file)), Some(want)) => file.differences(want).into_iter().map(str::to_owned).collect(),
+                (Some(Ok(_)), None) => vec!["AegisWin did not write this file".into()],
+                (Some(Err(_)), _) => vec!["the file could not be read".into()],
+            };
+            if !differences.is_empty() {
+                self.history.reject_runtime(&id);
+                reviews.insert(id.clone(), RuntimeReview { plugin_id: id, differences });
+            } else if let Some(review) = lock(&self.runtime_reviews).get(&id).cloned() {
+                reviews.insert(id, review);
+            } else if self.history.rejected_path(&id).exists() {
+                reviews.insert(id.clone(), RuntimeReview { plugin_id: id, differences: vec!["it was set aside at an earlier unlock".into()] });
+            } else if found.is_none() && want.is_some() {
+                let _ = self.history.write_runtime(&id, want.as_ref());
+            }
+        }
+        *lock(&self.runtime_reviews) = reviews;
+    }
+
+    /// Runtime files set aside at unlock, for the owner to review.
+    pub fn runtime_reviews(&self) -> Vec<RuntimeReview> {
+        lock(&self.runtime_reviews).values().cloned().collect()
+    }
+
+    /// The owner reviewed a set-aside runtime file: write it again from the
+    /// vault (the owner's own saved settings) and delete the rejected copy.
+    /// App only: never reachable over MCP.
+    pub fn rewrite_runtime_from_vault(&self, plugin_id: &str) -> AegisResult<()> {
+        self.with_state(|_| ())?;
+        if lock(&self.runtime_reviews).remove(plugin_id).is_none() {
+            return Err(AegisError::invalid(format!("no runtime file of '{plugin_id}' is waiting for review")));
+        }
+        let _ = std::fs::remove_file(self.history.rejected_path(plugin_id));
+        self.rewrite_runtime(plugin_id)
     }
 
     // ---- tools -----------------------------------------------------------
@@ -847,7 +1067,13 @@ impl Engine {
             tool: tool.clone(),
             args,
             gate,
-            ctx: ToolContext { elevated: self.elevated, enabled_components: components, llm, store: Some(self.store_for(plugin_id)) },
+            ctx: ToolContext {
+                elevated: self.elevated,
+                enabled_components: components,
+                llm,
+                store: Some(self.store_for(plugin_id)),
+                history: Some(self.history_for(plugin_id)),
+            },
         })
     }
 

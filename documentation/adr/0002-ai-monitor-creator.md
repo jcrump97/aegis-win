@@ -221,6 +221,12 @@ Rejected alternatives:
 - **Tamper detection**: on every unlock, the public key, `keyId`, and rules in `runtime.json` are compared with the vault's copies. On a mismatch the app warns, stops resuming from the file, and rewrites it from the vault after the owner reviews.
 - **Threat model.** Malware that can write to `./data` as the user can redirect future records or add observe-only rules. Preventing that is out of scope, since it already controls the session; *detection* at the next unlock is in scope. Someone who has only the files (e.g. a lost USB stick) sees the active rules, file dates, and sizes, but no collected data.
 
+**As built in Phase 4** (2026-11-08, during implementation):
+
+- **Runtime file path.** The history service is shared, so the runtime file is per plugin: `./data/runtime/<plugin>.json` (today only `usage-monitor.json`) rather than `./data/monitor/runtime.json`. It holds the format version, stream, key id, public key, retention, `paused`, and a plugin-defined section (for `usage-monitor`: its active rules and enabled components).
+- **Keys** are created in the vault the first time a stream is written while unlocked.
+- **Tamper check outcome.** A mismatching, unreadable, or unexpected runtime file is renamed to `<plugin>.rejected.json` (so it is never resumed from, also after a restart) and listed for the owner, who rewrites it from the vault in the app. Until then, plugin changes update the vault only. `paused` is not compared, because the tray sets it without the PIN. A missing file is rewritten from the vault without a warning: it cannot redirect anything.
+
 ## 6. Restart and resume
 
 - **Always on (A):** every launch reads `runtime.json`. If monitors were active and not paused, it resumes them in *locked, monitoring*. After unlock, a banner says "Monitors were stopped from X to Y; the gap is recorded."

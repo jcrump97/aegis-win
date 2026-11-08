@@ -264,7 +264,12 @@ impl SegmentWriter {
         let mut frame = Vec::with_capacity(4 + sealed.len());
         frame.extend_from_slice(&len.to_le_bytes());
         frame.extend_from_slice(&sealed);
-        seg.file.write_all(&frame)?;
+        if let Err(e) = seg.file.write_all(&frame) {
+            // A partly written frame would misalign every later one: drop
+            // this file (its tail reads as torn) and start a new one next time.
+            self.open = None;
+            return Err(e);
+        }
         seg.index += 1;
         seg.bytes += frame.len() as u64;
         seg.dirty = true;
@@ -372,9 +377,18 @@ pub struct StreamRead {
 
 /// Decrypts every file of a stream. Needs the private key (unlocked only).
 pub fn read_stream(dir: &Path, stream: &str, key: &StreamKey) -> io::Result<StreamRead> {
+    read_stream_since(dir, stream, key, None)
+}
+
+/// Like [`read_stream`], but skips files started before `since` (UTC day).
+/// A file holds records from its own day only, so nothing later is missed.
+pub fn read_stream_since(dir: &Path, stream: &str, key: &StreamKey, since: Option<NaiveDate>) -> io::Result<StreamRead> {
     let sk = key.private()?;
     let mut out = StreamRead::default();
     for (name, path, bytes) in segments(dir)? {
+        if since.is_some_and(|day| name.day < day) {
+            continue;
+        }
         let (status, records) = match fs::read(&path) {
             Ok(raw) => read_segment(&raw, stream, key, &sk),
             Err(_) => (FileStatus::Unreadable, Vec::new()),

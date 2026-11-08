@@ -142,6 +142,8 @@ pub struct ToolContext {
     pub llm: Option<crate::llm::LlmHandle>,
     /// This plugin's own records in the vault. Always set by the engine.
     pub store: Option<crate::plugin_data::PluginStore>,
+    /// This plugin's own encrypted history stream. Always set by the engine.
+    pub history: Option<crate::history_service::HistoryHandle>,
 }
 
 impl ToolContext {
@@ -155,6 +157,9 @@ impl ToolContext {
 
     pub fn store(&self) -> AegisResult<&crate::plugin_data::PluginStore> {
         self.store.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::Internal, "no plugin data store in this context"))
+    }
+    pub fn history(&self) -> AegisResult<&crate::history_service::HistoryHandle> {
+        self.history.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::Internal, "no history stream in this context"))
     }
 }
 
@@ -177,6 +182,9 @@ pub struct UnlockContext {
     pub enabled_components: Vec<String>,
     /// This plugin's own records in the vault. Always set by the engine.
     pub store: Option<crate::plugin_data::PluginStore>,
+    /// This plugin's own encrypted history stream. Always set by the engine.
+    /// Appending keeps working after lock; reading does not.
+    pub history: Option<crate::history_service::HistoryHandle>,
 }
 
 #[async_trait]
@@ -218,6 +226,9 @@ impl Registry {
         let mut ids = std::collections::HashSet::new();
         for p in &plugins {
             p.manifest().validate()?;
+            if p.manifest().id == crate::history_service::APPROVALS_STREAM {
+                return Err(format!("plugin id '{}' is reserved for the approvals history", p.manifest().id));
+            }
             if !ids.insert(p.manifest().id.clone()) {
                 return Err(format!("duplicate plugin id '{}'", p.manifest().id));
             }
