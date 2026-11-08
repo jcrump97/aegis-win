@@ -311,3 +311,120 @@ async fn lan_bind_from_settings_also_serves_loopback() {
         assert!(s.http.post(url).bearer_auth(&s.token).json(&json!({})).send().await.is_err(), "{url} still answers after lock");
     }
 }
+
+async fn poll_until_final(s: &Server, ticket_id: &str) -> Value {
+    for _ in 0..250 {
+        let out = s.call("aegis__check_ticket", json!({ "ticketId": ticket_id })).await["structuredContent"].clone();
+        if !matches!(out["status"].as_str(), Some("running" | "queued" | "pending_approval")) {
+            return out;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("ticket {ticket_id} did not finish");
+}
+
+fn step_statuses(ticket: &Value) -> Vec<&str> {
+    ticket["steps"].as_array().unwrap().iter().map(|s| s["status"].as_str().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn plans_are_proposed_over_mcp_and_approved_with_their_fingerprint() {
+    let s = server().await;
+    let list = s.rpc("tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let propose = tools.iter().find(|t| t["name"] == "aegis__propose_plan").expect("listed");
+    assert_eq!(propose["inputSchema"]["properties"]["steps"]["items"]["properties"]["tool"]["enum"], json!(["demo__fix"]), "only eligible tools");
+    assert!(tools.iter().any(|t| t["name"] == "aegis__cancel_ticket"));
+
+    let refused = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__echo" }] })).await;
+    assert_eq!(refused["isError"], true);
+    assert!(refused["structuredContent"]["error"]["message"].as_str().unwrap().contains("cannot be a plan step"));
+
+    let plan = json!({
+        "title": "Fix <both>",
+        "reasoning": "First a, then <b>b</b>.",
+        "steps": [{ "tool": "demo__fix", "args": { "note": "a" }, "reasoning": "<i>a</i> first" }, { "tool": "demo__fix", "args": { "note": "b" } }],
+    });
+    let pending = s.call("aegis__propose_plan", plan).await["structuredContent"].clone();
+    assert_eq!(pending["status"], "pending_approval", "{pending}");
+    assert!(pending.get("csrf").is_none());
+    let (hash, short) = (pending["plan"]["hash"].as_str().unwrap().to_owned(), pending["plan"]["shortHash"].as_str().unwrap().to_owned());
+    assert!(pending["message"].as_str().unwrap().contains(&short), "the agent is told the fingerprint to share");
+    assert_eq!(pending["steps"][0]["commands"], json!(["fix.exe a"]));
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let url = pending["approvalUrl"].as_str().unwrap().to_owned();
+
+    let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("Supplied by the requesting agent"));
+    assert!(html.contains("Fix &lt;both&gt;") && html.contains("First a, then &lt;b&gt;b&lt;/b&gt;.") && html.contains("&lt;i&gt;a&lt;/i&gt; first"), "{html}");
+    assert!(!html.contains("<b>b</b>") && !html.contains("<i>a</i>"));
+    assert!(html.contains("<code>") && html.contains(&short));
+    assert!(html.contains("fix.exe a") && html.contains("fix.exe b"));
+    assert!(html.contains("Approve and run 2 steps"));
+    assert!(html.contains(&format!("name=\"plan_hash\" value=\"{hash}\"")));
+    let csrf = extract_csrf(&html);
+
+    let post = |pairs: Vec<(&str, &str)>| {
+        s.http
+            .post(&url)
+            .header("origin", &s.base)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish())
+    };
+    let stale = "0".repeat(64);
+    for pairs in [vec![("csrf", csrf.as_str()), ("pin", PIN), ("decision", "approve")], vec![("csrf", &csrf), ("pin", PIN), ("decision", "approve"), ("plan_hash", &stale)]] {
+        let r = post(pairs).send().await.unwrap();
+        assert_eq!(r.status(), 409);
+        assert!(r.text().await.unwrap().contains("3 attempt(s) left"), "a stale page costs no PIN attempt");
+    }
+    let approved = post(vec![("csrf", &csrf), ("pin", PIN), ("decision", "approve"), ("plan_hash", &hash)]).send().await.unwrap();
+    assert_eq!(approved.status(), 200);
+    let done = poll_until_final(&s, &id).await;
+    assert_eq!(done["status"], "approved", "{done}");
+    assert_eq!(step_statuses(&done), ["succeeded", "succeeded"]);
+    assert_eq!(done["decidedVia"], "browser");
+    assert_eq!(*s.f.plugin.fixed.lock().unwrap(), ["a", "b"]);
+}
+
+#[tokio::test]
+async fn plans_can_be_cancelled_over_mcp_and_stopped_from_the_page() {
+    let s = server().await;
+    let missing = s.call("aegis__cancel_ticket", json!({ "ticketId": "0".repeat(32) })).await;
+    assert_eq!(missing["structuredContent"]["error"]["code"], "NOT_FOUND");
+
+    let pending = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "never" } }] })).await["structuredContent"].clone();
+    let withdrawn = s.call("aegis__cancel_ticket", json!({ "ticketId": pending["ticketId"] })).await["structuredContent"].clone();
+    assert_eq!(withdrawn["status"], "cancelled");
+    assert_eq!(step_statuses(&withdrawn), ["cancelled"]);
+
+    let pending = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "wait-a" } }, { "tool": "demo__fix", "args": { "note": "b" } }] })).await["structuredContent"].clone();
+    let (id, url, hash) = (pending["ticketId"].as_str().unwrap().to_owned(), pending["approvalUrl"].as_str().unwrap().to_owned(), pending["plan"]["hash"].as_str().unwrap().to_owned());
+    let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
+    let post = |pairs: Vec<(&str, &str)>| {
+        s.http
+            .post(&url)
+            .header("origin", &s.base)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish())
+    };
+    let approved = post(vec![("csrf", &csrf), ("pin", PIN), ("decision", "approve"), ("plan_hash", &hash)]).send().await.unwrap();
+    assert!(approved.text().await.unwrap().contains("Stop after this step"), "the running plan offers a stop button");
+    for _ in 0..250 {
+        if !s.f.plugin.started.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let running = s.call("aegis__check_ticket", json!({ "ticketId": id })).await["structuredContent"].clone();
+    assert!(running["message"].as_str().unwrap().contains("Running step 1 of 2"), "{running}");
+
+    assert_eq!(post(vec![("csrf", &"0".repeat(32)), ("decision", "cancel")]).send().await.unwrap().status(), 403, "cancel still needs the form token");
+    let stopped = post(vec![("csrf", &csrf), ("decision", "cancel")]).send().await.unwrap();
+    assert_eq!(stopped.status(), 200);
+    assert!(stopped.text().await.unwrap().contains("Stopping after the step"));
+    s.f.plugin.release.add_permits(1);
+    let done = poll_until_final(&s, &id).await;
+    assert_eq!(done["status"], "cancelled", "{done}");
+    assert_eq!(step_statuses(&done), ["succeeded", "cancelled"]);
+    assert_eq!(*s.f.plugin.fixed.lock().unwrap(), ["wait-a"]);
+}

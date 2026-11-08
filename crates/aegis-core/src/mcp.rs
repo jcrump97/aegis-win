@@ -31,12 +31,15 @@ use tokio::task::JoinHandle;
 
 use crate::engine::{Engine, Origin, RunOutcome};
 use crate::error::{AegisError, AegisResult, ErrorCode};
+use crate::plan::{PlanOrigin, MAX_PLAN_REASONING_CHARS, MAX_STEPS, MAX_STEP_REASONING_CHARS, MAX_TITLE_CHARS};
 use crate::registry::{self, GatePolicy};
-use crate::tickets::{TicketStatus, TicketView};
+use crate::tickets::{PlanMeta, StepStatus, TicketStatus, TicketView};
 
 /// Newest first. The first entry is offered when a client asks for a version we do not know.
 pub const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 pub const CHECK_TICKET_TOOL: &str = "aegis__check_ticket";
+pub const PROPOSE_PLAN_TOOL: &str = "aegis__propose_plan";
+pub const CANCEL_TICKET_TOOL: &str = "aegis__cancel_ticket";
 const MAX_BODY: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,14 +277,15 @@ fn initialize(params: &Value) -> Value {
         "instructions": "AegisWin diagnoses and repairs this Windows PC. Read-only tools run immediately. \
 Tools marked as needing approval return status 'pending_approval' with an approvalUrl: give that link to the user, \
 who approves with their PIN, then call aegis__check_ticket with the ticketId until the status is final. \
+To run several repairs in order under one approval, use aegis__propose_plan. \
 Tools that need administrator rights fail unless AegisWin runs elevated.",
     })
 }
 
 fn tools_list(state: &AppState) -> AegisResult<Value> {
-    let mut tools: Vec<Value> = state
-        .engine
-        .exposed_tools()?
+    let exposed = state.engine.exposed_tools()?;
+    let eligible: Vec<String> = exposed.iter().filter(|t| t.tool.plan_eligible).map(|t| registry::mcp_tool_name(&t.plugin_id, &t.tool.id)).collect();
+    let mut tools: Vec<Value> = exposed
         .into_iter()
         .map(|t| {
             let mut description = t.tool.description.clone();
@@ -311,7 +315,7 @@ fn tools_list(state: &AppState) -> AegisResult<Value> {
     tools.push(json!({
         "name": CHECK_TICKET_TOOL,
         "title": "Check approval request",
-        "description": "Returns the status of an approval request (pending_approval, running, approved, declined, execution_failed, locked_out or expired) and, once approved, the tool's result.",
+        "description": "Returns the status of an approval request (pending_approval, queued, running, approved, declined, execution_failed, locked_out, expired or cancelled) and, once approved, the tool's result. For a plan, steps shows each step's status, result, or error.",
         "inputSchema": {
             "type": "object",
             "properties": { "ticketId": { "type": "string", "description": "ticketId returned by a tool that needs approval" } },
@@ -319,6 +323,57 @@ fn tools_list(state: &AppState) -> AegisResult<Value> {
             "additionalProperties": false,
         },
         "annotations": { "title": "Check approval request", "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    }));
+    if !eligible.is_empty() {
+        tools.push(json!({
+            "name": PROPOSE_PLAN_TOOL,
+            "title": "Propose an action plan",
+            "description": format!(
+                "Proposes up to {MAX_STEPS} repairs to run in order under one approval. Nothing runs until the owner approves with their PIN. \
+Each step is checked and dry-run now; the owner sees every argument and the exact commands. Steps run one at a time and the plan \
+stops at the first failure; earlier changes stay. Returns a ticketId, an approvalUrl, and a plan fingerprint (plan.shortHash) to \
+tell the owner; poll aegis__check_ticket, whose steps array shows each step. Pending plans expire after 10 minutes. \
+Steps can use: {}.",
+                eligible.join(", ")
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "maxLength": MAX_TITLE_CHARS, "description": "Shown to the owner, labelled as supplied by you." },
+                    "reasoning": { "type": "string", "maxLength": MAX_PLAN_REASONING_CHARS, "description": "Why this plan; shown to the owner, labelled as supplied by you." },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_STEPS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": { "type": "string", "enum": eligible },
+                                "args": { "type": "object", "description": "The tool's arguments, as for a direct call; dryRun: true is not allowed." },
+                                "reasoning": { "type": "string", "maxLength": MAX_STEP_REASONING_CHARS },
+                            },
+                            "required": ["tool"],
+                            "additionalProperties": false,
+                        },
+                    },
+                },
+                "required": ["steps"],
+                "additionalProperties": false,
+            },
+            "annotations": { "title": "Propose an action plan", "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
+        }));
+    }
+    tools.push(json!({
+        "name": CANCEL_TICKET_TOOL,
+        "title": "Cancel approval request",
+        "description": "Withdraws an approval request that has not started, or stops a running plan before its next step (the running step finishes). Needs no approval, since it only does less.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "ticketId": { "type": "string" } },
+            "required": ["ticketId"],
+            "additionalProperties": false,
+        },
+        "annotations": { "title": "Cancel approval request", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
     }));
     Ok(json!({ "tools": tools }))
 }
@@ -342,12 +397,28 @@ fn tool_error(e: &AegisError) -> Value {
 
 fn ticket_payload(state: &AppState, ticket: &TicketView) -> Value {
     let mut value = serde_json::to_value(ticket).unwrap_or_default();
-    if ticket.status == TicketStatus::PendingApproval {
-        value["approvalUrl"] = json!(format!("{}/approve/{}", state.base_url, ticket.ticket_id));
-        value["message"] = json!("Waiting for the owner. Show them the approvalUrl (or they can approve in the AegisWin app), then call aegis__check_ticket.");
-    }
-    if ticket.status == TicketStatus::Queued {
-        value["message"] = json!("Approved. Another change is running first; this one starts when its turn comes. Keep calling aegis__check_ticket.");
+    match (ticket.status, &ticket.plan) {
+        (TicketStatus::PendingApproval, plan) => {
+            value["approvalUrl"] = json!(format!("{}/approve/{}", state.base_url, ticket.ticket_id));
+            value["message"] = json!(match plan {
+                Some(p) => format!(
+                    "Waiting for the owner. Show them the approvalUrl and the plan fingerprint {} (or they can approve in the AegisWin app), then call aegis__check_ticket.",
+                    p.short_hash
+                ),
+                None => "Waiting for the owner. Show them the approvalUrl (or they can approve in the AegisWin app), then call aegis__check_ticket.".into(),
+            });
+        }
+        (TicketStatus::Queued, _) => {
+            value["message"] = json!("Approved. Another change is running first; this one starts when its turn comes. Keep calling aegis__check_ticket.");
+        }
+        (TicketStatus::Running, Some(_)) => {
+            let at = ticket.steps.iter().position(|s| s.status == StepStatus::Running).map_or(1, |i| i + 1);
+            value["message"] = json!(format!(
+                "Approved. Running step {at} of {}. Keep calling aegis__check_ticket; aegis__cancel_ticket stops the plan before its next step.",
+                ticket.steps.len()
+            ));
+        }
+        _ => {}
     }
     value
 }
@@ -358,11 +429,26 @@ async fn tools_call(state: &AppState, id: &Value, params: &Value) -> Response {
     };
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
+    let not_found = || AegisError::new(ErrorCode::NotFound, "No such approval request (they are forgotten when AegisWin locks).");
     if name == CHECK_TICKET_TOOL {
         let ticket_id = args.get("ticketId").and_then(Value::as_str).unwrap_or_default();
         return match state.engine.ticket(ticket_id) {
             Some(ticket) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
-            None => rpc_result(id, tool_error(&AegisError::new(ErrorCode::NotFound, "No such approval request (they are forgotten when AegisWin locks)."))),
+            None => rpc_result(id, tool_error(&not_found())),
+        };
+    }
+    if name == CANCEL_TICKET_TOOL {
+        let ticket_id = args.get("ticketId").and_then(Value::as_str).unwrap_or_default();
+        return match state.engine.cancel_ticket(ticket_id) {
+            Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
+            Err(e) if e.code == ErrorCode::NotFound => rpc_result(id, tool_error(&not_found())),
+            Err(e) => rpc_result(id, tool_error(&e)),
+        };
+    }
+    if name == PROPOSE_PLAN_TOOL {
+        return match state.engine.propose_plan(PlanOrigin::Agent, args).await {
+            Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
+            Err(e) => rpc_result(id, tool_error(&e)),
         };
     }
     let Some((plugin_id, tool_id)) = registry::parse_mcp_tool_name(name) else {
@@ -434,11 +520,17 @@ label{display:block;margin-top:14px;font-weight:600}input,textarea{width:100%;bo
 border:1px solid #c5cad3;border-radius:6px}.row{display:flex;gap:12px;margin-top:18px}button{flex:1;padding:10px;font:inherit;\
 border:0;border-radius:6px;cursor:pointer}.approve{background:#1f6feb;color:#fff}.decline{background:#e5e7eb}\
 .msg{padding:10px 12px;border-radius:6px;background:#fff4e5;margin-bottom:12px}.ok{background:#e6f4ea}\
+.supplied{border-left:4px solid #c5cad3;padding:2px 12px;margin:12px 0}.label{font-size:.85rem;color:#5a6270;margin:4px 0}\
+.steps>li{margin-bottom:16px}.pre-line{white-space:pre-wrap}.stop{background:#e5e7eb}\
 @media (prefers-color-scheme:dark){body{background:#111317;color:#e6e8eb}main{background:#1b1e24;box-shadow:none}\
 pre{background:#262a31}dt{color:#9aa3af}input,textarea{background:#262a31;color:inherit;border-color:#3a3f48}\
-.decline{background:#30353d;color:inherit}.msg{background:#3a2e1a}.ok{background:#1d3324}}";
+.decline{background:#30353d;color:inherit}.msg{background:#3a2e1a}.ok{background:#1d3324}.supplied{border-color:#3a3f48}\
+.label{color:#9aa3af}.stop{background:#30353d;color:inherit}}";
 
 fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str, bool)>) -> String {
+    if let Some(plan) = &ticket.plan {
+        return render_plan(ticket, plan, csrf, message);
+    }
     let mut body = String::from("<h1>Approve a request from an AI agent?</h1>");
     if let Some((text, ok)) = message {
         body.push_str(&format!("<div class=\"msg{}\">{}</div>", if ok { " ok" } else { "" }, escape_html(text)));
@@ -477,11 +569,113 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
             escape_html(csrf),
             ticket.attempts_remaining
         )),
-        (TicketStatus::Queued, _) => body.push_str("<p>Approved. Another change is running first; this one starts when it finishes. You can close this page.</p>"),
+        (TicketStatus::Queued, csrf) => {
+            body.push_str("<p>Approved. Another change is running first; this one starts when it finishes. You can close this page.</p>");
+            body.push_str(&cancel_form(csrf, "Cancel before it starts"));
+        }
         (TicketStatus::Running, _) => body.push_str("<p>Approved. The action is running; you can close this page.</p>"),
         _ => body.push_str("<p>This request is closed. You can close this page.</p>"),
     }
     body
+}
+
+/// A PIN-free form that only withdraws or stops (it can never make more happen).
+fn cancel_form(csrf: Option<&str>, label: &str) -> String {
+    csrf.map(|csrf| {
+        format!(
+            "<form method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+<div class=\"row\"><button class=\"stop\" name=\"decision\" value=\"cancel\">{}</button></div></form>",
+            escape_html(csrf),
+            escape_html(label)
+        )
+    })
+    .unwrap_or_default()
+}
+
+/// The plan review (ADR 0003 §2): AegisWin's own summary and steps first,
+/// then the supplied text under its label, then the decision.
+fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message: Option<(&str, bool)>) -> String {
+    let pending = ticket.status == TicketStatus::PendingApproval;
+    let mut body = String::from(if pending { "<h1>Approve an action plan from an AI agent?</h1>" } else { "<h1>Action plan from an AI agent</h1>" });
+    if let Some((text, ok)) = message {
+        body.push_str(&format!("<div class=\"msg{}\">{}</div>", if ok { " ok" } else { "" }, escape_html(text)));
+    }
+    body.push_str(&format!(
+        "<p><strong>{}</strong></p><dl><dt>Plan fingerprint</dt><dd><code>{}</code></dd><dt>Requested</dt><dd>{}</dd>{}<dt>Status</dt><dd>{}</dd></dl>",
+        escape_html(&plan.summary),
+        escape_html(&plan.short_hash),
+        escape_html(&local_time(&ticket.created_at)),
+        if pending { format!("<dt>Expires</dt><dd>{}</dd>", escape_html(&local_time(&plan.expires_at))) } else { String::new() },
+        escape_html(&status_label(ticket.status)),
+    ));
+    body.push_str("<p>The steps run one at a time, in this order. The plan stops at the first failure, and changes made by earlier steps stay: Windows repairs cannot be undone.</p><ol class=\"steps\">");
+    for step in &ticket.steps {
+        let args = serde_json::to_string_pretty(&step.args).unwrap_or_default();
+        let commands = if step.commands.is_empty() { "(the dry run listed no commands)".to_owned() } else { step.commands.join("\n") };
+        body.push_str(&format!(
+            "<li><strong>{}</strong> ({}){}{}<br>{}<p>Arguments:</p><pre>{}</pre><p>Commands it will run:</p><pre>{}</pre>",
+            escape_html(&step.tool_name),
+            escape_html(&step.plugin_id),
+            if step.requires_admin { " · needs administrator" } else { "" },
+            if pending { String::new() } else { format!(" · <em>{}</em>", escape_html(&step_label(step.status))) },
+            escape_html(&step.tool_description),
+            escape_html(&args),
+            escape_html(&commands),
+        ));
+        if let Some(why) = &step.reasoning {
+            body.push_str(&format!("<div class=\"supplied\"><p class=\"label\">{}</p><p class=\"pre-line\">{}</p></div>", escape_html(plan.supplied_label), escape_html(why)));
+        }
+        if let Some(e) = &step.error {
+            body.push_str(&format!("<div class=\"msg\">{}</div>", escape_html(&e.message)));
+        }
+        body.push_str("</li>");
+    }
+    body.push_str("</ol>");
+    if plan.title.is_some() || plan.reasoning.is_some() {
+        body.push_str(&format!("<div class=\"supplied\"><p class=\"label\">{}</p>", escape_html(plan.supplied_label)));
+        if let Some(title) = &plan.title {
+            body.push_str(&format!("<p><strong>{}</strong></p>", escape_html(title)));
+        }
+        if let Some(why) = &plan.reasoning {
+            body.push_str(&format!("<p class=\"pre-line\">{}</p>", escape_html(why)));
+        }
+        body.push_str("</div>");
+    }
+    for flag in &plan.flags {
+        body.push_str(&format!("<div class=\"msg\">{}</div>", escape_html(flag)));
+    }
+    if let Some(reason) = &plan.stop_reason {
+        body.push_str(&format!("<div class=\"msg\">{}</div>", escape_html(reason)));
+    }
+    match (ticket.status, csrf) {
+        (TicketStatus::PendingApproval, Some(csrf)) => body.push_str(&format!(
+            "<form method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+<input type=\"hidden\" name=\"plan_hash\" value=\"{}\">\
+<label for=\"pin\">Your AegisWin PIN</label><input id=\"pin\" name=\"pin\" type=\"password\" required autofocus>\
+<label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
+<p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run {} step{}</button>\
+<button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button></div></form>",
+            escape_html(csrf),
+            escape_html(&plan.hash),
+            ticket.attempts_remaining,
+            ticket.steps.len(),
+            if ticket.steps.len() == 1 { "" } else { "s" },
+        )),
+        (TicketStatus::Queued, csrf) => {
+            body.push_str("<p>Approved. Another change is running first; the plan starts when it finishes.</p>");
+            body.push_str(&cancel_form(csrf, "Cancel before it starts"));
+        }
+        (TicketStatus::Running, csrf) => {
+            body.push_str("<p>Approved and running. You can close this page; reload it to see each step.</p>");
+            body.push_str(&cancel_form(csrf, "Stop after this step"));
+        }
+        _ => body.push_str("<p>This plan is closed. You can close this page.</p>"),
+    }
+    body
+}
+
+fn step_label(status: StepStatus) -> String {
+    serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
 }
 
 fn status_label(status: TicketStatus) -> String {
@@ -504,10 +698,15 @@ async fn portal_get(State(state): State<AppState>, Path(id): Path<String>) -> Re
 #[derive(Deserialize)]
 struct PortalForm {
     csrf: String,
+    /// Not sent by the cancel form.
+    #[serde(default)]
     pin: String,
     decision: String,
     #[serde(default)]
     comment: Option<String>,
+    /// Sent by a plan's form; the engine checks it in constant time.
+    #[serde(default)]
+    plan_hash: Option<String>,
 }
 
 async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form(form): Form<PortalForm>) -> Response {
@@ -521,9 +720,10 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
     let approve = match form.decision.as_str() {
         "approve" => true,
         "decline" => false,
+        "cancel" => return portal_cancel(&state, &id),
         _ => return page(StatusCode::BAD_REQUEST, "<h1>Choose approve or decline</h1>"),
     };
-    let result = state.engine.decide_ticket(&id, approve, pin.to_string(), form.comment, "browser").await;
+    let result = state.engine.decide(&id, approve, pin.to_string(), form.comment, "browser", form.plan_hash.as_deref()).await;
     let ticket = state.engine.ticket(&id);
     let csrf = state.engine.ticket_csrf(&id);
     match (result, ticket) {
@@ -532,9 +732,11 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
                 TicketStatus::Declined => "Declined. The agent has been told.",
                 TicketStatus::ExecutionFailed => "Approved, but the action could not start. The agent can see the error.",
                 TicketStatus::Queued => "Approved. It runs after the change ahead of it finishes.",
+                _ if view.plan.is_some() => "Approved. The plan is running.",
                 _ => "Approved. The action is running.",
             };
-            page(StatusCode::OK, &render_ticket(&view, None, Some((text, true))))
+            let csrf = state.engine.ticket_csrf(&id);
+            page(StatusCode::OK, &render_ticket(&view, csrf.as_deref(), Some((text, true))))
         }
         (Err(e), Some(ticket)) => {
             let status = match e.code {
@@ -548,6 +750,21 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
             page(status, &render_ticket(&ticket, csrf.as_deref(), Some((&e.message, false))))
         }
         (Err(e), None) => page(StatusCode::NOT_FOUND, &format!("<h1>No such request</h1><p>{}</p>", escape_html(&e.message))),
+    }
+}
+
+/// The cancel button: the CSRF token has already been checked.
+fn portal_cancel(state: &AppState, id: &str) -> Response {
+    let csrf = state.engine.ticket_csrf(id);
+    match state.engine.cancel_ticket(id) {
+        Ok(view) => {
+            let text = if view.status == TicketStatus::Cancelled { "Cancelled. Nothing more will run." } else { "Stopping after the step that is running now." };
+            page(StatusCode::OK, &render_ticket(&view, csrf.as_deref(), Some((text, true))))
+        }
+        Err(e) => match state.engine.ticket(id) {
+            Some(ticket) => page(StatusCode::CONFLICT, &render_ticket(&ticket, csrf.as_deref(), Some((&e.message, false)))),
+            None => page(StatusCode::NOT_FOUND, "<h1>No such request</h1>"),
+        },
     }
 }
 
@@ -605,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_request_shows_no_form_and_says_it_waits() {
+    fn a_queued_request_offers_only_cancel_and_says_it_waits() {
         let ticket = TicketView {
             ticket_id: "0".repeat(32),
             plugin_id: "windows-health".into(),
@@ -628,7 +845,10 @@ mod tests {
         };
         let html = render_ticket(&ticket, Some("csrf-token"), None);
         assert!(html.contains("Another change is running first"), "{html}");
-        assert!(!html.contains("<form") && !html.contains("csrf-token"), "a decided request offers no form");
+        assert!(!html.contains("name=\"pin\"") && !html.contains("value=\"approve\""), "a decided request cannot be decided again");
+        assert!(html.contains("value=\"cancel\"") && html.contains("Cancel before it starts"), "{html}");
+        let closed = render_ticket(&TicketView { status: TicketStatus::Approved, ..ticket }, Some("csrf-token"), None);
+        assert!(!closed.contains("<form") && !closed.contains("csrf-token"), "a finished request offers no form");
     }
 
     #[test]

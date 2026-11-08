@@ -86,7 +86,30 @@ flowchart TD
 ```
 
 ### 2.3 Long-Running Approved Tools (`sfc /scannow`)
-An approved ticket moves to `running` and the tool runs on a background task, so the approval page and the app return at once. The agent polls `aegis__check_ticket` until the status is final: `approved` (with the result), `execution_failed`, `declined`, `locked_out`, or `expired`. There is no progress percentage; `sfc /scannow` reports only its final result.
+An approved ticket moves to `running` (or `queued` while another change runs) and the tool runs on a background task, so the approval page and the app return at once. The agent polls `aegis__check_ticket` until the status is final: `approved` (with the result), `execution_failed`, `declined`, `locked_out`, `expired`, or `cancelled`. There is no progress percentage; `sfc /scannow` reports only its final result.
+
+#### Action plans ([ADR 0003](adr/0003-action-plans.md))
+
+```mermaid
+sequenceDiagram
+    participant Agent as External AI Agent
+    participant MCP as AegisWin MCP Server
+    participant Engine as Engine (plan + executor)
+    participant Portal as Approval page
+    participant User as Owner
+
+    Agent->>MCP: tools/call "aegis__propose_plan" { title, reasoning, steps[1..5] }
+    MCP->>Engine: Check every step (planEligible, schema + defaults, plugin, component, admin), dry-run each
+    Engine-->>Agent: { status: "pending_approval", ticketId, approvalUrl, plan: { shortHash, ... }, steps: [{ commands }] }
+    User->>Portal: Opens approvalUrl: summary, every step, arguments, commands, labelled supplied text, fingerprint
+    User->>Portal: POST { csrf, plan_hash, pin, decision: "approve" }
+    Portal->>Engine: Hash matches (constant time) → PIN → re-check every step → queue
+    loop Each step, holding the one change slot
+        Engine->>Engine: Stop if cancelled or auto-lock is due; re-check; run; stop at the first failure
+    end
+    Agent->>MCP: tools/call "aegis__check_ticket" → steps[].status (succeeded / failed / skipped / cancelled)
+    Agent->>MCP: tools/call "aegis__cancel_ticket" (optional) → stops before the next step
+```
 
 ### 2.4 Process & Trust Layout
 

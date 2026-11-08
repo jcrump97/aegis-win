@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phase 3 on `feat/plans-mcp` (the engine so far); see "As built" in §10. Phases 4-5 are not.
+- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phase 3 on `feat/plans-mcp` (the engine and MCP so far; the app's Approvals tab is next); see "As built" in §10. Phases 4-5 are not.
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 
@@ -213,6 +213,8 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 - **The approval must name the plan hash.** A missing or wrong hash is refused with `CONFLICT` before the PIN is checked, so a stale page costs no attempt. The single-ticket call (`decide_ticket`) passes no hash, so it cannot approve a plan.
 - **A step's tool that is `appOnly` is reported to an agent as unknown**, as a direct call would be. (Phase 2 already makes such tools ineligible.)
 - **Cancel** of a running single-tool request is refused with `CONFLICT`: it is one step, already running, and stopping a repair halfway is unsafe.
+- **MCP** (`aegis-core::mcp`): `aegis__propose_plan` is listed only while some exposed tool is eligible, and its schema names exactly those tools. `aegis__cancel_ticket` is always listed. Any agent holding the MCP token can cancel any request it knows the id of, the same reach `aegis__check_ticket` has; cancel only does less.
+- **Browser page**: the plan's form carries the full hash in a hidden `plan_hash` field. While a plan runs, the page offers "Stop after this step"; while a request is queued, "Cancel before it starts". Both are PIN-free forms that still need the CSRF token and pass the Origin check. A pending request has no cancel button on the page, so the owner is not offered two ways to say no; Decline needs the PIN, as before.
 - **Found while building this: two approvals of the same request could both run it.** The decision re-read the ticket only before the PIN check, so two correct-PIN approvals arriving together (the app and the browser page at once) could both start it. The decision now re-checks that the ticket is still pending at the moment it changes it, so exactly one wins. The race predates this ADR.
 
 ## 11. Open questions
