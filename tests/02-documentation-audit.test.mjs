@@ -13,6 +13,7 @@ const REQUIRED_DOCS = [
   'documentation/adr/0001-rust-core.md',
   'documentation/adr/0002-ai-monitor-creator.md',
   'documentation/adr/0003-action-plans.md',
+  'documentation/adr/0004-approval-channel-and-key-hardening.md',
 ];
 
 test('Documentation Audit: all required agent and architecture docs exist and are non-empty', () => {

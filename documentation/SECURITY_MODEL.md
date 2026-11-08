@@ -5,6 +5,7 @@
 2. **Off-LAN LLM Providers**: Cloud LLM endpoints receive diagnostic snippets only after the user explicitly marks the calling plugin as trusted for Off-LAN transmission.
 3. **LLM output**: model replies are untrusted input. They can propose a monitor rule or ask the owner a question, never act (§8).
 4. **Antivirus & EDR Compatibility**: Single-binary compilation (`asInvoker`) avoids process-injection patterns and unsigned multi-binary drops.
+5. **Same-user code is outside the boundary** ([ADR 0004 §3.1](adr/0004-approval-channel-and-key-hardening.md)): the approval gate protects against agents that reach AegisWin only through MCP. Code running as your Windows user can read the data folder, read AegisWin's memory while it is unlocked, replace or plant files next to the exe, and send keystrokes to its window. Run agents that can execute commands under a separate Windows account or in a sandbox if they must not be able to do these things.
 
 ## 2. Cryptographic & Storage Standards
 - **Key derivation**: the PIN (6-128 characters) goes through Argon2id (64 MiB, 3 passes) with a 16-byte random salt. No PIN hash or verifier is stored; a wrong PIN shows up as an AES-GCM authentication failure. The KDF parameters and salt are bound to the ciphertext as associated data.
@@ -86,3 +87,12 @@ AegisWin always starts `asInvoker`. Tools that need administrator rights report 
 - **Another copy's shortcut is never replaced silently.** A shortcut with the same name that starts another exe (a moved folder, a new drive letter, another copy) or cannot be read is shown with *Update to this copy* (PIN) and *Remove*; enabling over it returns a conflict, and the app asks before replacing it.
 - **Removal.** Turning it off deletes the file. Once the last monitor is deleted (in the app or by an approved agent request), the 5-second shell check deletes it within seconds, but only if it starts this copy. A copy whose folder was deleted cannot clean up after itself; Settings says how to remove it in Task Manager.
 - **What a sign-in launch does.** `--background` opens no window and resumes only what the runtime files declare, locked (§10); it exits at once if nothing resumes. Nothing it does needs or reveals the PIN.
+
+## 12. Known Gaps ([ADR 0004](adr/0004-approval-channel-and-key-hardening.md), proposed)
+Found by the independent reviews of 2026-11-08. They are true of the current code until ADR 0004's phases land:
+- **LAN mode is plain HTTP.** On the LAN address, the bearer token, every request, and any PIN typed into an approval page cross the network unencrypted. Use LAN mode only on a network you trust.
+- **The approval page asks for the vault PIN, and the agent supplies its link.** A look-alike page from an agent, or anyone sniffing the LAN, can capture the PIN, and the PIN is the vault key.
+- **A 6-character PIN can be guessed offline** from a copied data folder in hours.
+- **The approval record is not tamper-evident.** Records can be forged by anyone with the stream's public key, and files can be deleted or cut short without detection. Writes are best effort (a failed write does not stop a change), and a flood of requests can push older records out through the size limit.
+- **The plan fingerprint (8 hex characters) is a label, not proof.** An agent can make two different plans with the same fingerprint. Compare the steps, not the fingerprint.
+- **The keyword checks are heuristics**: the unsafe-question filter and the reasoning-consistency notice catch common cases, not every one.
