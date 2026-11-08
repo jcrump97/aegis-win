@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use aegis_core::engine::{Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
-use aegis_core::registry::{ExitReason, GatePolicy, Plugin, Registry};
+use aegis_core::registry::{ExitReason, GatePolicy, Launch, Plugin, Registry};
 use aegis_core::plan::PlanOrigin;
 use aegis_core::tickets::TicketView;
 use aegis_core::{AegisError, ErrorCode};
@@ -93,7 +93,9 @@ fn quit_app(app: &AppHandle) {
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open AegisWin", true, None::<&str>)?;
     let lock = MenuItem::with_id(app, "lock", "Lock", true, None::<&str>)?;
-    let pause = MenuItem::with_id(app, "pause", pause_label(false), true, None::<&str>)?;
+    // A pause kept in the runtime file carries over a restart.
+    let paused = app.state::<Arc<Engine>>().monitoring_paused();
+    let pause = MenuItem::with_id(app, "pause", pause_label(paused), true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let pause_item = pause.clone();
     let mut tray = TrayIconBuilder::with_id("main")
@@ -243,6 +245,13 @@ async fn rewrite_runtime(engine: EngineState<'_>, plugin_id: String) -> Cmd<()> 
     engine.rewrite_runtime_from_vault(&plugin_id)
 }
 
+/// Closes the banner about the gap before a resume at launch.
+#[tauri::command]
+async fn dismiss_resume_notice(engine: EngineState<'_>, plugin_id: String) -> Cmd<()> {
+    engine.dismiss_resume_notice(&plugin_id);
+    Ok(())
+}
+
 #[tauri::command]
 async fn run_tool(engine: EngineState<'_>, plugin_id: String, tool_id: String, args: Value, pin: Option<String>) -> Cmd<RunOutcome> {
     engine.run_tool(Origin::Ui { pin }, &plugin_id, &tool_id, args).await
@@ -342,8 +351,16 @@ fn main() {
         // The check never stops AegisWin from starting.
         Err(_) => None,
     };
+    // `--background` is the Startup shortcut (ADR 0002 §6): no window, tray only.
+    let background = std::env::args().skip(1).any(|a| a == "--background");
     let data_dir = data_dir();
     let engine = Engine::new(&data_dir, registry(), EngineOptions::default());
+    // Every launch resumes running monitors in *locked, monitoring*.
+    let resumed = engine.resume_at_launch(if background { Launch::Autostart } else { Launch::Manual });
+    if background && !resumed {
+        // Nothing to monitor: a sign-in launch stays out of the way.
+        return;
+    }
     let app = tauri::Builder::default()
         .manage(engine)
         .manage(InstanceClaim(Mutex::new(claim)))
@@ -368,6 +385,7 @@ fn main() {
                 .title(title)
                 .inner_size(1180.0, 800.0)
                 .min_inner_size(900.0, 620.0)
+                .visible(!background)
                 // Keep WebView2's cache and storage in ./data too, so the app stays portable.
                 .data_directory(data_dir.join("webview"))
                 .build()?;
@@ -390,6 +408,7 @@ fn main() {
             grant_llm_trust,
             revoke_llm_trust,
             rewrite_runtime,
+            dismiss_resume_notice,
             run_tool,
             list_tickets,
             decide_ticket,

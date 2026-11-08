@@ -75,12 +75,17 @@ const finished = { ...base, ticketId: 'one-3', pluginId: 'windows-health', toolI
 
 const calls = [];
 let reviews = [];
+let notices = [];
 let app = null;
 function backend(cmd, args) {
   calls.push(cmd);
   switch (cmd) {
     case 'status':
-      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews };
+      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews, resumeNotices: notices };
+    case 'dismiss_resume_notice':
+      assert.equal(args.pluginId, 'usage-monitor');
+      notices = [];
+      return null;
     case 'rewrite_runtime':
       assert.equal(args.pluginId, 'usage-monitor');
       reviews = [];
@@ -194,4 +199,22 @@ test('a runtime file set aside at unlock shows a banner until the owner rewrites
   await settle();
   assert.ok(calls.includes('rewrite_runtime'));
   assert.equal(banner().textContent, '', 'the banner goes once the file is rewritten');
+});
+
+test('after a resume at launch, a banner shows the gap until dismissed', async () => {
+  const { document, intervals } = app;
+  const banner = () => document.querySelector('main').childNodes[0];
+  notices = [{ pluginId: 'usage-monitor', from: '2026-11-07T22:00:00Z', to: '2026-11-08T07:30:00Z', label: 'Not monitoring: AegisWin was closed.' }];
+  for (const poll of intervals) await poll();
+  await settle();
+  const text = banner().textContent;
+  assert.ok(text.includes('monitors were stopped from') && text.includes('the gap is recorded'), `the banner says when (${text})`);
+  assert.ok(text.includes('AegisWin was closed.'), 'and why');
+
+  const dismiss = document.querySelectorAll('button').find((b) => b.textContent === 'Dismiss');
+  assert.ok(dismiss, 'the banner can be dismissed');
+  dismiss.click();
+  await settle();
+  assert.ok(calls.includes('dismiss_resume_notice'));
+  assert.equal(banner().textContent, '', 'the banner goes once dismissed');
 });

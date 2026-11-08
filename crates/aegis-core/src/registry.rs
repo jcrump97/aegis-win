@@ -185,11 +185,15 @@ pub struct UnlockContext {
     /// This plugin's own encrypted history stream. Always set by the engine.
     /// Appending keeps working after lock; reading does not.
     pub history: Option<crate::history_service::HistoryHandle>,
+    /// Monitoring is paused from the tray (also from a pause kept in the
+    /// runtime file across a restart).
+    pub paused: bool,
 }
 
-/// Handed to [`Plugin::run_locked`]. Everything in it comes from the vault
-/// (what the plugin declared with `HistoryHandle::set_runtime`), never from
-/// the runtime file on disk.
+/// Handed to [`Plugin::run_locked`]. On a lock everything in it comes from
+/// the vault (what the plugin declared with `HistoryHandle::set_runtime`).
+/// At launch (`launch` is set) it comes from the runtime file on disk,
+/// which is checked against the vault only at the next unlock (ADR 0002 §6).
 #[derive(Clone)]
 pub struct LockedContext {
     /// The plugin's own runtime section, as it last declared it.
@@ -198,6 +202,40 @@ pub struct LockedContext {
     pub history: crate::history_service::HistoryHandle,
     /// Monitoring is paused from the tray.
     pub paused: bool,
+    /// Set when AegisWin resumes this work at launch, not at a lock.
+    pub launch: Option<Launch>,
+}
+
+/// How AegisWin was started, for a plugin's session record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Launch {
+    /// The owner started it.
+    #[default]
+    Manual,
+    /// The Startup shortcut started it at sign-in (`--background`).
+    Autostart,
+}
+
+impl Launch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Launch::Manual => "manual",
+            Launch::Autostart => "autostart",
+        }
+    }
+}
+
+/// Shown once after the first unlock that follows a resume at launch: when
+/// monitoring was not running before this launch (ADR 0002 §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeNotice {
+    /// When monitoring stopped (RFC 3339), if the history still has it.
+    pub from: Option<String>,
+    /// When this launch started monitoring again (RFC 3339).
+    pub to: String,
+    /// Why it was not running, in a plain sentence.
+    pub label: String,
 }
 
 /// Why AegisWin is exiting, for a plugin's clean-stop record.
@@ -256,6 +294,13 @@ pub trait Plugin: Send + Sync {
     /// AegisWin is exiting: write a clean-stop record. Called before the
     /// final `on_lock`, whether the vault is locked or not.
     fn on_exit(&self, _reason: ExitReason) {}
+
+    /// Called once after `on_unlock` at each unlock. A plugin that resumed at
+    /// launch says when it was not running before; the engine shows it in
+    /// the app until dismissed. Never sent over MCP.
+    fn resume_notice(&self) -> Option<ResumeNotice> {
+        None
+    }
 }
 
 pub struct Registry {

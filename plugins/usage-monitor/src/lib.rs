@@ -20,7 +20,7 @@ use aegis_core::history_service::HistoryHandle;
 use aegis_core::llm::LlmHandle;
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
-use aegis_core::registry::{CallReview, ExitReason, LockedContext, Plugin, PluginManifest, ToolContext, UnlockContext};
+use aegis_core::registry::{CallReview, ExitReason, Launch, LockedContext, Plugin, PluginManifest, ResumeNotice, ToolContext, UnlockContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, NaiveTime, Utc};
@@ -154,6 +154,10 @@ struct Telemetry {
     paused: bool,
     /// A `session_start` was written and its `session_stop` not yet.
     session_open: bool,
+    /// How AegisWin was started, for the next `session_start`.
+    launch: Launch,
+    /// Resumed at launch: the first unlock reports the gap before it.
+    resumed_at_launch: bool,
 }
 
 impl Telemetry {
@@ -261,10 +265,13 @@ fn write_history(history: &HistoryHandle, records: Vec<Value>) {
     }
 }
 
-fn session_start() -> Value {
+/// How far back the gap before a resume is looked for.
+const RESUME_NOTICE_DAYS: i64 = 14;
+
+fn session_start(launch: Launch) -> Value {
     let boot = DateTime::<Utc>::from_timestamp(i64::try_from(System::boot_time()).unwrap_or(0), 0)
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    json!({ "kind": "session_start", "launch": "manual", "bootTime": boot, "version": env!("CARGO_PKG_VERSION") })
+    json!({ "kind": "session_start", "launch": launch.as_str(), "bootTime": boot, "version": env!("CARGO_PKG_VERSION") })
 }
 
 fn push_capped<T>(buf: &mut VecDeque<T>, item: T) {
@@ -415,12 +422,16 @@ impl UsageMonitorPlugin {
         let flag = Arc::clone(&stop);
         let opened = {
             let mut t = self.telemetry.lock().unwrap();
-            let open = t.history.is_some() && !t.session_open;
-            t.session_open |= open;
-            open.then(|| t.history.clone()).flatten()
+            match t.history.clone() {
+                Some(history) if !t.session_open => {
+                    t.session_open = true;
+                    Some((history, t.launch))
+                }
+                _ => None,
+            }
         };
-        if let Some(history) = opened {
-            write_history(&history, vec![session_start()]);
+        if let Some((history, launch)) = opened {
+            write_history(&history, vec![session_start(launch)]);
         }
         let thread = std::thread::Builder::new()
             .name("usage-monitor-sampler".into())
@@ -995,8 +1006,26 @@ impl Plugin for UsageMonitorPlugin {
             t.history = ctx.history.clone();
             // A sampler still running from the locked state carries on, now unlocked.
             t.locked = false;
+            t.paused = ctx.paused;
         }
         self.load_monitors(ctx.store.as_ref(), enabled_components);
+    }
+
+    /// After a resume at launch, the first unlock reports when monitoring
+    /// was not running before it, read from the last two weeks of history
+    /// (ADR 0002 §6), so a large history does not hold up the unlock.
+    fn resume_notice(&self) -> Option<ResumeNotice> {
+        let history = {
+            let mut t = self.telemetry.lock().unwrap();
+            if !std::mem::take(&mut t.resumed_at_launch) {
+                return None;
+            }
+            t.history.clone()?
+        };
+        let since = (Utc::now() - chrono::Duration::days(RESUME_NOTICE_DAYS)).date_naive();
+        let read = history.read(Some(since)).ok()?;
+        let gap = timeline::gap_before_last_start(&timeline::ordered(&read.records))?;
+        Some(ResumeNotice { from: Some(gap.from), to: gap.to?, label: gap.label })
     }
 
     fn background_active(&self) -> bool {
@@ -1029,6 +1058,10 @@ impl Plugin for UsageMonitorPlugin {
             t.history = Some(ctx.history.clone());
             t.locked = true;
             t.paused = ctx.paused;
+            if let Some(launch) = ctx.launch {
+                t.launch = launch;
+                t.resumed_at_launch = true;
+            }
             // Keep the running evaluators (and their cooldowns) when they are the declared ones.
             let ids = |rt: &MonitorRuntime| rt.active.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
             if ids(&t.monitors) != ids(&declared) {

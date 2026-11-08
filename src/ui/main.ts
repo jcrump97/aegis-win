@@ -325,11 +325,33 @@ function updateShellBadges(): void {
 /** Runtime files the unlock check set aside (ADR 0002 §5): nothing resumes from them until the owner rewrites them. */
 function updateRuntimeReviews(host: HTMLElement): void {
   const reviews = status.runtimeReviews ?? [];
-  const signature = reviews.map((r) => `${r.pluginId}:${r.differences.join(',')}`).join('|');
+  const notices = status.resumeNotices ?? [];
+  const signature = [
+    ...reviews.map((r) => `${r.pluginId}:${r.differences.join(',')}`),
+    ...notices.map((n) => `gap:${n.pluginId}:${n.from ?? ''}:${n.to}`),
+  ].join('|');
   if (signature === reviewSignature) return;
   reviewSignature = signature;
   replace(
     host,
+    ...notices.map((n) => {
+      const name = plugins.find((p) => p.id === n.pluginId)?.name ?? n.pluginId;
+      const when = (iso: string): string => new Date(iso).toLocaleString();
+      const span = n.from ? `from ${when(n.from)} to ${when(n.to)}` : `until ${when(n.to)}`;
+      const dismiss = h('button', {}, 'Dismiss');
+      dismiss.addEventListener('click', async () => {
+        await busy(dismiss, () => api.dismissResumeNotice(n.pluginId)).catch(() => undefined);
+        status = await api.status();
+        updateShellBadges();
+      });
+      return h(
+        'div',
+        { class: 'notice', role: 'status' },
+        h('p', {}, h('strong', {}, `${name}: monitors were stopped ${span}; the gap is recorded.`)),
+        h('p', { class: 'hint' }, `${n.label} AegisWin resumed them when it started. The history shows this gap with any Windows evidence.`),
+        h('div', { class: 'row' }, dismiss),
+      );
+    }),
     ...reviews.map((r) => {
       const name = plugins.find((p) => p.id === r.pluginId)?.name ?? r.pluginId;
       const message = h('div');

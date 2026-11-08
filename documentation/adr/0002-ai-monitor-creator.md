@@ -1,6 +1,6 @@
 # ADR 0002: AI-assisted monitor creator, background monitoring, and encrypted monitor history
 
-- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phase 3 is implemented on `feat/lifecycle` except the *locked, monitoring* state and tray *Pause monitoring*, which moved to Phase 4 (§4). Phase 4 is implemented on `feat/encrypted-history`. Phase 5 is not.
+- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phase 3 is implemented on `feat/lifecycle` except the *locked, monitoring* state and tray *Pause monitoring*, which moved to Phase 4 (§4). Phase 4 is implemented on `feat/encrypted-history`. Phase 5 is on `feat/resume-startup`: resume at launch and `--background` first, then the Startup shortcut.
 - **Date**: 2026-11-07
 - **Amends**: [ADR 0001](0001-rust-core.md) rejected-option row 13 (telemetry on disk), [GUIDING_PRINCIPLES §2](../GUIDING_PRINCIPLES.md)
 - **Plugin**: `usage-monitor` (the encrypted history writer in §5 is a shared `aegis-core` service)
@@ -234,7 +234,7 @@ Rejected alternatives:
 - **Runtime file path.** The history service is shared, so the runtime file is per plugin: `./data/runtime/<plugin>.json` (today only `usage-monitor.json`) rather than `./data/monitor/runtime.json`. It holds the format version, stream, key id, public key, retention, `paused`, and a plugin-defined section (for `usage-monitor`: its active rules and enabled components).
 - **Keys** are created in the vault the first time a stream is written while unlocked.
 - **Tamper check outcome.** A mismatching, unreadable, or unexpected runtime file is renamed to `<plugin>.rejected.json` (so it is never resumed from, also after a restart) and listed for the owner, who rewrites it from the vault in the app. Until then, plugin changes update the vault only. `paused` is not compared, because the tray sets it without the PIN. A missing file is rewritten from the vault without a warning: it cannot redirect anything.
-- **Records.** No `crash` record is written: crash and hang events stay in the Application log, and gaps take their evidence from the System log when history is read. `session_stop` with reason "monitoring stopped" also covers a change of monitoring settings, which restarts the sampler. The runtime file lists only running (not paused) monitors and is removed when nothing runs. Until Phase 5, `session_start` always says `manual`.
+- **Records.** No `crash` record is written: crash and hang events stay in the Application log, and gaps take their evidence from the System log when history is read. `session_stop` with reason "monitoring stopped" also covers a change of monitoring settings, which restarts the sampler. The runtime file lists only running (not paused) monitors and is removed when nothing runs. `session_start` says `autostart` for a `--background` launch and `manual` otherwise (§6).
 - **In the app.** The History card reads, limits, and purges the stream (each needs the PIN). A set-aside runtime file shows a warning above every tab with a *Rewrite it from my saved settings* button, an app-only command that never reaches MCP.
 
 ## 6. Restart and resume
@@ -247,7 +247,15 @@ Rejected alternatives:
   - **Wrong or dead target**: on each launch, if the shortcut exists but points to a different exe (the stick moved, a new drive letter, another copy), Settings shows **Update** or **Remove**. A shortcut left behind by an install that has since been deleted cannot be detected by that install, so the setting's help text says how to remove it via Task Manager's Startup tab.
   - **If a shortcut from another copy exists**, enabling asks before replacing it.
   - **`--background` launch**: single-instance check, no window, tray only, *locked, monitoring*.
-- **Rejected**: Task Scheduler and the HKCU Run key. Both use the registry and are well-known malware persistence techniques that antivirus watches.
+- **Rejected**: Task Scheduler and the HKCU Run key.
+
+**As built in Phase 5, resume** (2026-11-08, during implementation):
+
+- **`Engine::resume_at_launch(Launch)`** runs once, before the window opens. For each runtime file it calls `run_locked` with the file's section and `launch` set, and takes the stream's public key and retention from the file. Skipped: no vault yet, a file set aside for review (`.rejected.json` exists), a plugin not in this build, and a file with a wrong version, a mismatched stream, an invalid key, or retention out of range. The plugin validates the section again (`MonitorRuntime::from_runtime`), so a rule that needs a component the file does not list does not run.
+- **Unverified until unlock.** While locked the file cannot be checked against the vault, so a changed file runs until the next unlock (the §5 threat model: detected, not prevented). At unlock the tamper check sets it aside and the plugin reloads from the vault; work resumed for a plugin that is not installed is stopped. The history key switches to the vault's, closing the file written under the file's key.
+- **Pause.** A `paused` flag in any resumed file restores the tray pause (label and tooltip) at launch; plugins get it in `UnlockContext.paused` too.
+- **Gap banner.** `Plugin::resume_notice` is asked once after each unlock. After a resume at launch, `usage-monitor` reads the last 14 days of its history and returns the stop (or unexpected end) just before this launch's `session_start`. The app shows "monitors were stopped from X to Y; the gap is recorded" until dismissed (`dismiss_resume_notice`, app only; `Status.resumeNotices`, empty while locked). A gap older than 14 days is not shown in the banner; the history view still has it.
+- **`--background`** launch: no window (the hidden window opens from the tray or a second launch), `session_start` says `autostart`. If nothing resumes, the process exits at once, so a sign-in launch with nothing to monitor leaves no tray icon. A later manual launch while it runs shows its window. Both use the registry and are well-known malware persistence techniques that antivirus watches.
 
 ## 7. Gap recording
 

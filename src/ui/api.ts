@@ -24,6 +24,18 @@ export interface Status {
   change: { running: string | null; queued: number };
   /** Runtime files set aside at unlock because they did not match the vault. */
   runtimeReviews: RuntimeReview[];
+  /** Shown after unlock: monitoring was not running before this launch resumed it. */
+  resumeNotices: ResumeNotice[];
+}
+
+export interface ResumeNotice {
+  pluginId: string;
+  /** When monitoring stopped (RFC 3339), if the history still has it. */
+  from: string | null;
+  /** When this launch started monitoring again (RFC 3339). */
+  to: string;
+  /** Why it was not running, in a plain sentence. */
+  label: string;
 }
 
 export interface RuntimeReview {
@@ -245,6 +257,7 @@ export const api = {
   grantLlmTrust: (pluginId: string, pin: string) => call<void>('grant_llm_trust', { pluginId, pin }),
   revokeLlmTrust: (pluginId: string) => call<void>('revoke_llm_trust', { pluginId }),
   rewriteRuntime: (pluginId: string) => call<void>('rewrite_runtime', { pluginId }),
+  dismissResumeNotice: (pluginId: string) => call<void>('dismiss_resume_notice', { pluginId }),
   runTool: (pluginId: string, toolId: string, args: unknown, pin: string | null) =>
     call<RunOutcome>('run_tool', { pluginId, toolId, args, pin }),
   listTickets: () => call<TicketView[]>('list_tickets'),

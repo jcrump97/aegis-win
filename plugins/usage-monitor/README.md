@@ -64,6 +64,8 @@ There are no crash records: crashes and hangs come from the Application log in t
 - **Nothing runs locked** when no monitor runs (a lock then ends the session with "monitoring stopped") or when the runtime file is waiting for your review.
 - **Pause from the tray** (Pause monitoring / Resume monitoring, no PIN) stops the sampler and records `paused`, then `resumed`; the history shows the time in between as paused by you. The pause also holds across a lock and an unlock.
 - **Stop reasons:** quitting (tray Quit, closing the window, restarting as administrator) records `quit`; Windows ending the session records `shutdown`.
+- **At launch** AegisWin resumes the monitors listed in the runtime file, locked, before you unlock (`session_start` says `manual`, or `autostart` for the Startup shortcut's `--background`). The rules are validated again. The file is checked against your saved settings at the next unlock; if it was changed, it is set aside and the monitors run from your settings instead. A tray pause kept in the file carries over.
+- **After unlock** a banner says when monitors were stopped before this launch and why (from the last 14 days of history), until you dismiss it.
 
 ## Privacy
 

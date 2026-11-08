@@ -157,6 +157,15 @@ pub fn gaps(records: &[(DateTime<Utc>, &Value)]) -> Vec<Gap> {
     out
 }
 
+/// The stop (or unexpected end) just before the latest `session_start`:
+/// what a resume at launch reports after unlock. `None` for the first
+/// session in the history.
+pub fn gap_before_last_start(records: &[(DateTime<Utc>, &Value)]) -> Option<Gap> {
+    let (start, _) = records.iter().rev().find(|(_, r)| kind(r) == "session_start")?;
+    let to = stamp(*start);
+    gaps(records).into_iter().rev().find(|g| matches!(g.kind, GapKind::Stopped | GapKind::Unexpected) && g.to.as_deref() == Some(to.as_str()))
+}
+
 /// The System log query that finds evidence for gaps over `days` days.
 pub fn evidence_query(days: u32) -> EventQuery {
     EventQuery {
@@ -259,6 +268,19 @@ mod tests {
 
     fn s(h: u32, m: u32) -> String {
         stamp(t(h, m))
+    }
+
+    #[test]
+    fn the_gap_before_a_resume_is_the_one_ending_at_the_latest_start() {
+        let first = [rec(8, 0, "session_start"), rec(8, 1, "heartbeat")];
+        assert!(gap_before_last_start(&ordered(&first)).is_none(), "the first session has nothing before it");
+
+        let quit = [rec(8, 0, "session_start"), stop(9, 0, STOP_QUIT), rec(10, 0, "session_start"), stop(11, 0, STOP_SHUTDOWN), rec(12, 0, "session_start"), rec(12, 1, "heartbeat")];
+        let gap = gap_before_last_start(&ordered(&quit)).unwrap();
+        assert_eq!((gap.kind, gap.from, gap.to), (GapKind::Stopped, s(11, 0), Some(s(12, 0))));
+
+        let crashed = [rec(8, 0, "session_start"), rec(8, 1, "heartbeat"), rec(9, 0, "session_start")];
+        assert_eq!(gap_before_last_start(&ordered(&crashed)).unwrap().kind, GapKind::Unexpected);
     }
 
     #[test]

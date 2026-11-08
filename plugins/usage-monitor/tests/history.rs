@@ -1,12 +1,12 @@
-//! The monitor's encrypted history and *locked, monitoring* through the
-//! real engine (ADR 0002 §4, §5).
+//! The monitor's encrypted history, *locked, monitoring*, and resume at
+//! launch through the real engine (ADR 0002 §4-§6).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use aegis_core::engine::{Engine, EngineOptions, Origin, RunOutcome};
-use aegis_core::registry::{ExitReason, Plugin, Registry};
+use aegis_core::registry::{ExitReason, Launch, Plugin, Registry};
 use aegis_core::vault::KdfParams;
 use aegis_core::ErrorCode;
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES};
@@ -233,4 +233,120 @@ async fn a_runtime_file_waiting_for_review_does_not_run_while_locked() {
     engine.rewrite_runtime_from_vault(UM).unwrap();
     engine.lock().await;
     assert!(plugin.is_sampling(), "after the rewrite, locking keeps the monitor running");
+}
+
+/// A new launch of AegisWin on the same data folder: a fresh engine and plugin.
+fn relaunch(dir: &tempfile::TempDir) -> (Arc<Engine>, Arc<UsageMonitorPlugin>) {
+    let plugin = Arc::new(UsageMonitorPlugin::default());
+    let registry = Registry::new(vec![Arc::clone(&plugin) as Arc<dyn Plugin>]).unwrap();
+    (Engine::new(dir.path().join("data"), registry, EngineOptions { kdf: KdfParams::INSECURE_TEST, elevated: false }), plugin)
+}
+
+#[tokio::test]
+async fn a_launch_resumes_running_monitors_locked_and_reports_the_gap_after_unlock() {
+    let (engine, _plugin, dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    engine.exit(ExitReason::Quit).await;
+    drop(engine);
+
+    let (engine, plugin) = relaunch(&dir);
+    assert!(engine.resume_at_launch(Launch::Autostart), "the runtime file lists a running monitor");
+    assert!(plugin.is_sampling() && engine.locked_monitoring() && !engine.status().unlocked);
+    assert!(!engine.resume_at_launch(Launch::Manual), "only once per launch");
+
+    engine.unlock(PIN.into()).await.unwrap();
+    assert!(plugin.is_sampling(), "still running after unlock");
+    let status = engine.status();
+    assert!(status.runtime_reviews.is_empty(), "the file matched the vault");
+    assert_eq!(status.resume_notices.len(), 1);
+    let notice = &status.resume_notices[0];
+    assert_eq!(notice.plugin_id, UM);
+    assert!(notice.notice.from.is_some());
+    assert!(notice.notice.label.contains("closed"), "{}", notice.notice.label);
+
+    let view = run(&engine, "read_monitor_history", json!({})).await.unwrap();
+    let starts: Vec<&Value> = view["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "session_start").collect();
+    assert_eq!(starts.last().unwrap()["launch"], "autostart", "this launch came from the Startup shortcut");
+    assert_eq!(starts[0]["launch"], "manual");
+    assert_eq!(reasons(&view).last().unwrap(), "quit");
+
+    engine.dismiss_resume_notice(UM);
+    assert!(engine.status().resume_notices.is_empty());
+    engine.lock().await;
+    engine.unlock(PIN.into()).await.unwrap();
+    assert!(engine.status().resume_notices.is_empty(), "shown once per launch");
+}
+
+#[tokio::test]
+async fn a_launch_keeps_the_tray_pause_and_resumes_nothing_from_a_set_aside_file() {
+    let (engine, _plugin, dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    engine.set_monitoring_paused(true);
+    engine.exit(ExitReason::Quit).await;
+    drop(engine);
+
+    let (engine, plugin) = relaunch(&dir);
+    assert!(engine.resume_at_launch(Launch::Manual));
+    assert!(engine.monitoring_paused() && !plugin.is_sampling() && engine.locked_monitoring(), "paused, but the monitor is declared");
+    engine.unlock(PIN.into()).await.unwrap();
+    assert!(!plugin.is_sampling(), "still paused after unlock");
+    engine.exit(ExitReason::Quit).await;
+    drop(engine);
+
+    // A set-aside copy waits for the owner, also across restarts.
+    std::fs::copy(runtime_file_in(&dir), runtime_file_in(&dir).with_file_name(format!("{UM}.rejected.json"))).unwrap();
+    let (engine, plugin) = relaunch(&dir);
+    assert!(!engine.resume_at_launch(Launch::Autostart), "nothing resumes while a file waits for review");
+    assert!(!plugin.is_sampling() && !engine.locked_monitoring());
+}
+
+#[tokio::test]
+async fn a_changed_runtime_file_runs_until_the_next_unlock_then_the_vault_wins() {
+    let (engine, _plugin, dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    engine.exit(ExitReason::Quit).await;
+    drop(engine);
+
+    // Something edits the file while AegisWin is not running.
+    let path = runtime_file_in(&dir);
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    file["plugin"]["components"] = json!([COMPONENT_CRASHES, "usage-monitor:active-window"]);
+    // A file with a broken key is never resumed from.
+    let mut broken = file.clone();
+    broken["publicKey"] = json!("not a key");
+    std::fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
+    let (engine, _plugin) = relaunch(&dir);
+    assert!(!engine.resume_at_launch(Launch::Manual), "an invalid key is never used");
+    drop(engine);
+
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let (engine, plugin) = relaunch(&dir);
+    assert!(engine.resume_at_launch(Launch::Manual), "locked, the file cannot be checked (detected, not prevented)");
+    engine.unlock(PIN.into()).await.unwrap();
+    let status = engine.status();
+    assert_eq!(status.runtime_reviews.len(), 1, "the unlock sets the changed file aside");
+    assert!(plugin.is_sampling(), "the monitor now runs from the vault");
+    let view = run(&engine, "list_monitors", json!({})).await.unwrap();
+    assert_eq!(view["monitors"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_planted_file_for_an_uninstalled_plugin_stops_at_unlock() {
+    let (engine, _plugin, dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    let saved = std::fs::read(runtime_file_in(&dir)).unwrap();
+    engine.set_installed(BTreeMap::new()).unwrap();
+    engine.exit(ExitReason::Quit).await;
+    drop(engine);
+    std::fs::write(runtime_file_in(&dir), saved).unwrap();
+
+    let (engine, plugin) = relaunch(&dir);
+    assert!(engine.resume_at_launch(Launch::Manual), "locked, AegisWin cannot tell the plugin is not installed");
+    engine.unlock(PIN.into()).await.unwrap();
+    assert!(!plugin.is_sampling() && !engine.background_active(), "the unlock stops it");
+    assert_eq!(engine.status().runtime_reviews.len(), 1, "and sets the file aside");
+}
+
+fn runtime_file_in(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("data").join("runtime").join(format!("{UM}.json"))
 }

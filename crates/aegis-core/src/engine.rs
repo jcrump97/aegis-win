@@ -22,7 +22,7 @@ use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
 use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
-use crate::registry::{self, ExitReason, Gate, GatePolicy, LockedContext, Plugin, Registry, ToolContext, ToolManifest, UnlockContext};
+use crate::registry::{self, ExitReason, Gate, GatePolicy, Launch, LockedContext, Plugin, Registry, ResumeNotice, ToolContext, ToolManifest, UnlockContext};
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
@@ -67,6 +67,9 @@ pub struct Engine {
     runtime_reviews: Mutex<BTreeMap<String, RuntimeReview>>,
     /// Plugins that kept running when the vault locked (*locked, monitoring*).
     locked_work: Mutex<BTreeSet<String>>,
+    /// Shown after unlock until dismissed: monitoring was not running before
+    /// this launch. App only.
+    resume_notices: Mutex<BTreeMap<String, ResumeNotice>>,
     /// Monitoring paused from the tray (no PIN).
     paused: AtomicBool,
 }
@@ -100,6 +103,16 @@ pub struct Status {
     pub change: ChangeView,
     /// Runtime files set aside at unlock, waiting for the owner (empty while locked).
     pub runtime_reviews: Vec<RuntimeReview>,
+    /// Gaps before a resume at launch, by plugin. Empty while locked.
+    pub resume_notices: Vec<ResumeNoticeView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeNoticeView {
+    pub plugin_id: String,
+    #[serde(flatten)]
+    pub notice: ResumeNotice,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,6 +276,7 @@ impl Engine {
             history: HistoryService::new(&data_dir),
             runtime_reviews: Mutex::new(BTreeMap::new()),
             locked_work: Mutex::new(BTreeSet::new()),
+            resume_notices: Mutex::new(BTreeMap::new()),
             paused: AtomicBool::new(false),
             data_dir,
             registry,
@@ -329,6 +343,8 @@ impl Engine {
 
     pub fn status(&self) -> Status {
         let reviews = self.runtime_reviews();
+        let notices: Vec<ResumeNoticeView> =
+            lock(&self.resume_notices).iter().map(|(id, n)| ResumeNoticeView { plugin_id: id.clone(), notice: n.clone() }).collect();
         let guard = lock(&self.vault);
         let state = guard.as_ref().map(|v| &v.state);
         Status {
@@ -342,6 +358,7 @@ impl Engine {
             ui_scale: state.map_or(100, |s| s.ui_scale),
             change: self.executor.view(),
             runtime_reviews: if state.is_some() { reviews } else { Vec::new() },
+            resume_notices: if state.is_some() { notices } else { Vec::new() },
         }
     }
 
@@ -396,13 +413,22 @@ impl Engine {
         let installed: Vec<(String, Vec<String>)> =
             vault.state.installed_plugins.iter().map(|id| (id.clone(), vault.state.components_for(id))).collect();
         *lock(&self.vault) = Some(vault);
-        // Plugins running locked carry on under `on_unlock`.
-        lock(&self.locked_work).clear();
+        // Plugins running locked carry on under `on_unlock`. One resumed at
+        // launch from a file whose plugin is not installed stops here.
+        let was_running = std::mem::take(&mut *lock(&self.locked_work));
+        for id in was_running.iter().filter(|id| !installed.iter().any(|(i, _)| i == *id)) {
+            if let Some(plugin) = self.registry.plugin(id) {
+                plugin.on_lock();
+            }
+        }
         self.load_history_keys();
         self.check_runtime_files();
         for (id, components) in installed {
             if let Some(plugin) = self.registry.plugin(&id) {
                 plugin.on_unlock(&self.unlock_context(&id, components));
+                if let Some(notice) = plugin.resume_notice() {
+                    lock(&self.resume_notices).insert(id, notice);
+                }
             }
         }
         if mcp_enabled {
@@ -469,6 +495,50 @@ impl Engine {
         }
     }
 
+    /// At launch, before any unlock: resumes the work each runtime file
+    /// declares, in *locked, monitoring* (ADR 0002 §6). The file is not
+    /// checked against the vault until the next unlock, which stops work
+    /// from a file that differs. A file set aside for review is never
+    /// resumed from, and neither is one with an invalid key or retention.
+    /// Also restores a tray pause kept in the files. Returns true if
+    /// anything runs.
+    pub fn resume_at_launch(&self, launch: Launch) -> bool {
+        if lock(&self.vault).is_some() || !lock(&self.locked_work).is_empty() || !vault::vault_exists(&self.vault_path()) {
+            return false;
+        }
+        let mut files = Vec::new();
+        for id in self.history.runtime_files() {
+            if self.history.rejected_path(&id).exists() || self.registry.plugin(&id).is_none() {
+                continue;
+            }
+            if let Some(Ok(file)) = self.history.read_runtime(&id) {
+                if file.version == RUNTIME_VERSION && file.stream == id && file.public_key().is_valid() && file.retention.is_valid() {
+                    files.push((id, file));
+                }
+            }
+        }
+        let paused = files.iter().any(|(_, f)| f.paused);
+        self.paused.store(paused, Ordering::SeqCst);
+        let mut running = BTreeSet::new();
+        for (id, file) in files {
+            let Some(plugin) = self.registry.plugin(&id) else { continue };
+            self.history.set_key(&id, file.public_key(), file.retention);
+            let ctx = LockedContext { runtime: file.plugin, history: self.history_for(&id), paused, launch: Some(launch) };
+            if plugin.run_locked(&ctx) {
+                running.insert(id);
+            }
+        }
+        self.history.enforce_retention(chrono::Utc::now());
+        let any = !running.is_empty();
+        *lock(&self.locked_work) = running;
+        any
+    }
+
+    /// The owner closed the banner about the gap before a resume.
+    pub fn dismiss_resume_notice(&self, plugin_id: &str) {
+        lock(&self.resume_notices).remove(plugin_id);
+    }
+
     /// Locks the vault when the owner has been away for the auto-lock
     /// timeout. Returns true when it locked. A change that is running then
     /// finishes first, and nothing new starts meanwhile, so a long queue cannot
@@ -525,7 +595,7 @@ impl Engine {
                     let Some(plugin) = self.registry.plugin(&id) else { continue };
                     match runtime.get(&id).filter(|_| keep_locked_work && !reviews.contains(&id)) {
                         Some(section) => {
-                            if plugin.run_locked(&LockedContext { runtime: section.clone(), history: self.history_for(&id), paused }) {
+                            if plugin.run_locked(&LockedContext { runtime: section.clone(), history: self.history_for(&id), paused, launch: None }) {
                                 running.insert(id);
                             }
                         }
@@ -548,6 +618,7 @@ impl Engine {
         // A fresh file (and HPKE context) for anything written while locked.
         self.history.close_all();
         lock(&self.tickets).clear();
+        lock(&self.resume_notices).clear();
         self.status()
     }
 
@@ -850,7 +921,12 @@ impl Engine {
     }
 
     fn unlock_context(&self, plugin_id: &str, enabled_components: Vec<String>) -> UnlockContext {
-        UnlockContext { enabled_components, store: Some(self.store_for(plugin_id)), history: Some(self.history_for(plugin_id)) }
+        UnlockContext {
+            enabled_components,
+            store: Some(self.store_for(plugin_id)),
+            history: Some(self.history_for(plugin_id)),
+            paused: self.monitoring_paused(),
+        }
     }
 
     fn require_installed(&self, s: &VaultState, plugin_id: &str) -> AegisResult<()> {
