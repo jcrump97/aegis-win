@@ -4,6 +4,7 @@
 pub mod engine;
 pub mod error;
 pub mod executor;
+pub mod history;
 pub mod llm;
 pub mod mcp;
 pub mod os;

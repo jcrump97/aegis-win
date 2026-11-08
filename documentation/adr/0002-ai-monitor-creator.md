@@ -193,7 +193,7 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
 
 **Scheme: write-only public-key encryption.**
 - **Keypair.** A monitor X25519 keypair. The **private key lives only inside the vault** (behind the PIN, zeroized on lock). The **public key** is in `runtime.json` and in the vault.
-- **Construction.** HPKE ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)), base mode, X25519 + HKDF-SHA256 + AES-256-GCM, from an audited crate. No hand-rolled cryptography.
+- **Construction.** HPKE ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)), base mode, X25519 + HKDF-SHA256 + AES-256-GCM, from an existing crate. No hand-rolled cryptography. The crate chosen (open question 4) has **no paid or formal audit**; see [SECURITY_MODEL §10](../SECURITY_MODEL.md).
 - **What this gives.** The locked writer can encrypt but never decrypt, so nothing on disk is readable without the PIN, including by AegisWin itself while locked.
 
 Rejected alternatives:
@@ -282,7 +282,7 @@ Decided on 2026-11-07 by taking the written recommendation, except where marked 
 1. **Hide to tray**: lock immediately, or rely on the 15-minute auto-lock? **Decided: rely on auto-lock**, so an owner who hides the window during an agent session is not interrupted.
 2. **`read_monitor_history` gate over MCP**: `auto` like `capture_diagnostic_snapshot`, or `pin_required` given up to 90 days of foreground history? **Decided: `pin_required`.**
 3. **Event conditions**: poll every 30 seconds with a bookmark through `aegis_core::os::eventlog`, or push through `EvtSubscribe`? **Decided: poll** (reuses existing code, simpler to test).
-4. **HPKE crate**: confirm the chosen crate meets the "audited, no hand-rolled cryptography" bar before Phase 4, or compose `x25519-dalek` + `hkdf` + `aes-gcm` exactly per RFC 9180. **Open: a crypto choice the owner decides before Phase 4 starts.**
+4. **HPKE crate**: confirm the chosen crate meets the "audited, no hand-rolled cryptography" bar before Phase 4, or compose `x25519-dalek` + `hkdf` + `aes-gcm` exactly per RFC 9180. **Decided (2026-11-08, by the owner): the `hpke` crate (rozbb/rust-hpke), pinned to exactly 0.12.0, default features off, X25519 + HKDF-SHA256 + AES-256-GCM only.** It does not meet the "audited" half of the bar: it has no paid or formal audit (Cloudflare published an internal review of version 0.8; there is no NCC Group audit). It was chosen over composing the primitives, which would be hand-rolled HPKE. 0.12.0 shares `aes-gcm` 0.10.3 (past RUSTSEC-2023-0096), `sha2` 0.10 and `rand_core` 0.6 with the vault, so it adds the fewest new crates; later versions move to the next RustCrypto generation. A CFRG known-answer test for this exact suite runs in CI.
 5. **Caps**: confirm 20 monitors and 8 conditions per monitor. **Decided: 20 monitors, 8 conditions per monitor.**
 6. **Windows toast notifications**: stay deferred until there is a way to show them without a registry entry? **Decided: deferred**; v1 uses the tray icon and the in-app list only.
 7. **Shutdown messages**: confirm in Phase 3 whether Tauri delivers them or a hidden message window is needed. **Decided: Tauri delivers them.** The window library (tao 0.37) handles `WM_ENDSESSION` and ends the event loop, which Tauri reports as `RunEvent::Exit`, so no hidden message window is needed. Phase 4 writes its clean-stop record there. Still to confirm by hand with a real sign-out and shutdown.
