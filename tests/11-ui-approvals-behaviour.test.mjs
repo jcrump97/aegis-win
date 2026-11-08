@@ -74,11 +74,17 @@ const queued = { ...base, ticketId: 'one-2', pluginId: 'windows-health', toolId:
 const finished = { ...base, ticketId: 'one-3', pluginId: 'windows-health', toolId: 'sfc_scan', toolName: 'System file check', toolDescription: '', status: 'approved', result: { success: true } };
 
 const calls = [];
+let reviews = [];
+let app = null;
 function backend(cmd, args) {
   calls.push(cmd);
   switch (cmd) {
     case 'status':
-      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 } };
+      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews };
+    case 'rewrite_runtime':
+      assert.equal(args.pluginId, 'usage-monitor');
+      reviews = [];
+      return null;
     case 'list_plugins':
       return ['windows-health', 'usage-monitor'].map((id) => pluginView(manifest(id)));
     case 'get_settings':
@@ -104,7 +110,8 @@ async function settle() {
 
 /** The Approvals tab, flattened: each heading or card in page order, as text. */
 function approvalsSections(document) {
-  const stack = document.querySelector('main').firstChild;
+  // The first child holds runtime-file review banners; the tab comes after it.
+  const stack = document.querySelector('main').childNodes.at(-1);
   return stack.childNodes.map((n) => n.textContent.replace(/\s+/g, ' ').trim());
 }
 
@@ -115,7 +122,8 @@ function nav(document, tab) {
 }
 
 test('a running plan stays under "In progress" after switching to the Monitor tab and back', async () => {
-  const { document } = installFakeDom();
+  app = installFakeDom();
+  const { document } = app;
   window.__TAURI_INTERNALS__ = { invoke: async (cmd, args) => backend(cmd, args), transformCallback: () => 0 };
 
   const bundle = await build({
@@ -161,4 +169,29 @@ test('a running plan stays under "In progress" after switching to the Monitor ta
   nav(document, 'approvals').click();
   await settle();
   check('after the Monitor tab');
+});
+
+test('a runtime file set aside at unlock shows a banner until the owner rewrites it', async () => {
+  assert.ok(app, 'the app was loaded by the previous test');
+  const { document, intervals } = app;
+  const banner = () => document.querySelector('main').childNodes[0];
+  assert.equal(banner().textContent, '', 'no banner while nothing is set aside');
+
+  reviews = [{ pluginId: 'usage-monitor', differences: ['monitoring settings'] }];
+  for (const poll of intervals) await poll();
+  await settle();
+  const text = banner().textContent;
+  assert.ok(text.includes(manifest('usage-monitor').name), `the banner names the plugin (${text})`);
+  assert.ok(text.includes('monitoring settings'), 'the banner says what differed');
+
+  nav(document, 'plugin:usage-monitor').click();
+  await settle();
+  assert.ok(banner().textContent.includes('monitoring settings'), 'the banner stays when the tab changes');
+
+  const rewrite = document.querySelectorAll('button').find((b) => b.textContent.startsWith('Rewrite it from my saved settings'));
+  assert.ok(rewrite, 'the banner offers the rewrite');
+  rewrite.click();
+  await settle();
+  assert.ok(calls.includes('rewrite_runtime'));
+  assert.equal(banner().textContent, '', 'the banner goes once the file is rewritten');
 });

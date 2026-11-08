@@ -187,8 +187,13 @@ async fn a_changed_runtime_file_is_set_aside_until_the_owner_rewrites_it() {
     history(&f.plugin).set_runtime(Some(json!({ "rules": ["busy", "hot"] }))).unwrap();
     assert!(!runtime_path(&f.engine, "demo").exists());
 
+    // The app sees the review in its status, only while unlocked.
+    assert_eq!(f.engine.status().runtime_reviews.len(), 1);
+
     // Still waiting after another lock and unlock.
     f.engine.lock().await;
+    assert!(f.engine.status().runtime_reviews.is_empty(), "nothing is shown while locked");
+    assert_eq!(f.engine.rewrite_runtime_from_vault("demo").unwrap_err().code, ErrorCode::VaultLocked);
     f.engine.unlock(PIN.into()).await.unwrap();
     assert_eq!(f.engine.runtime_reviews().len(), 1);
     assert!(!runtime_path(&f.engine, "demo").exists());

@@ -204,6 +204,12 @@ async fn revoke_llm_trust(engine: EngineState<'_>, plugin_id: String) -> Cmd<()>
     engine.revoke_llm_trust(&plugin_id)
 }
 
+/// Rewrites a set-aside runtime file from the vault (app only, never MCP).
+#[tauri::command]
+async fn rewrite_runtime(engine: EngineState<'_>, plugin_id: String) -> Cmd<()> {
+    engine.rewrite_runtime_from_vault(&plugin_id)
+}
+
 #[tauri::command]
 async fn run_tool(engine: EngineState<'_>, plugin_id: String, tool_id: String, args: Value, pin: Option<String>) -> Cmd<RunOutcome> {
     engine.run_tool(Origin::Ui { pin }, &plugin_id, &tool_id, args).await
@@ -346,6 +352,7 @@ fn main() {
             set_gate_policy,
             grant_llm_trust,
             revoke_llm_trust,
+            rewrite_runtime,
             run_tool,
             list_tickets,
             decide_ticket,

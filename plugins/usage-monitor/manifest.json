@@ -195,9 +195,42 @@
       }
     },
     {
+      "id": "read_monitor_history",
+      "name": "Read Monitor History",
+      "description": "Decrypts the recorded monitor history for the last 1-90 days (default 1): spikes, foreground app changes, monitor hits, and when monitoring started and stopped. Shows the gaps when nothing was monitored and why (sleep, closed, shutdown, crash or power loss, paused), with System log evidence. Returns up to `limit` newest events.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "days": { "type": "integer", "minimum": 1, "maximum": 90, "default": 1 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 500 }
+        }
+      }
+    },
+    {
+      "id": "configure_history_retention",
+      "name": "Set Monitor History Retention",
+      "description": "Sets how long the encrypted monitor history is kept: 1-90 days and 8-512 MB, whichever limit is reached first. Shortening it deletes older history files at once.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "pin_required",
+      "readOnly": false,
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["maxDays", "maxMb"],
+        "properties": {
+          "maxDays": { "type": "integer", "minimum": 1, "maximum": 90 },
+          "maxMb": { "type": "integer", "minimum": 8, "maximum": 512 }
+        }
+      }
+    },
+    {
       "id": "purge_telemetry_history",
-      "name": "Purge Recorded Telemetry",
-      "description": "Deletes all recorded spikes, foreground app history, and monitor hits from memory. Saved monitors are kept. Telemetry is never written to disk.",
+      "name": "Purge Recorded Telemetry and History",
+      "description": "Deletes all recorded spikes, foreground app history, and monitor hits, in memory and in the encrypted history files, and replaces the history key so deleted files cannot be read later. Saved monitors are kept.",
       "requiresAdmin": false,
       "defaultGatePolicy": "pin_required",
       "readOnly": false,

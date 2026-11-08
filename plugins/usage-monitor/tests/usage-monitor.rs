@@ -146,8 +146,10 @@ async fn sampler_runs_only_while_unlocked_and_purge_is_pin_gated() {
 
     let purge = plugin.manifest().tool("purge_telemetry_history").unwrap();
     assert_eq!(purge.default_gate_policy, aegis_core::registry::GatePolicy::PinRequired);
-    let out = call(&plugin, "purge_telemetry_history", json!({}), ToolContext::default()).await.unwrap();
-    assert_eq!(out["purged"], true);
+    // Purge also deletes the history files, so it fails without a history
+    // stream rather than report a purge it did not do (tests/history.rs).
+    let err = call(&plugin, "purge_telemetry_history", json!({}), ToolContext::default()).await.unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::Internal);
 }
 
 #[tokio::test]

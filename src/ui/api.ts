@@ -22,6 +22,14 @@ export interface Status {
   uiScale: number;
   /** The change running now and how many wait their turn (one at a time). */
   change: { running: string | null; queued: number };
+  /** Runtime files set aside at unlock because they did not match the vault. */
+  runtimeReviews: RuntimeReview[];
+}
+
+export interface RuntimeReview {
+  pluginId: string;
+  /** What differed, in words ("history key", "monitoring settings", ...). */
+  differences: string[];
 }
 
 export interface JsonSchema {
@@ -236,6 +244,7 @@ export const api = {
     call<GatePolicy>('set_gate_policy', { pluginId, toolId, policy, pin }),
   grantLlmTrust: (pluginId: string, pin: string) => call<void>('grant_llm_trust', { pluginId, pin }),
   revokeLlmTrust: (pluginId: string) => call<void>('revoke_llm_trust', { pluginId }),
+  rewriteRuntime: (pluginId: string) => call<void>('rewrite_runtime', { pluginId }),
   runTool: (pluginId: string, toolId: string, args: unknown, pin: string | null) =>
     call<RunOutcome>('run_tool', { pluginId, toolId, args, pin }),
   listTickets: () => call<TicketView[]>('list_tickets'),

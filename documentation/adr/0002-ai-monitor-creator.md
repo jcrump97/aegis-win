@@ -226,6 +226,9 @@ Rejected alternatives:
 - **Runtime file path.** The history service is shared, so the runtime file is per plugin: `./data/runtime/<plugin>.json` (today only `usage-monitor.json`) rather than `./data/monitor/runtime.json`. It holds the format version, stream, key id, public key, retention, `paused`, and a plugin-defined section (for `usage-monitor`: its active rules and enabled components).
 - **Keys** are created in the vault the first time a stream is written while unlocked.
 - **Tamper check outcome.** A mismatching, unreadable, or unexpected runtime file is renamed to `<plugin>.rejected.json` (so it is never resumed from, also after a restart) and listed for the owner, who rewrites it from the vault in the app. Until then, plugin changes update the vault only. `paused` is not compared, because the tray sets it without the PIN. A missing file is rewritten from the vault without a warning: it cannot redirect anything.
+- **Records.** No `crash` record is written: crash and hang events stay in the Application log, and gaps take their evidence from the System log when history is read. `session_stop` with reason "monitoring stopped" also covers a change of monitoring settings, which restarts the sampler. The runtime file lists only running (not paused) monitors and is removed when nothing runs. Until Phase 5, `session_start` always says `manual`.
+- **Not in this step:** monitoring while locked, tray pause and resume (`paused`, `resumed`), and the quit and shutdown stop reasons; until they land, Lock still stops every monitor (§4).
+- **In the app.** The History card reads, limits, and purges the stream (each needs the PIN). A set-aside runtime file shows a warning above every tab with a *Rewrite it from my saved settings* button, an app-only command that never reaches MCP.
 
 ## 6. Restart and resume
 

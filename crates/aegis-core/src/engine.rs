@@ -93,6 +93,8 @@ pub struct Status {
     pub ui_scale: u32,
     /// The change running now and how many wait (for the app's top bar).
     pub change: ChangeView,
+    /// Runtime files set aside at unlock, waiting for the owner (empty while locked).
+    pub runtime_reviews: Vec<RuntimeReview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,6 +321,7 @@ impl Engine {
     // ---- lifecycle -------------------------------------------------------
 
     pub fn status(&self) -> Status {
+        let reviews = self.runtime_reviews();
         let guard = lock(&self.vault);
         let state = guard.as_ref().map(|v| &v.state);
         Status {
@@ -331,6 +334,7 @@ impl Engine {
             pin_lockout_seconds: lock(&self.guard).check(Instant::now()).err().map_or(0, |d| d.as_secs().max(1)),
             ui_scale: state.map_or(100, |s| s.ui_scale),
             change: self.executor.view(),
+            runtime_reviews: if state.is_some() { reviews } else { Vec::new() },
         }
     }
 

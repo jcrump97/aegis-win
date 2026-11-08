@@ -16,7 +16,8 @@ let tickets: TicketView[] = [];
 let activeTab = '';
 let pollTimer: number | undefined;
 let mainEl: HTMLElement | null = null;
-let shellParts: { approvalsCount: HTMLElement; mcpPill: HTMLElement; changePill: HTMLElement } | null = null;
+let shellParts: { approvalsCount: HTMLElement; mcpPill: HTMLElement; changePill: HTMLElement; reviews: HTMLElement } | null = null;
+let reviewSignature = '';
 /** Steps the owner is collecting for an action plan. Memory only; dropped on lock. */
 let planDraft: Array<{ tool: string; name: string; args: Record<string, unknown> }> = [];
 const MAX_PLAN_STEPS = 5;
@@ -282,7 +283,8 @@ async function appShell(): Promise<void> {
     nav('settings', 'Settings'),
   );
   mainEl = h('main', { class: 'main' });
-  shellParts = { approvalsCount, mcpPill, changePill };
+  shellParts = { approvalsCount, mcpPill, changePill, reviews: h('div', { class: 'stack', 'aria-live': 'polite' }) };
+  reviewSignature = '';
   replace(
     root,
     h(
@@ -317,6 +319,42 @@ function updateShellBadges(): void {
   const text = running ? `Change in progress: ${running}${waiting ? ` · ${waiting}` : ''}` : waiting;
   shellParts.changePill.hidden = !text;
   replace(shellParts.changePill, text);
+  updateRuntimeReviews(shellParts.reviews);
+}
+
+/** Runtime files the unlock check set aside (ADR 0002 §5): nothing resumes from them until the owner rewrites them. */
+function updateRuntimeReviews(host: HTMLElement): void {
+  const reviews = status.runtimeReviews ?? [];
+  const signature = reviews.map((r) => `${r.pluginId}:${r.differences.join(',')}`).join('|');
+  if (signature === reviewSignature) return;
+  reviewSignature = signature;
+  replace(
+    host,
+    ...reviews.map((r) => {
+      const name = plugins.find((p) => p.id === r.pluginId)?.name ?? r.pluginId;
+      const message = h('div');
+      const rewrite = h('button', { class: 'primary' }, 'Rewrite it from my saved settings');
+      rewrite.addEventListener('click', async () => {
+        try {
+          await busy(rewrite, () => api.rewriteRuntime(r.pluginId));
+          status = await api.status();
+          toast(`${name}: runtime file rewritten from your saved settings.`);
+          updateShellBadges();
+        } catch (e) {
+          replace(message, errorNotice(asError(e)));
+        }
+      });
+      return h(
+        'div',
+        { class: 'notice error', role: 'alert' },
+        h('p', {}, h('strong', {}, `${name}: its runtime file was changed outside AegisWin and has been set aside.`)),
+        h('p', {}, `What differed: ${r.differences.join(', ')}.`),
+        h('p', { class: 'hint' }, 'AegisWin will not monitor while locked or resume from that file. Your saved settings are unchanged. If you did not expect this, something on this PC may have edited the data folder; the set-aside copy is kept next to it as a .rejected.json file.'),
+        message,
+        h('div', { class: 'row' }, rewrite),
+      );
+    }),
+  );
 }
 
 function renderTab(): void {
@@ -327,7 +365,7 @@ function renderTab(): void {
     : activeTab === 'mcp' ? mcpTab()
     : activeTab === 'llm' ? llmTab()
     : settingsTab();
-  replace(mainEl, content);
+  replace(mainEl, shellParts?.reviews ?? null, content);
 }
 
 // ---- polling for approval requests ------------------------------------------

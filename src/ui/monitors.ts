@@ -18,7 +18,7 @@ export interface MonitorDeps {
 }
 
 /** Tools this screen handles; the plugin tab does not show generic forms for them. */
-export const MONITOR_TOOLS = new Set(['propose_monitor', 'activate_monitor', 'list_monitors', 'pause_monitor', 'delete_monitor', 'monitor_chat_start', 'monitor_chat_reply', 'monitor_chat_cancel']);
+export const MONITOR_TOOLS = new Set(['propose_monitor', 'activate_monitor', 'list_monitors', 'pause_monitor', 'delete_monitor', 'monitor_chat_start', 'monitor_chat_reply', 'monitor_chat_cancel', 'read_monitor_history', 'configure_history_retention', 'purge_telemetry_history']);
 
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : {});
@@ -44,7 +44,9 @@ export function monitorPanel(deps: MonitorDeps): HTMLElement {
   list.onAdjust = (rule, id) => editor.load(rule, id);
   const chat = monitorChat(deps, (rule) => editor.load(rule, null), () => list.refresh());
   const hint = h('p', { class: 'hint' }, 'While a monitor runs, closing this window keeps AegisWin running in the tray. Quit from the tray icon to stop it. Locking stops all monitors.');
-  panel = h('div', { class: 'stack' }, hint, list.element, chat, editor.element);
+  const history = historyCard(deps);
+  list.onRetention = history.showRetention;
+  panel = h('div', { class: 'stack' }, hint, list.element, chat, editor.element, history.element);
   return panel;
 }
 
@@ -112,12 +114,13 @@ function proposalView(deps: MonitorDeps, proposal: unknown, replaceId: string | 
 
 // ---- saved monitors ------------------------------------------------------------
 
-function monitorList(deps: MonitorDeps): { element: HTMLElement; refresh(): void; onAdjust: (rule: unknown, id: string) => void } {
+function monitorList(deps: MonitorDeps): { element: HTMLElement; refresh(): void; onAdjust: (rule: unknown, id: string) => void; onRetention: (r: Json) => void } {
   const body = h('div', { class: 'stack' });
   const refreshButton = h('button', {}, 'Refresh');
   const self = {
     element: h('section', { class: 'card stack' }, h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'Your monitors'), refreshButton), body),
     onAdjust: (_rule: unknown, _id: string) => {},
+    onRetention: (_r: Json) => {},
     refresh: () => void load(),
   };
   const load = async () => {
@@ -125,6 +128,7 @@ function monitorList(deps: MonitorDeps): { element: HTMLElement; refresh(): void
     if (!r.ok) return r.error ? replace(body, errorBox(r.error)) : undefined;
     const v = obj(r.value);
     const monitors = arr(v.monitors).map(obj);
+    if (v.historyRetention) self.onRetention(obj(v.historyRetention));
     replace(
       body,
       h('p', { class: 'hint' }, str(v.note)),
@@ -152,7 +156,7 @@ function monitorCard(deps: MonitorDeps, m: Json, list: { refresh(): void; onAdju
   });
   const del = h('button', { class: 'danger' }, 'Delete (PIN)');
   del.addEventListener('click', async () => {
-    if (!(await confirmDialog(`Delete monitor ${id}?`, 'Its rule is removed. Hits recorded so far stay until they are purged or AegisWin locks.', 'Delete'))) return;
+    if (!(await confirmDialog(`Delete monitor ${id}?`, 'Its rule is removed. Hits recorded so far stay in the encrypted history until it is purged or they age out.', 'Delete'))) return;
     const r = await deps.run('delete_monitor', { id }, del);
     if (r.ok) list.refresh();
     else if (r.error) replace(message, errorBox(r.error));
@@ -169,6 +173,116 @@ function monitorCard(deps: MonitorDeps, m: Json, list: { refresh(): void; onAdju
     message,
     h('div', { class: 'row' }, pause, adjust, del),
   );
+}
+
+// ---- encrypted history -----------------------------------------------------------
+
+const KIND_LABELS: Record<string, string> = {
+  session_start: 'Monitoring started',
+  session_stop: 'Monitoring stopped',
+  spike: 'Resource spike',
+  foreground: 'App in the foreground',
+  monitor_hit: 'Monitor fired',
+  paused: 'Paused from the tray',
+  resumed: 'Resumed from the tray',
+};
+
+const when = (v: unknown): string => (str(v) ? new Date(str(v)).toLocaleString() : 'now');
+
+function eventText(e: Json): string {
+  switch (e.kind) {
+    case 'session_start':
+      return `launched ${str(e.launch) || 'manually'}`;
+    case 'session_stop':
+      return str(e.reason);
+    case 'spike':
+      return `${str(e.process)} (${str(e.type)}): ${e.cpuPercent ?? '?'}% CPU, ${e.ramMb ?? '?'} MB`;
+    case 'foreground':
+      return str(e.process);
+    case 'monitor_hit':
+      return `${str(e.name)} (${str(e.monitorId)})${lines(e.matched).length ? `: ${lines(e.matched).join('; ')}` : ''}`;
+    default:
+      return '';
+  }
+}
+
+function gapView(g: Json): HTMLElement {
+  const evidence = arr(g.evidence).map(obj);
+  return h(
+    'div',
+    { class: `notice ${g.kind === 'unexpected' ? 'error' : ''}` },
+    h('p', {}, h('strong', {}, `${when(g.from)} to ${when(g.to)}`), ` ${str(g.label)}`),
+    evidence.length
+      ? h('ul', {}, ...evidence.map((e) => h('li', {}, `${when(e.time)}: ${str(e.meaning)} (event ${e.eventId}, ${str(e.provider)})${str(e.message) ? ` ${str(e.message)}` : ''}`)))
+      : null,
+  );
+}
+
+/** The monitor's encrypted timeline: reading it, its limits, and purging it all need the PIN. */
+function historyCard(deps: MonitorDeps): { element: HTMLElement; showRetention(r: Json): void } {
+  const result = h('div', { class: 'stack', 'aria-live': 'polite' });
+  const days = h('select', { id: 'history-days' }, ...[1, 7, 14, 30, 90].map((d) => h('option', { value: d }, d === 1 ? 'the last day' : `the last ${d} days`)));
+  const show = h('button', { class: 'primary' }, 'Show history (PIN)');
+  show.addEventListener('click', async () => {
+    const r = await deps.run('read_monitor_history', { days: Number(days.value) }, show);
+    if (!r.ok) return r.error ? replace(result, errorBox(r.error)) : undefined;
+    const v = obj(r.value);
+    const events = arr(v.events).map(obj).reverse();
+    const gaps = arr(v.gaps).map(obj).reverse();
+    const omitted = Number(v.omitted ?? 0);
+    replace(
+      result,
+      h('p', { class: 'hint' }, `From ${when(v.from)} to ${when(v.to)}. ${str(v.note)}`),
+      ...lines(v.problems).map((p) => h('div', { class: 'notice error' }, p)),
+      h('h4', {}, gaps.length ? `Times AegisWin was not monitoring (${gaps.length})` : 'No gaps in monitoring'),
+      ...gaps.map(gapView),
+      h('h4', {}, `Events, newest first (${events.length})`),
+      events.length === 0 ? h('p', {}, 'Nothing recorded in this period.') : null,
+      events.length
+        ? h('table', {}, h('tbody', {}, ...events.map((e) => h('tr', {}, h('td', {}, when(e.at)), h('td', {}, KIND_LABELS[str(e.kind)] ?? str(e.kind)), h('td', {}, eventText(e))))))
+        : null,
+      omitted ? h('p', { class: 'hint' }, `${omitted} older event(s) not shown.`) : null,
+    );
+  });
+
+  const maxDays = h('input', { type: 'number', id: 'history-max-days', min: 1, max: 90, value: 14 });
+  const maxMb = h('input', { type: 'number', id: 'history-max-mb', min: 8, max: 512, value: 64 });
+  const limitsMessage = h('div');
+  const save = h('button', {}, 'Save limits (PIN)');
+  save.addEventListener('click', async () => {
+    const r = await deps.run('configure_history_retention', { maxDays: Number(maxDays.value), maxMb: Number(maxMb.value) }, save);
+    if (r.ok) replace(limitsMessage, h('div', { class: 'notice ok' }, str(obj(r.value).note) || 'Saved.'));
+    else if (r.error) replace(limitsMessage, errorBox(r.error));
+  });
+
+  const purge = h('button', { class: 'danger' }, 'Delete all history (PIN)');
+  purge.addEventListener('click', async () => {
+    if (!(await confirmDialog('Delete all monitor history?', 'Every history file is deleted and the history gets a new key, so deleted files cannot be read even if recovered. This cannot be undone.', 'Delete'))) return;
+    const r = await deps.run('purge_telemetry_history', {}, purge);
+    if (r.ok) {
+      replace(result, h('div', { class: 'notice ok' }, `History deleted (${Number(obj(r.value).historyFilesRemoved ?? 0)} file(s)).`));
+      toast('Monitor history deleted.');
+    } else if (r.error) replace(result, errorBox(r.error));
+  });
+
+  const element = h(
+    'section',
+    { class: 'card stack' },
+    h('h3', {}, 'History'),
+    h('p', { class: 'hint' }, 'While a monitor runs, AegisWin keeps an encrypted record of sessions, spikes, foreground apps and monitor hits on this PC. Only your PIN can read it. Process names only, never window titles.'),
+    h('div', { class: 'row' }, h('label', { for: 'history-days' }, 'Show'), days, show),
+    result,
+    h('h4', {}, 'Keep history for'),
+    h('div', { class: 'grid2' }, h('div', {}, h('label', { for: 'history-max-days' }, 'At most (days, 1 to 90)'), maxDays), h('div', {}, h('label', { for: 'history-max-mb' }, 'At most (MB, 8 to 512)'), maxMb)),
+    limitsMessage,
+    h('div', { class: 'row' }, save, purge),
+  );
+  // The saved limits arrive with the monitor list (it loads first, before any edit).
+  const showRetention = (r: Json) => {
+    if (typeof r.maxDays === 'number' && document.activeElement !== maxDays) maxDays.value = String(r.maxDays);
+    if (typeof r.maxMb === 'number' && document.activeElement !== maxMb) maxMb.value = String(r.maxMb);
+  };
+  return { element, showRetention };
 }
 
 // ---- AI monitor creator -------------------------------------------------------

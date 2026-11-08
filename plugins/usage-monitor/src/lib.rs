@@ -2,9 +2,12 @@
 //! tracking during a user-defined daily watch window, plus owner-approved
 //! monitors (ADR 0002).
 //!
-//! Telemetry, including monitor hits, lives in memory only (bounded ring
-//! buffers) and is cleared when the vault locks. Saved monitors live in the
-//! encrypted vault. Only process names are recorded, never window titles.
+//! Recent telemetry, including monitor hits, is kept in memory (bounded
+//! ring buffers) and cleared when the vault locks. The same events, plus a
+//! heartbeat each minute and session start and stop, are written to the
+//! plugin's encrypted, write-only history stream (ADR 0002 §5), readable
+//! only with the PIN. Saved monitors live in the encrypted vault. Only
+//! process names are recorded, never window titles.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aegis_core::history::Retention;
+use aegis_core::history_service::HistoryHandle;
 use aegis_core::llm::LlmHandle;
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
@@ -30,6 +35,7 @@ pub mod creator;
 pub mod monitors;
 pub mod replay;
 pub mod rules;
+pub mod timeline;
 
 pub const COMPONENT_SPIKES: &str = "usage-monitor:resource-spikes";
 pub const COMPONENT_CRASHES: &str = "usage-monitor:crash-correlator";
@@ -41,6 +47,7 @@ const CORRELATION_WINDOW_MINUTES: i64 = 10;
 /// How often the sampler re-reads the event logs that active monitors use.
 const EVENT_POLL_EVERY: Duration = Duration::from_secs(15);
 const EVENT_POLL_LIMIT: usize = 200;
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(timeline::HEARTBEAT_SECONDS);
 
 const SYSTEM_PROMPT: &str = "You are a Windows performance and stability assistant. The user message is a JSON \
 diagnostic snapshot: top processes by CPU and memory, recorded resource spikes, application crash or hang events, \
@@ -137,6 +144,10 @@ struct Telemetry {
     hits: VecDeque<MonitorHit>,
     /// The last 30 minutes of samples, for replaying a proposed rule.
     recent: VecDeque<RecordedTick>,
+    /// This plugin's history stream, once the engine handed it over.
+    history: Option<HistoryHandle>,
+    /// Records for the history stream, written by the sampler outside the lock.
+    outbox: Vec<Value>,
 }
 
 impl Telemetry {
@@ -156,10 +167,14 @@ impl Telemetry {
         if self.in_watch_window(tick.local_time) {
             replay::remember(&mut self.recent, RecordedTick::keep(tick, &self.components));
         }
-        let Self { monitors, hits, .. } = self;
+        let Self { monitors, hits, outbox, history, .. } = self;
         for m in &mut monitors.active {
             if let Some(hit) = m.evaluator.tick(tick) {
-                push_capped(hits, MonitorHit::new(&m.id, &m.evaluator.rule().name, hit));
+                let hit = MonitorHit::new(&m.id, &m.evaluator.rule().name, hit);
+                if history.is_some() {
+                    outbox.push(json!({ "kind": "monitor_hit", "monitorId": hit.monitor_id, "name": hit.name, "matched": hit.matched }));
+                }
+                push_capped(hits, hit);
             }
         }
     }
@@ -188,6 +203,9 @@ impl Telemetry {
                 .map(|(s, kind)| Spike { time: stamp.clone(), process: s.name.clone(), pid: s.pid, kind, cpu_percent: round1(s.cpu_percent), ram_mb: s.ram_mb })
                 .collect();
             for spike in found {
+                if self.history.is_some() {
+                    self.outbox.push(json!({ "kind": "spike", "process": spike.process, "pid": spike.pid, "type": spike.kind, "cpuPercent": spike.cpu_percent, "ramMb": spike.ram_mb }));
+                }
                 push_capped(&mut self.spikes, spike);
             }
         }
@@ -195,6 +213,9 @@ impl Telemetry {
             if let Some(name) = foreground {
                 if self.last_foreground.as_deref() != Some(name.as_str()) {
                     self.last_foreground = Some(name.clone());
+                    if self.history.is_some() {
+                        self.outbox.push(json!({ "kind": "foreground", "process": name }));
+                    }
                     push_capped(&mut self.foreground, ForegroundChange { time: stamp, process: name });
                 }
             }
@@ -202,6 +223,7 @@ impl Telemetry {
     }
 
     fn clear(&mut self) {
+        self.outbox.clear();
         self.hits.clear();
         self.recent.clear();
         self.spikes.clear();
@@ -209,6 +231,28 @@ impl Telemetry {
         self.last_spike.clear();
         self.last_foreground = None;
     }
+}
+
+/// Takes what the last tick queued for the history stream.
+fn take_outbox(t: &mut Telemetry) -> Option<(HistoryHandle, Vec<Value>)> {
+    if t.outbox.is_empty() {
+        return None;
+    }
+    Some((t.history.clone()?, std::mem::take(&mut t.outbox)))
+}
+
+/// Writes records to the history stream. A failed write (disk full, no key
+/// yet) loses those records only; the in-memory telemetry is unaffected.
+fn write_history(history: &HistoryHandle, records: Vec<Value>) {
+    for record in records {
+        let _ = history.append(record);
+    }
+}
+
+fn session_start() -> Value {
+    let boot = DateTime::<Utc>::from_timestamp(i64::try_from(System::boot_time()).unwrap_or(0), 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    json!({ "kind": "session_start", "launch": "manual", "bootTime": boot, "version": env!("CARGO_PKG_VERSION") })
 }
 
 fn push_capped<T>(buf: &mut VecDeque<T>, item: T) {
@@ -357,6 +401,9 @@ impl UsageMonitorPlugin {
         let stop = Arc::new(AtomicBool::new(false));
         let telemetry = Arc::clone(&self.telemetry);
         let flag = Arc::clone(&stop);
+        if let Some(history) = self.telemetry.lock().unwrap().history.clone() {
+            write_history(&history, vec![session_start()]);
+        }
         let thread = std::thread::Builder::new()
             .name("usage-monitor-sampler".into())
             .spawn(move || {
@@ -364,6 +411,7 @@ impl UsageMonitorPlugin {
                 refresh(&mut sys);
                 let mut events: Vec<rules::ObservedEvent> = Vec::new();
                 let mut last_poll: Option<Instant> = None;
+                let mut last_heartbeat = Instant::now();
                 while !flag.load(Ordering::Relaxed) {
                     let mut waited = Duration::ZERO;
                     while waited < SAMPLE_EVERY && !flag.load(Ordering::Relaxed) {
@@ -383,6 +431,12 @@ impl UsageMonitorPlugin {
                     }
                     let local = Local::now();
                     let mut t = telemetry.lock().unwrap();
+                    if last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
+                        last_heartbeat = Instant::now();
+                        if t.history.is_some() {
+                            t.outbox.push(json!({ "kind": "heartbeat" }));
+                        }
+                    }
                     t.record(&current, fg.clone(), local.time(), Instant::now());
                     t.evaluate_monitors(&rules::Tick {
                         now: Utc::now(),
@@ -394,6 +448,11 @@ impl UsageMonitorPlugin {
                         foreground: fg.as_deref(),
                         events: &events,
                     });
+                    let out = take_outbox(&mut t);
+                    drop(t);
+                    if let Some((history, records)) = out {
+                        write_history(&history, records);
+                    }
                 }
             })
             .expect("can spawn the sampler thread");
@@ -401,10 +460,33 @@ impl UsageMonitorPlugin {
         *slot = Some(Sampler { stop, thread });
     }
 
-    fn stop_sampler(&self) {
+    /// Stops the sampler and writes `session_stop` with `reason`.
+    fn stop_sampler(&self, reason: &str) {
         if let Some(sampler) = self.sampler.lock().unwrap().take() {
             sampler.stop.store(true, Ordering::Relaxed);
             let _ = sampler.thread.join();
+            let mut t = self.telemetry.lock().unwrap();
+            let mut records = std::mem::take(&mut t.outbox);
+            let history = t.history.clone();
+            drop(t);
+            if let Some(history) = history {
+                records.push(json!({ "kind": "session_stop", "reason": reason }));
+                write_history(&history, records);
+            }
+        }
+    }
+
+    /// Tells the engine what runs while locked: the running monitors and
+    /// the components they need. Nothing running, nothing declared.
+    fn sync_runtime(&self) {
+        let (history, section) = {
+            let t = self.telemetry.lock().unwrap();
+            let monitors: Vec<Value> = t.monitors.active.iter().map(|m| json!({ "id": m.id, "rule": m.evaluator.rule() })).collect();
+            let section = (!monitors.is_empty()).then(|| json!({ "monitors": monitors, "components": t.components }));
+            (t.history.clone(), section)
+        };
+        if let Some(history) = history {
+            let _ = history.set_runtime(section);
         }
     }
 
@@ -447,6 +529,7 @@ impl UsageMonitorPlugin {
             },
         };
         self.telemetry.lock().unwrap().monitors = runtime;
+        self.sync_runtime();
         self.start_sampler_if_needed();
     }
 
@@ -470,6 +553,7 @@ impl UsageMonitorPlugin {
         let out = change(&mut book).map_err(AegisError::invalid)?;
         store.set(monitors::STORE_KEY, book.to_value())?;
         self.telemetry.lock().unwrap().monitors = MonitorRuntime::build(&book, &ctx.enabled_components);
+        self.sync_runtime();
         self.start_sampler_if_needed();
         Ok(out)
     }
@@ -641,6 +725,7 @@ impl UsageMonitorPlugin {
             "monitors": book.monitors.iter().map(|m| monitors::view(m, &t.monitors, &hits)).collect::<Vec<_>>(),
             "maxMonitors": rules::MAX_MONITORS,
             "loadError": t.monitors.load_error,
+            "historyRetention": ctx.history.as_ref().and_then(|h| h.retention().ok()),
             "note": "Monitors only watch and record while AegisWin is running and unlocked. They never run anything or change Windows.",
         }))
     }
@@ -708,6 +793,31 @@ impl UsageMonitorPlugin {
             "foregroundChanges": if enabled(COMPONENT_FOREGROUND) { json!(foreground) } else { json!("component disabled") },
             "monitorHits": hits,
         }))
+    }
+}
+
+impl UsageMonitorPlugin {
+    /// Decrypts the last `days` days and builds the timeline with gaps. The
+    /// System log is read for gap evidence only.
+    async fn read_history(&self, args: &Value, ctx: &ToolContext) -> AegisResult<Value> {
+        let days = args["days"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(1).clamp(1, timeline::MAX_DAYS);
+        let limit = args["limit"].as_u64().and_then(|n| usize::try_from(n).ok()).unwrap_or(timeline::DEFAULT_LIMIT).clamp(1, timeline::MAX_LIMIT);
+        let history = ctx.history()?.clone();
+        let now = Utc::now();
+        let since = (now.date_naive() - chrono::Days::new(u64::from(days - 1))).and_hms_opt(0, 0, 0).expect("midnight exists").and_utc();
+        let retention = history.retention()?;
+        let (read, events) = tokio::task::spawn_blocking(move || {
+            let read = history.read(Some(since.date_naive()));
+            let events = eventlog::query(&timeline::evidence_query(days)).unwrap_or_default();
+            (read, events)
+        })
+        .await
+        .map_err(|e| AegisError::failed(e.to_string()))?;
+        let mut view = timeline::view(&read?, &events, since, now, limit);
+        view["days"] = json!(days);
+        view["retention"] = json!(retention);
+        view["note"] = json!("Gaps are worked out from the records; System log events are shown as evidence when they fall inside a gap. Values are never filled in across a gap.");
+        Ok(view)
     }
 }
 
@@ -788,10 +898,23 @@ impl Plugin for UsageMonitorPlugin {
                 Ok(json!({ "analysis": answer }))
             }
             "purge_telemetry_history" => {
-                let mut t = self.telemetry.lock().unwrap();
-                let removed = t.spikes.len() + t.foreground.len() + t.hits.len() + t.recent.len();
-                t.clear();
-                Ok(json!({ "purged": true, "entriesRemoved": removed }))
+                let removed = {
+                    let mut t = self.telemetry.lock().unwrap();
+                    let removed = t.spikes.len() + t.foreground.len() + t.hits.len() + t.recent.len();
+                    t.clear();
+                    removed
+                };
+                let files = ctx.history()?.purge()?;
+                Ok(json!({ "purged": true, "entriesRemoved": removed, "historyFilesRemoved": files, "newKey": true }))
+            }
+            "read_monitor_history" => self.read_history(&args, &ctx).await,
+            "configure_history_retention" => {
+                let retention = Retention {
+                    max_days: args["maxDays"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
+                    max_mb: args["maxMb"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
+                };
+                ctx.history()?.set_retention(retention)?;
+                Ok(json!({ "retention": retention, "note": "Older history beyond these limits is deleted, oldest files first." }))
             }
             other => Err(AegisError::new(ErrorCode::UnknownTool, format!("usage-monitor has no tool '{other}'"))),
         }
@@ -799,7 +922,11 @@ impl Plugin for UsageMonitorPlugin {
 
     fn on_unlock(&self, ctx: &UnlockContext) {
         let enabled_components = &ctx.enabled_components;
-        self.telemetry.lock().unwrap().components = enabled_components.clone();
+        {
+            let mut t = self.telemetry.lock().unwrap();
+            t.components = enabled_components.clone();
+            t.history = ctx.history.clone();
+        }
         self.load_monitors(ctx.store.as_ref(), enabled_components);
     }
 
@@ -813,7 +940,7 @@ impl Plugin for UsageMonitorPlugin {
         let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
         self.chat_generation.fetch_add(1, Ordering::SeqCst);
         *self.chat.lock().unwrap() = None;
-        self.stop_sampler();
+        self.stop_sampler(timeline::STOP_LOCKED);
         let mut t = self.telemetry.lock().unwrap();
         t.clear();
         t.sampling_since = None;
