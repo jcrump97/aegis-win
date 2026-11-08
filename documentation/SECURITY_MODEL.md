@@ -3,7 +3,8 @@
 ## 1. Threat Boundaries
 1. **Untrusted / Semi-Trusted MCP Agents**: External or local AI agents connected via MCP HTTP must never execute destructive or state-changing tools without human authorization, and must never access the user's PIN or raw API keys.
 2. **Off-LAN LLM Providers**: Cloud LLM endpoints receive diagnostic snippets only after the user explicitly marks the calling plugin as trusted for Off-LAN transmission.
-3. **Antivirus & EDR Compatibility**: Single-binary compilation (`asInvoker`) avoids process-injection patterns and unsigned multi-binary drops.
+3. **LLM output**: model replies are untrusted input. They can propose a monitor rule or ask the owner a question, never act (§8).
+4. **Antivirus & EDR Compatibility**: Single-binary compilation (`asInvoker`) avoids process-injection patterns and unsigned multi-binary drops.
 
 ## 2. Cryptographic & Storage Standards
 - **Key derivation**: the PIN (6-128 characters) goes through Argon2id (64 MiB, 3 passes) with a 16-byte random salt. No PIN hash or verifier is stored; a wrong PIN shows up as an AES-GCM authentication failure. The KDF parameters and salt are bound to the ciphertext as associated data.
@@ -45,3 +46,14 @@ AegisWin always starts `asInvoker`. Tools that need administrator rights report 
 - **Off-LAN endpoints must use `https://`.** Plain-HTTP Off-LAN URLs are refused.
 - **No redirects.** The HTTP client never follows redirects, so a LAN endpoint cannot bounce a payload to an Off-LAN host.
 - **Scrubbing** runs on every string in the payload before an Off-LAN call: profile paths (`C:\Users\<Name>`, also with `/`), SMB UNC server names (`\\Server\Share`), and the Windows user and computer names as whole words (case-insensitive). The PIN is never part of any payload because it is never stored.
+
+## 7. Plugin Data and App-Only Tools (`aegis-core::plugin_data`, `registry`)
+- **Plugin data lives in the vault.** A plugin's records (for example `usage-monitor`'s saved monitors) are stored inside `vault.enc.json`, so they share its encryption and atomic saves. The engine hands each plugin a `PluginStore` bound to that plugin's id, so a plugin can reach only its own records, and only while the vault is unlocked and the plugin is installed. Each plugin is capped at 256 KiB; a write over the cap changes nothing.
+- **`appOnly` tools.** A tool marked `appOnly: true` is left out of MCP `tools/list`, and an MCP call to it fails with the same `unknown tool` error as a tool that does not exist, checked before anything else, so it never opens a ticket and reveals nothing. The app still reaches it through `run_tool`, with its gate applied. The in-app monitor chat uses this, because it sends the owner's own words to the LLM.
+
+## 8. Monitors and the AI Monitor Creator ([ADR 0002](adr/0002-ai-monitor-creator.md))
+- **Monitors only watch.** A rule is a closed, bounded JSON vocabulary, parsed strictly (unknown fields rejected, hidden characters rejected, process names that cannot be paths). A hit is a record; a monitor never runs anything.
+- **Anyone can propose, only the owner can start.** `propose_monitor` is `auto` and saves nothing. `activate_monitor`, `pause_monitor`, `delete_monitor`, and `configure_watch_window` are `pin_required`, so an agent gets an approval request that shows the full rule and the description AegisWin generates from it.
+- **Replay stays inside the watch window.** The last 30 minutes of samples are kept in memory, only inside the PIN-gated watch window and only for enabled components, so replay tells an agent no more than `capture_diagnostic_snapshot` can. A known, accepted limit: inside the window, an agent can learn whether a named process used at least 64 MB or 1 % CPU recently.
+- **AI output is untrusted input.** Every chat reply must be one JSON object in an allowed form, within fixed limits, and a proposed rule must validate against the enabled components. Questions asking for secrets, containing links, code, or commands, or asking the owner to run or install something are dropped with a visible note. The AI's reasoning is shown only under an "AI-generated, may be wrong" label next to the description code generates, and a consistency check flags reasoning that names an app or event ID the rule does not watch.
+- **What reaches the LLM.** The owner's description and answers, the enabled components, and, only after the owner agrees once per conversation, up to 200 running process names. Never event-log text. Every turn goes through the plugin's `LlmHandle`, so §6 (trust, `https`, scrubbing) applies, and each turn says whether it went to an on-LAN or Off-LAN LLM. The conversation is memory only and cleared on lock.
