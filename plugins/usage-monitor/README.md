@@ -1,6 +1,6 @@
 # Plugin: `usage-monitor`
 
-Finds the app behind slowdowns, freezes and crashes. While AegisWin is unlocked, a background thread samples every process every 5 seconds and records what crosses your thresholds inside a daily watch window, and checks every monitor you have saved.
+Finds the app behind slowdowns, freezes and crashes. While AegisWin is unlocked, a background thread samples every process every 5 seconds and records what crosses your thresholds inside a daily watch window, and checks every monitor you have saved. Running monitors keep going while AegisWin is locked.
 
 ## Sub-components (chosen in the first-run wizard)
 
@@ -56,11 +56,18 @@ While the sampler runs, the plugin writes an encrypted timeline through its `His
 - **Runtime file:** `./data/runtime/usage-monitor.json` lists the running monitors and enabled components with the stream's public key, which is what a locked AegisWin will need to keep writing. It is removed when nothing runs. On every unlock it is checked against the vault; if it was changed, the app shows a warning and nothing resumes from it until you rewrite it from your saved settings.
 - **In the app:** the History card on the Usage Monitor tab shows the timeline, sets the limits, and deletes everything.
 
-There are no crash records yet: crashes and hangs come from the Application log in the snapshot. Monitoring while locked, tray pause and resume, and the quit and shutdown reasons come in later phases.
+There are no crash records: crashes and hangs come from the Application log in the snapshot.
+
+## While locked
+
+- **Running monitors keep going** when AegisWin locks (*locked, monitoring*). Only the monitors listed in the vault's copy of the runtime section run, never one read from the file on disk. While locked the plugin keeps nothing in memory: no spikes, foreground apps, replay samples, or hit list. It writes only monitor hits and the heartbeat to the encrypted history, which it cannot read back.
+- **Nothing runs locked** when no monitor runs (a lock then ends the session with "monitoring stopped") or when the runtime file is waiting for your review.
+- **Pause from the tray** (Pause monitoring / Resume monitoring, no PIN) stops the sampler and records `paused`, then `resumed`; the history shows the time in between as paused by you. The pause also holds across a lock and an unlock.
+- **Stop reasons:** quitting (tray Quit, closing the window, restarting as administrator) records `quit`; Windows ending the session records `shutdown`.
 
 ## Privacy
 
-- In memory, telemetry is kept in ring buffers of 500 entries and cleared when the vault locks or with `purge_telemetry_history`.
+- In memory, telemetry is kept in ring buffers of 500 entries, only while unlocked, and cleared when the vault locks or with `purge_telemetry_history`.
 - On disk, it is only in the encrypted history above. Only the PIN can read it; AegisWin itself cannot read it while locked. Process names only, never window titles.
 - `purge_telemetry_history` (PIN) clears memory, deletes every history file, and gives the history a new key, so a deleted file recovered from the disk cannot be read. Saved monitors are kept.
 - The watch window settings reset when the vault locks.

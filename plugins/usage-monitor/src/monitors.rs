@@ -143,6 +143,22 @@ impl MonitorRuntime {
         Self { load_error: Some(error), ..Self::default() }
     }
 
+    /// Rebuilds the running monitors from a runtime section
+    /// (`{"monitors": [{"id", "rule"}], "components": [...]}`), checking
+    /// every rule again. Returns the components the section names too.
+    pub fn from_runtime(section: &Value) -> (Self, Vec<String>) {
+        let components: Vec<String> = section["components"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+        let mut rt = Self::default();
+        for m in section["monitors"].as_array().into_iter().flatten().take(MAX_MONITORS) {
+            let id = m["id"].as_str().unwrap_or_default().chars().take(MAX_ID_CHARS).collect::<String>();
+            match rules::validate(&m["rule"], &components) {
+                Ok(rule) => rt.active.push(ActiveMonitor { id, evaluator: Evaluator::new(rule) }),
+                Err(errors) => rt.problems.push((id, errors)),
+            }
+        }
+        (rt, components)
+    }
+
     pub fn problems_for(&self, id: &str) -> &[String] {
         self.problems.iter().find(|(m, _)| m == id).map_or(&[], |(_, p)| p.as_slice())
     }

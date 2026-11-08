@@ -2,9 +2,10 @@
 //! tickets and the MCP server. Tauri commands and the MCP server both call
 //! into it, so every gate is enforced in exactly one place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -21,7 +22,7 @@ use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
 use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
-use crate::registry::{self, Gate, GatePolicy, Plugin, Registry, ToolContext, ToolManifest, UnlockContext};
+use crate::registry::{self, ExitReason, Gate, GatePolicy, LockedContext, Plugin, Registry, ToolContext, ToolManifest, UnlockContext};
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
@@ -64,6 +65,10 @@ pub struct Engine {
     history: HistoryService,
     /// Runtime files that did not match the vault, until the owner rewrites them.
     runtime_reviews: Mutex<BTreeMap<String, RuntimeReview>>,
+    /// Plugins that kept running when the vault locked (*locked, monitoring*).
+    locked_work: Mutex<BTreeSet<String>>,
+    /// Monitoring paused from the tray (no PIN).
+    paused: AtomicBool,
 }
 
 /// Where a tool call came from. Only the desktop UI can pass a PIN inline;
@@ -257,6 +262,8 @@ impl Engine {
             me: me.clone(),
             history: HistoryService::new(&data_dir),
             runtime_reviews: Mutex::new(BTreeMap::new()),
+            locked_work: Mutex::new(BTreeSet::new()),
+            paused: AtomicBool::new(false),
             data_dir,
             registry,
             vault: Mutex::new(None),
@@ -389,6 +396,8 @@ impl Engine {
         let installed: Vec<(String, Vec<String>)> =
             vault.state.installed_plugins.iter().map(|id| (id.clone(), vault.state.components_for(id))).collect();
         *lock(&self.vault) = Some(vault);
+        // Plugins running locked carry on under `on_unlock`.
+        lock(&self.locked_work).clear();
         self.load_history_keys();
         self.check_runtime_files();
         for (id, components) in installed {
@@ -413,15 +422,51 @@ impl Engine {
         *lock(&self.activity)
     }
 
-    /// True while a change is running or waiting, or an installed plugin has
-    /// background work (only while unlocked: locking stops it). Closing the
-    /// window then hides to the tray, so a repair is not cut off.
+    /// True while a change is running or waiting, an installed plugin has
+    /// background work, or a plugin kept running when the vault locked.
+    /// Closing the window then hides to the tray, so a repair or a monitor
+    /// is not cut off.
     pub fn background_active(&self) -> bool {
         if self.executor.view() != ChangeView::default() {
             return true;
         }
-        let installed = lock(&self.vault).as_ref().map(|v| v.state.installed_plugins.clone()).unwrap_or_default();
-        installed.iter().filter_map(|id| self.registry.plugin(id)).any(|p| p.background_active())
+        self.background_plugins().iter().filter_map(|id| self.registry.plugin(id)).any(|p| p.background_active())
+    }
+
+    /// Plugins that may have background work: the installed ones while
+    /// unlocked, the ones running locked otherwise.
+    fn background_plugins(&self) -> Vec<String> {
+        let installed = lock(&self.vault).as_ref().map(|v| v.state.installed_plugins.clone());
+        installed.unwrap_or_else(|| lock(&self.locked_work).iter().cloned().collect())
+    }
+
+    /// True while locked with a plugin still running (*locked, monitoring*).
+    pub fn locked_monitoring(&self) -> bool {
+        lock(&self.vault).is_none() && !lock(&self.locked_work).is_empty()
+    }
+
+    pub fn monitoring_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// Pauses or resumes background monitoring from the tray. Needs no PIN:
+    /// the tray is not reachable by agents (ADR 0002 §4). Flips `paused` in
+    /// each runtime file (not part of the tamper check) and tells the plugins,
+    /// which record the pause in their history.
+    pub fn set_monitoring_paused(&self, paused: bool) {
+        if self.paused.swap(paused, Ordering::SeqCst) == paused {
+            return;
+        }
+        for id in self.history.runtime_files() {
+            if let Some(Ok(file)) = self.history.read_runtime(&id) {
+                let _ = self.history.write_runtime(&id, Some(&RuntimeFile { paused, ..file }));
+            }
+        }
+        for id in self.background_plugins() {
+            if let Some(plugin) = self.registry.plugin(&id) {
+                plugin.set_paused(paused);
+            }
+        }
     }
 
     /// Locks the vault when the owner has been away for the auto-lock
@@ -448,16 +493,59 @@ impl Engine {
     }
 
     /// Stops the MCP server and background work, drops the key, and forgets tickets.
+    /// Locks the vault. A plugin that declared locked work keeps running it
+    /// (*locked, monitoring*, ADR 0002 §4) unless its runtime file waits for
+    /// the owner's review; everything else stops.
     pub async fn lock(&self) -> Status {
-        self.stop_mcp().await;
-        let installed = lock(&self.vault).take().map(|v| v.state.installed_plugins.clone()).unwrap_or_default();
-        // Waiting changes never resume after unlock; a running one finishes.
-        self.executor.cancel_all();
-        for id in installed {
+        self.lock_inner(true).await
+    }
+
+    /// AegisWin is exiting: plugins write their clean-stop record, then
+    /// everything stops, including locked work.
+    pub async fn exit(&self, reason: ExitReason) {
+        for id in self.background_plugins() {
             if let Some(plugin) = self.registry.plugin(&id) {
-                plugin.on_lock();
+                plugin.on_exit(reason);
             }
         }
+        self.lock_inner(false).await;
+    }
+
+    async fn lock_inner(&self, keep_locked_work: bool) -> Status {
+        self.stop_mcp().await;
+        let reviews: BTreeSet<String> = lock(&self.runtime_reviews).keys().cloned().collect();
+        let taken = lock(&self.vault).take().map(|v| (v.state.installed_plugins.clone(), v.state.runtime.clone()));
+        // Waiting changes never resume after unlock; a running one finishes.
+        self.executor.cancel_all();
+        match taken {
+            Some((installed, runtime)) => {
+                let paused = self.monitoring_paused();
+                let mut running = BTreeSet::new();
+                for id in installed {
+                    let Some(plugin) = self.registry.plugin(&id) else { continue };
+                    match runtime.get(&id).filter(|_| keep_locked_work && !reviews.contains(&id)) {
+                        Some(section) => {
+                            if plugin.run_locked(&LockedContext { runtime: section.clone(), history: self.history_for(&id), paused }) {
+                                running.insert(id);
+                            }
+                        }
+                        None => plugin.on_lock(),
+                    }
+                }
+                *lock(&self.locked_work) = running;
+            }
+            // Already locked: only an exit stops what runs locked.
+            None if !keep_locked_work => {
+                let running = std::mem::take(&mut *lock(&self.locked_work));
+                for id in running {
+                    if let Some(plugin) = self.registry.plugin(&id) {
+                        plugin.on_lock();
+                    }
+                }
+            }
+            None => {}
+        }
+        // A fresh file (and HPKE context) for anything written while locked.
         self.history.close_all();
         lock(&self.tickets).clear();
         self.status()
@@ -958,7 +1046,7 @@ impl Engine {
             return Ok(());
         }
         let expected = self.with_state(|s| Self::expected_runtime(s, plugin_id))?;
-        let paused = matches!(self.history.read_runtime(plugin_id), Some(Ok(f)) if f.paused);
+        let paused = self.monitoring_paused() || matches!(self.history.read_runtime(plugin_id), Some(Ok(f)) if f.paused);
         self.history.write_runtime(plugin_id, expected.map(|f| RuntimeFile { paused, ..f }).as_ref())
     }
 
@@ -993,7 +1081,8 @@ impl Engine {
             } else if self.history.rejected_path(&id).exists() {
                 reviews.insert(id.clone(), RuntimeReview { plugin_id: id, differences: vec!["it was set aside at an earlier unlock".into()] });
             } else if found.is_none() && want.is_some() {
-                let _ = self.history.write_runtime(&id, want.as_ref());
+                let paused = self.monitoring_paused();
+                let _ = self.history.write_runtime(&id, want.map(|f| RuntimeFile { paused, ..f }).as_ref());
             }
         }
         *lock(&self.runtime_reviews) = reviews;

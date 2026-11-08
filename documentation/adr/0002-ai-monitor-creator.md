@@ -1,6 +1,6 @@
 # ADR 0002: AI-assisted monitor creator, background monitoring, and encrypted monitor history
 
-- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phase 3 is implemented on `feat/lifecycle` except the *locked, monitoring* state and tray *Pause monitoring*, which move to Phase 4 (§4). Phases 4-5 are not.
+- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phase 3 is implemented on `feat/lifecycle` except the *locked, monitoring* state and tray *Pause monitoring*, which moved to Phase 4 (§4). Phase 4 is implemented on `feat/encrypted-history`. Phase 5 is not.
 - **Date**: 2026-11-07
 - **Amends**: [ADR 0001](0001-rust-core.md) rejected-option row 13 (telemetry on disk), [GUIDING_PRINCIPLES §2](../GUIDING_PRINCIPLES.md)
 - **Plugin**: `usage-monitor` (the encrypted history writer in §5 is a shared `aegis-core` service)
@@ -176,6 +176,14 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
 - **Close to tray**: closing the window hides it only while a monitor is running (`background_active`); otherwise it quits. The one-time notice is a standing hint on the Usage Monitor screen, because there are no toasts.
 - **Single instance** is a named mutex plus an auto-reset event in the session namespace, both keyed on a hash of the install folder, so two portable copies in different folders run side by side. A second launch signals the first to show its window and exits. A standard-user launch while an elevated copy runs cannot open the elevated copy's objects, so it exits without focusing it. The elevated restart releases the claim just before it starts the elevated copy and takes it back if the prompt is cancelled. `tauri-plugin-single-instance` was not used: it is keyed on the app identifier, not the install.
 
+**As built in Phase 4** (2026-11-08, during implementation):
+
+- **The plugin hook** is `run_locked(&LockedContext)`, called *instead of* `on_lock`, so `on_lock` keeps meaning "stop everything". Its input is the vault's copy of the runtime section, not the file. A plugin without it stops on lock as before.
+- **Locked work is narrower than unlocked work.** Only the running monitors keep going; the components' own recording (spikes, foreground changes) and everything in memory stop at lock. Hits and heartbeats go to the history only.
+- **Not run locked:** a plugin whose runtime file waits for review, and a lock with no monitor running (it ends the session).
+- **Tray:** Pause monitoring / Resume monitoring. The pause stops the sampler without ending the session (`paused`, then `resumed`), holds across lock and unlock, and is kept in the runtime file's `paused` flag.
+- **Stop reasons:** `quit` for tray Quit, closing the window, and the elevated restart (which now stops monitoring in the old copy first); `shutdown` when the event loop ends without the owner asking (Windows ending the session). Still to confirm by hand with a real sign-out and shutdown (open question 7).
+
 ### Idle auto-lock
 
 - **Timeout:** default 15 minutes. Options: 5, 15, 30, or 60 minutes. There is no "off".
@@ -227,7 +235,6 @@ Rejected alternatives:
 - **Keys** are created in the vault the first time a stream is written while unlocked.
 - **Tamper check outcome.** A mismatching, unreadable, or unexpected runtime file is renamed to `<plugin>.rejected.json` (so it is never resumed from, also after a restart) and listed for the owner, who rewrites it from the vault in the app. Until then, plugin changes update the vault only. `paused` is not compared, because the tray sets it without the PIN. A missing file is rewritten from the vault without a warning: it cannot redirect anything.
 - **Records.** No `crash` record is written: crash and hang events stay in the Application log, and gaps take their evidence from the System log when history is read. `session_stop` with reason "monitoring stopped" also covers a change of monitoring settings, which restarts the sampler. The runtime file lists only running (not paused) monitors and is removed when nothing runs. Until Phase 5, `session_start` always says `manual`.
-- **Not in this step:** monitoring while locked, tray pause and resume (`paused`, `resumed`), and the quit and shutdown stop reasons; until they land, Lock still stops every monitor (§4).
 - **In the app.** The History card reads, limits, and purges the stream (each needs the PIN). A set-aside runtime file shows a warning above every tab with a *Rewrite it from my saved settings* button, an app-only command that never reaches MCP.
 
 ## 6. Restart and resume

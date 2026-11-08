@@ -223,7 +223,9 @@ async fn only_running_monitors_keep_aegiswin_in_the_tray() {
     engine.set_installed(BTreeMap::from([(UM.to_owned(), vec![COMPONENT_CRASHES.to_owned()])])).unwrap();
     assert!(engine.background_active());
     engine.lock().await;
-    assert!(!engine.background_active(), "locking stops monitors");
+    assert!(engine.background_active(), "a running monitor keeps going while locked (ADR 0002 §4)");
+    engine.exit(aegis_core::registry::ExitReason::Quit).await;
+    assert!(!engine.background_active(), "quitting stops it");
 }
 
 #[test]

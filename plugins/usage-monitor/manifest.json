@@ -2,7 +2,7 @@
   "id": "usage-monitor",
   "name": "Diagnostic Usage & Time-Window Monitor",
   "version": "1.0.0",
-  "description": "Samples per-process CPU and memory while AegisWin is unlocked, records spikes inside a daily watch window, correlates them with application crash and hang events, tracks which app was in the foreground, and runs the monitors you approve.",
+  "description": "Samples per-process CPU and memory while AegisWin is unlocked (and, for running monitors only, while it is locked), records spikes inside a daily watch window, correlates them with application crash and hang events, tracks which app was in the foreground, and runs the monitors you approve.",
   "optionalInstallDefault": true,
   "usesLlm": true,
   "subComponents": [

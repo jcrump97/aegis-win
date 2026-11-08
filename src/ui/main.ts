@@ -1156,7 +1156,7 @@ function settingsTab(): HTMLElement {
       h('h3', {}, 'Security'),
       h('label', { for: 'auto-lock' }, 'Lock automatically after no use for'),
       autoLock,
-      h('p', { class: 'hint' }, 'Clicks, typing, and entering your PIN count as use. Nothing an AI agent does counts. Locking stops all monitors.'),
+      h('p', { class: 'hint' }, 'Clicks, typing, and entering your PIN count as use. Nothing an AI agent does counts. Running monitors keep going while locked.'),
     ),
     h('section', { class: 'stack' }, h('h3', {}, 'Plugins and components'), selector.element, h('div', { class: 'row end' }, savePlugins)),
     pinForm,

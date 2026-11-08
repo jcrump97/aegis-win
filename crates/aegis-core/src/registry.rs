@@ -187,6 +187,28 @@ pub struct UnlockContext {
     pub history: Option<crate::history_service::HistoryHandle>,
 }
 
+/// Handed to [`Plugin::run_locked`]. Everything in it comes from the vault
+/// (what the plugin declared with `HistoryHandle::set_runtime`), never from
+/// the runtime file on disk.
+#[derive(Clone)]
+pub struct LockedContext {
+    /// The plugin's own runtime section, as it last declared it.
+    pub runtime: Value,
+    /// This plugin's history stream: appending works, reading does not.
+    pub history: crate::history_service::HistoryHandle,
+    /// Monitoring is paused from the tray.
+    pub paused: bool,
+}
+
+/// Why AegisWin is exiting, for a plugin's clean-stop record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// Quit from the tray or by closing the window.
+    Quit,
+    /// Windows is shutting down or signing out (the event loop ended on its own).
+    Shutdown,
+}
+
 #[async_trait]
 pub trait Plugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
@@ -215,6 +237,25 @@ pub trait Plugin: Send + Sync {
     fn background_active(&self) -> bool {
         false
     }
+
+    /// Called **instead of** `on_lock` when the vault locks while this plugin
+    /// has declared locked work (ADR 0002 §4) and its runtime file is not
+    /// waiting for review. It must drop everything `on_lock` drops, then may
+    /// keep running only what `ctx.runtime` describes, writing only to
+    /// `ctx.history`. Returns true if it keeps running. The default stops
+    /// everything, like `on_lock`.
+    fn run_locked(&self, _ctx: &LockedContext) -> bool {
+        self.on_lock();
+        false
+    }
+
+    /// Pause or resume background work from the tray (no PIN: agents cannot
+    /// reach the tray). The plugin records the pause in its history.
+    fn set_paused(&self, _paused: bool) {}
+
+    /// AegisWin is exiting: write a clean-stop record. Called before the
+    /// final `on_lock`, whether the vault is locked or not.
+    fn on_exit(&self, _reason: ExitReason) {}
 }
 
 pub struct Registry {

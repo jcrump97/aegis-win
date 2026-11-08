@@ -43,7 +43,7 @@ export function monitorPanel(deps: MonitorDeps): HTMLElement {
   const editor = ruleEditor(deps, () => list.refresh());
   list.onAdjust = (rule, id) => editor.load(rule, id);
   const chat = monitorChat(deps, (rule) => editor.load(rule, null), () => list.refresh());
-  const hint = h('p', { class: 'hint' }, 'While a monitor runs, closing this window keeps AegisWin running in the tray. Quit from the tray icon to stop it. Locking stops all monitors.');
+  const hint = h('p', { class: 'hint' }, 'While a monitor runs, closing this window keeps AegisWin running in the tray, and locking keeps the monitor going: it then records only to the encrypted history, which nothing can read until you unlock. Pause or resume from the tray icon; Quit there to stop.');
   const history = historyCard(deps);
   list.onRetention = history.showRetention;
   panel = h('div', { class: 'stack' }, hint, list.element, chat, editor.element, history.element);
@@ -93,7 +93,7 @@ function proposalView(deps: MonitorDeps, proposal: unknown, replaceId: string | 
     const r = await deps.run('activate_monitor', args, start);
     if (r.ok) {
       toast(`Monitor ${str(obj(r.value).id)} is running.`);
-      replace(message, h('div', { class: 'notice ok' }, `Monitor ${str(obj(r.value).id)} is running. It only watches and records while AegisWin is unlocked.`));
+      replace(message, h('div', { class: 'notice ok' }, `Monitor ${str(obj(r.value).id)} is running. It watches and records while AegisWin runs, also while locked.`));
       start.disabled = true;
       actions.started();
     } else if (r.error) replace(message, errorBox(r.error));

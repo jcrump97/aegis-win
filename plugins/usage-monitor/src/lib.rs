@@ -20,7 +20,7 @@ use aegis_core::history_service::HistoryHandle;
 use aegis_core::llm::LlmHandle;
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
-use aegis_core::registry::{CallReview, Plugin, PluginManifest, ToolContext, UnlockContext};
+use aegis_core::registry::{CallReview, ExitReason, LockedContext, Plugin, PluginManifest, ToolContext, UnlockContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, NaiveTime, Utc};
@@ -148,6 +148,12 @@ struct Telemetry {
     history: Option<HistoryHandle>,
     /// Records for the history stream, written by the sampler outside the lock.
     outbox: Vec<Value>,
+    /// Running while the vault is locked: monitors only, history only.
+    locked: bool,
+    /// Paused from the tray: the sampler stays off until resumed.
+    paused: bool,
+    /// A `session_start` was written and its `session_stop` not yet.
+    session_open: bool,
 }
 
 impl Telemetry {
@@ -164,9 +170,10 @@ impl Telemetry {
     /// Inside the watch window, like all other telemetry, it also keeps what
     /// the enabled components allow for replay.
     fn evaluate_monitors(&mut self, tick: &rules::Tick) {
-        if self.in_watch_window(tick.local_time) {
+        if !self.locked && self.in_watch_window(tick.local_time) {
             replay::remember(&mut self.recent, RecordedTick::keep(tick, &self.components));
         }
+        let locked = self.locked;
         let Self { monitors, hits, outbox, history, .. } = self;
         for m in &mut monitors.active {
             if let Some(hit) = m.evaluator.tick(tick) {
@@ -174,7 +181,10 @@ impl Telemetry {
                 if history.is_some() {
                     outbox.push(json!({ "kind": "monitor_hit", "monitorId": hit.monitor_id, "name": hit.name, "matched": hit.matched }));
                 }
-                push_capped(hits, hit);
+                // While locked nothing is kept in memory, only in the history.
+                if !locked {
+                    push_capped(hits, hit);
+                }
             }
         }
     }
@@ -184,8 +194,10 @@ impl Telemetry {
         group_needs(self.monitors.active.iter().flat_map(|m| rules::event_needs(m.evaluator.rule())))
     }
 
+    /// Spikes and foreground changes, inside the watch window, while
+    /// unlocked only: locked work is limited to the running monitors.
     fn record(&mut self, samples: &[ProcSample], foreground: Option<String>, now_local: NaiveTime, now: Instant) {
-        if !self.in_watch_window(now_local) {
+        if self.locked || !self.in_watch_window(now_local) {
             return;
         }
         let stamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -401,7 +413,13 @@ impl UsageMonitorPlugin {
         let stop = Arc::new(AtomicBool::new(false));
         let telemetry = Arc::clone(&self.telemetry);
         let flag = Arc::clone(&stop);
-        if let Some(history) = self.telemetry.lock().unwrap().history.clone() {
+        let opened = {
+            let mut t = self.telemetry.lock().unwrap();
+            let open = t.history.is_some() && !t.session_open;
+            t.session_open |= open;
+            open.then(|| t.history.clone()).flatten()
+        };
+        if let Some(history) = opened {
             write_history(&history, vec![session_start()]);
         }
         let thread = std::thread::Builder::new()
@@ -460,20 +478,48 @@ impl UsageMonitorPlugin {
         *slot = Some(Sampler { stop, thread });
     }
 
-    /// Stops the sampler and writes `session_stop` with `reason`.
-    fn stop_sampler(&self, reason: &str) {
+    /// Stops the sampler thread, if it runs.
+    fn join_sampler(&self) {
         if let Some(sampler) = self.sampler.lock().unwrap().take() {
             sampler.stop.store(true, Ordering::Relaxed);
             let _ = sampler.thread.join();
+        }
+    }
+
+    /// Stops the sampler and writes what it queued, then `marker` if a
+    /// session is open: `session_stop` ends the session, `paused` keeps it.
+    fn halt(&self, marker: Value) {
+        self.join_sampler();
+        let ends = marker["kind"] == "session_stop";
+        let (history, records) = {
             let mut t = self.telemetry.lock().unwrap();
             let mut records = std::mem::take(&mut t.outbox);
-            let history = t.history.clone();
-            drop(t);
-            if let Some(history) = history {
-                records.push(json!({ "kind": "session_stop", "reason": reason }));
-                write_history(&history, records);
+            if t.session_open {
+                t.session_open = !ends;
+                records.push(marker);
             }
+            (t.history.clone(), records)
+        };
+        if let Some(history) = history {
+            write_history(&history, records);
         }
+    }
+
+    /// Stops the sampler and ends the session with `reason`.
+    fn stop_sampler(&self, reason: &str) {
+        self.halt(json!({ "kind": "session_stop", "reason": reason }));
+    }
+
+    /// What `on_lock` does, for callers that already hold `book`.
+    fn stop_everything(&self) {
+        self.chat_generation.fetch_add(1, Ordering::SeqCst);
+        *self.chat.lock().unwrap() = None;
+        self.stop_sampler(timeline::STOP_LOCKED);
+        let mut t = self.telemetry.lock().unwrap();
+        t.clear();
+        t.sampling_since = None;
+        t.monitors = MonitorRuntime::default();
+        t.locked = false;
     }
 
     /// Tells the engine what runs while locked: the running monitors and
@@ -530,17 +576,38 @@ impl UsageMonitorPlugin {
         };
         self.telemetry.lock().unwrap().monitors = runtime;
         self.sync_runtime();
-        self.start_sampler_if_needed();
+        self.refresh_sampler();
     }
 
-    /// The sampler runs while a sampling component is on or a monitor runs.
+    /// The sampler is wanted while a monitor runs or, unlocked, a sampling
+    /// component is on.
+    fn sampler_wanted(t: &Telemetry) -> bool {
+        !t.monitors.active.is_empty() || (!t.locked && [COMPONENT_SPIKES, COMPONENT_FOREGROUND].iter().any(|c| t.enabled(c)))
+    }
+
+    /// Starts the sampler when it is wanted and not paused from the tray.
     fn start_sampler_if_needed(&self) {
         let needed = {
             let t = self.telemetry.lock().unwrap();
-            [COMPONENT_SPIKES, COMPONENT_FOREGROUND].iter().any(|c| t.enabled(c)) || !t.monitors.active.is_empty()
+            !t.paused && Self::sampler_wanted(&t)
         };
         if needed {
             self.start_sampler();
+        }
+    }
+
+    /// After the monitors changed: starts the sampler when needed, or ends
+    /// the session when nothing needs it any more (the last monitor was
+    /// paused or deleted with no sampling component on).
+    fn refresh_sampler(&self) {
+        let unwanted = {
+            let t = self.telemetry.lock().unwrap();
+            !t.paused && !Self::sampler_wanted(&t)
+        };
+        if unwanted {
+            self.stop_sampler(timeline::STOP_LOCKED);
+        } else {
+            self.start_sampler_if_needed();
         }
     }
 
@@ -554,7 +621,7 @@ impl UsageMonitorPlugin {
         store.set(monitors::STORE_KEY, book.to_value())?;
         self.telemetry.lock().unwrap().monitors = MonitorRuntime::build(&book, &ctx.enabled_components);
         self.sync_runtime();
-        self.start_sampler_if_needed();
+        self.refresh_sampler();
         Ok(out)
     }
 
@@ -726,7 +793,7 @@ impl UsageMonitorPlugin {
             "maxMonitors": rules::MAX_MONITORS,
             "loadError": t.monitors.load_error,
             "historyRetention": ctx.history.as_ref().and_then(|h| h.retention().ok()),
-            "note": "Monitors only watch and record while AegisWin is running and unlocked. They never run anything or change Windows.",
+            "note": "Monitors watch and record while AegisWin is running, also while it is locked (then to the encrypted history only). They never run anything or change Windows.",
         }))
     }
 
@@ -926,6 +993,8 @@ impl Plugin for UsageMonitorPlugin {
             let mut t = self.telemetry.lock().unwrap();
             t.components = enabled_components.clone();
             t.history = ctx.history.clone();
+            // A sampler still running from the locked state carries on, now unlocked.
+            t.locked = false;
         }
         self.load_monitors(ctx.store.as_ref(), enabled_components);
     }
@@ -938,13 +1007,75 @@ impl Plugin for UsageMonitorPlugin {
         // Waits for a monitor change in progress, so it cannot restart the
         // sampler after this. Later changes fail: the vault is already locked.
         let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_everything();
+    }
+
+    /// *Locked, monitoring* (ADR 0002 §4): drops what `on_lock` drops (chat,
+    /// in-memory telemetry, the watch window's data) and keeps only the
+    /// monitors the vault's runtime section lists, writing their hits and a
+    /// heartbeat to the encrypted history.
+    fn run_locked(&self, ctx: &LockedContext) -> bool {
+        let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        let (declared, components) = MonitorRuntime::from_runtime(&ctx.runtime);
+        if declared.active.is_empty() {
+            self.stop_everything();
+            return false;
+        }
         self.chat_generation.fetch_add(1, Ordering::SeqCst);
         *self.chat.lock().unwrap() = None;
-        self.stop_sampler(timeline::STOP_LOCKED);
-        let mut t = self.telemetry.lock().unwrap();
-        t.clear();
-        t.sampling_since = None;
-        t.monitors = MonitorRuntime::default();
+        {
+            let mut t = self.telemetry.lock().unwrap();
+            t.clear();
+            t.history = Some(ctx.history.clone());
+            t.locked = true;
+            t.paused = ctx.paused;
+            // Keep the running evaluators (and their cooldowns) when they are the declared ones.
+            let ids = |rt: &MonitorRuntime| rt.active.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+            if ids(&t.monitors) != ids(&declared) {
+                t.monitors = declared;
+            }
+            t.components = components;
+        }
+        if ctx.paused {
+            self.join_sampler();
+        } else {
+            self.start_sampler_if_needed();
+        }
+        true
+    }
+
+    /// Tray pause: the sampler stops and `paused` is recorded; resuming
+    /// records `resumed` and starts it again. The session stays open.
+    fn set_paused(&self, paused: bool) {
+        let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut t = self.telemetry.lock().unwrap();
+            if t.paused == paused {
+                return;
+            }
+            t.paused = paused;
+        }
+        if paused {
+            self.halt(json!({ "kind": "paused" }));
+            return;
+        }
+        let history = {
+            let t = self.telemetry.lock().unwrap();
+            t.session_open.then(|| t.history.clone()).flatten()
+        };
+        if let Some(history) = history {
+            write_history(&history, vec![json!({ "kind": "resumed" })]);
+        }
+        self.start_sampler_if_needed();
+    }
+
+    /// Ends the session with why AegisWin is exiting.
+    fn on_exit(&self, reason: ExitReason) {
+        let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_sampler(match reason {
+            ExitReason::Quit => timeline::STOP_QUIT,
+            ExitReason::Shutdown => timeline::STOP_SHUTDOWN,
+        });
     }
 
     /// The approval request for `activate_monitor` shows the description
@@ -1011,6 +1142,30 @@ mod tests {
         t.watch.end_time = "09:00".into();
         t.evaluate_monitors(&tick(20.0));
         assert!(t.recent.is_empty());
+    }
+
+    #[test]
+    fn while_locked_nothing_is_kept_in_memory() {
+        let mut t = Telemetry { monitors: monitor_runtime(json!({ "any": [{ "type": "system_cpu", "atLeastPercent": 50, "forSeconds": 5 }] })), locked: true, ..Default::default() };
+        t.components = vec![COMPONENT_SPIKES.into(), COMPONENT_FOREGROUND.into()];
+        let now = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        let busy = [ProcSample { pid: 7, name: "game.exe".into(), cpu_percent: 99.0, ram_mb: 9000 }];
+        let tick = rules::Tick {
+            now,
+            local_time: now.time(),
+            local_weekday: now.weekday(),
+            processes: &busy,
+            system_cpu_percent: 90.0,
+            system_memory_percent: 10.0,
+            foreground: Some("game.exe"),
+            events: &[],
+        };
+        t.record(&busy, Some("game.exe".into()), now.time(), Instant::now());
+        t.evaluate_monitors(&tick);
+        t.evaluate_monitors(&tick);
+        assert!(t.spikes.is_empty() && t.foreground.is_empty(), "no spikes or foreground apps while locked");
+        assert!(t.hits.is_empty() && t.recent.is_empty(), "hits go to the history only, nothing is kept for replay");
+        assert!(t.outbox.is_empty(), "without a history stream nothing is queued");
     }
 
     #[test]

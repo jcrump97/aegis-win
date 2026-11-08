@@ -1,11 +1,12 @@
-//! The monitor's encrypted history through the real engine (ADR 0002 §5).
+//! The monitor's encrypted history and *locked, monitoring* through the
+//! real engine (ADR 0002 §4, §5).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use aegis_core::engine::{Engine, EngineOptions, Origin, RunOutcome};
-use aegis_core::registry::{Plugin, Registry};
+use aegis_core::registry::{ExitReason, Plugin, Registry};
 use aegis_core::vault::KdfParams;
 use aegis_core::ErrorCode;
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES};
@@ -15,12 +16,22 @@ const PIN: &str = "246810";
 const UM: &str = "usage-monitor";
 
 async fn engine() -> (Arc<Engine>, tempfile::TempDir) {
+    let (engine, _plugin, dir) = engine_with_plugin().await;
+    (engine, dir)
+}
+
+async fn engine_with_plugin() -> (Arc<Engine>, Arc<UsageMonitorPlugin>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let registry = Registry::new(vec![Arc::new(UsageMonitorPlugin::default()) as Arc<dyn Plugin>]).unwrap();
+    let plugin = Arc::new(UsageMonitorPlugin::default());
+    let registry = Registry::new(vec![Arc::clone(&plugin) as Arc<dyn Plugin>]).unwrap();
     let engine = Engine::new(dir.path().join("data"), registry, EngineOptions { kdf: KdfParams::INSECURE_TEST, elevated: false });
     engine.setup(PIN.into()).await.unwrap();
     engine.set_installed(BTreeMap::from([(UM.to_owned(), vec![COMPONENT_CRASHES.to_owned()])])).unwrap();
-    (engine, dir)
+    (engine, plugin, dir)
+}
+
+fn reasons(view: &Value) -> Vec<String> {
+    view["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "session_stop").map(|e| e["reason"].as_str().unwrap().to_owned()).collect()
 }
 
 fn crash_rule() -> Value {
@@ -66,11 +77,14 @@ async fn reading_and_changing_history_needs_the_pin() {
 }
 
 #[tokio::test]
-async fn sessions_are_recorded_encrypted_and_a_lock_shows_as_a_stop() {
-    let (engine, _dir) = engine().await;
+async fn sessions_are_recorded_encrypted_and_a_running_monitor_keeps_going_while_locked() {
+    let (engine, plugin, _dir) = engine_with_plugin().await;
     run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
     engine.lock().await;
+    assert!(plugin.is_sampling(), "locked, monitoring: the monitor keeps running");
+    assert!(engine.locked_monitoring() && engine.background_active(), "the tray and close-to-tray see the locked work");
     engine.unlock(PIN.into()).await.unwrap();
+    assert!(!engine.locked_monitoring());
 
     let files = segment_files(&engine);
     assert!(!files.is_empty());
@@ -79,16 +93,17 @@ async fn sessions_are_recorded_encrypted_and_a_lock_shows_as_a_stop() {
         assert!(!raw.contains("session_start") && !raw.contains("Game crashes"), "nothing readable on disk");
     }
 
-    // Setup starts the sampler with every component on; choosing components
-    // restarts it; the monitor starts it again; lock stops it; unlock restarts.
+    // Setup starts the sampler with every component on; choosing only the
+    // crash component stops it; the monitor starts it again and it runs on
+    // through the lock and the unlock, in one session.
     let view = run(&engine, "read_monitor_history", json!({ "days": 1 })).await.unwrap();
-    assert_eq!(kinds(&view), ["session_start", "session_stop", "session_start", "session_stop", "session_start"]);
-    assert_eq!(view["events"][3]["reason"], "monitoring stopped");
+    assert_eq!(kinds(&view), ["session_start", "session_stop", "session_start"]);
+    assert_eq!(reasons(&view), ["monitoring stopped"]);
     assert_eq!(view["events"][0]["launch"], "manual");
     let gaps = view["gaps"].as_array().unwrap();
-    assert_eq!(gaps.len(), 2);
-    assert!(gaps.iter().all(|g| g["kind"] == "stopped"));
-    assert!(gaps[1]["label"].as_str().unwrap().contains("locked"));
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["kind"], "stopped");
+    assert!(gaps[0]["label"].as_str().unwrap().contains("settings changed"));
     assert!(view["problems"].as_array().unwrap().is_empty());
     assert_eq!(view["retention"], json!({ "maxDays": 14, "maxMb": 64 }));
 }
@@ -136,4 +151,86 @@ async fn retention_is_validated_and_shown_in_the_list() {
     let listed = engine.run_tool(ui(None), UM, "list_monitors", json!({})).await.unwrap();
     let RunOutcome::Completed { result } = listed else { panic!() };
     assert_eq!(result["historyRetention"], json!({ "maxDays": 3, "maxMb": 16 }));
+}
+
+#[tokio::test]
+async fn a_lock_with_no_monitor_running_ends_the_session() {
+    let (engine, plugin, _dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    run(&engine, "pause_monitor", json!({ "id": "m1" })).await.unwrap();
+    assert!(!plugin.is_sampling(), "the last monitor paused, nothing needs the sampler");
+    run(&engine, "pause_monitor", json!({ "id": "m1", "paused": false })).await.unwrap();
+    run(&engine, "delete_monitor", json!({ "id": "m1" })).await.unwrap();
+    engine.lock().await;
+    assert!(!plugin.is_sampling() && !engine.locked_monitoring() && !engine.background_active());
+    engine.unlock(PIN.into()).await.unwrap();
+    let view = run(&engine, "read_monitor_history", json!({})).await.unwrap();
+    assert_eq!(kinds(&view), ["session_start", "session_stop", "session_start", "session_stop", "session_start", "session_stop"]);
+}
+
+#[tokio::test]
+async fn the_tray_pause_is_recorded_and_quit_and_shutdown_say_why() {
+    let (engine, plugin, _dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    engine.lock().await;
+
+    // Pausing needs no PIN and works while locked.
+    engine.set_monitoring_paused(true);
+    assert!(engine.monitoring_paused() && !plugin.is_sampling());
+    let file: Value = serde_json::from_slice(&std::fs::read(runtime_file(&engine)).unwrap()).unwrap();
+    assert_eq!(file["paused"], true);
+    engine.set_monitoring_paused(false);
+    assert!(plugin.is_sampling());
+
+    engine.exit(ExitReason::Quit).await;
+    assert!(!plugin.is_sampling() && !engine.locked_monitoring(), "exiting stops the locked work too");
+
+    // A later launch (the same engine here) starts a new session; Windows ending it is a shutdown.
+    engine.unlock(PIN.into()).await.unwrap();
+    engine.exit(ExitReason::Shutdown).await;
+    engine.unlock(PIN.into()).await.unwrap();
+
+    let view = run(&engine, "read_monitor_history", json!({})).await.unwrap();
+    assert_eq!(kinds(&view)[2..], ["session_start", "paused", "resumed", "session_stop", "session_start", "session_stop", "session_start"]);
+    assert_eq!(reasons(&view)[1..], ["quit", "shutdown"]);
+    let gaps: Vec<&str> = view["gaps"].as_array().unwrap().iter().map(|g| g["kind"].as_str().unwrap()).collect();
+    assert_eq!(gaps, ["stopped", "paused", "stopped", "stopped"]);
+}
+
+#[tokio::test]
+async fn a_pause_carries_over_a_lock_and_an_unlock() {
+    let (engine, plugin, _dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    engine.set_monitoring_paused(true);
+    assert!(!plugin.is_sampling());
+    engine.lock().await;
+    assert!(!plugin.is_sampling() && engine.locked_monitoring(), "paused, but still the locked state with a monitor");
+    engine.unlock(PIN.into()).await.unwrap();
+    assert!(!plugin.is_sampling(), "still paused after unlock");
+    let file: Value = serde_json::from_slice(&std::fs::read(runtime_file(&engine)).unwrap()).unwrap();
+    assert_eq!(file["paused"], true);
+    assert!(engine.runtime_reviews().is_empty(), "a tray pause is not tampering");
+    engine.set_monitoring_paused(false);
+    assert!(plugin.is_sampling());
+}
+
+#[tokio::test]
+async fn a_runtime_file_waiting_for_review_does_not_run_while_locked() {
+    let (engine, plugin, _dir) = engine_with_plugin().await;
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    let mut file: Value = serde_json::from_slice(&std::fs::read(runtime_file(&engine)).unwrap()).unwrap();
+    file["plugin"]["components"] = json!(["usage-monitor:active-window"]);
+    std::fs::write(runtime_file(&engine), serde_json::to_vec(&file).unwrap()).unwrap();
+
+    engine.lock().await;
+    engine.unlock(PIN.into()).await.unwrap();
+    assert_eq!(engine.runtime_reviews().len(), 1, "the changed file was set aside");
+    assert!(plugin.is_sampling(), "unlocked, the monitor runs from the vault");
+    engine.lock().await;
+    assert!(!plugin.is_sampling() && !engine.locked_monitoring(), "nothing runs locked until the owner reviews it");
+
+    engine.unlock(PIN.into()).await.unwrap();
+    engine.rewrite_runtime_from_vault(UM).unwrap();
+    engine.lock().await;
+    assert!(plugin.is_sampling(), "after the rewrite, locking keeps the monitor running");
 }

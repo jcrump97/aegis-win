@@ -149,7 +149,11 @@ async fn the_runtime_file_mirrors_the_vault_and_a_tray_pause_is_not_tampering() 
     // Pausing from the tray needs no PIN, so it only flips `paused` on disk.
     let paused = RuntimeFile { paused: true, ..file.clone() };
     std::fs::write(runtime_path(&f.engine, "demo"), serde_json::to_vec(&paused).unwrap()).unwrap();
+    let locks = f.plugin.locks.load(std::sync::atomic::Ordering::SeqCst);
     f.engine.lock().await;
+    // A plugin without `run_locked` stops on lock as before, declared work or not.
+    assert_eq!(f.plugin.locks.load(std::sync::atomic::Ordering::SeqCst), locks + 1);
+    assert!(!f.engine.locked_monitoring() && !f.engine.background_active());
     f.engine.unlock(PIN.into()).await.unwrap();
     assert!(f.engine.runtime_reviews().is_empty());
     history(&f.plugin).set_runtime(Some(json!({ "rules": ["busy", "hot"] }))).unwrap();

@@ -5,13 +5,14 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aegis_core::engine::{Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
-use aegis_core::registry::{GatePolicy, Plugin, Registry};
+use aegis_core::registry::{ExitReason, GatePolicy, Plugin, Registry};
 use aegis_core::plan::PlanOrigin;
 use aegis_core::tickets::TicketView;
 use aegis_core::{AegisError, ErrorCode};
@@ -24,6 +25,16 @@ type Cmd<T> = Result<T, AegisError>;
 type EngineState<'a> = State<'a, Arc<Engine>>;
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
+
+/// Set when the owner quits (tray Quit, closing the window, the elevated
+/// restart). An exit without it is Windows ending the session, which the
+/// history records as a shutdown.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+fn request_quit(app: &AppHandle) {
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+    app.exit(0);
+}
 
 /// This install's single-instance claim, held for the life of the process.
 /// Released only for the elevated restart, so the elevated copy can start.
@@ -49,10 +60,20 @@ fn show_main(app: &AppHandle) {
 fn tray_text(engine: &Engine) -> String {
     let unlocked = engine.status().unlocked;
     let state = if unlocked { "unlocked" } else { "locked" };
+    let paused = if engine.monitoring_paused() { ", monitoring paused" } else { "" };
     match engine.change_running() {
-        Some(tool) => format!("AegisWin: {state}, running {tool}"),
-        None if unlocked && engine.background_active() => "AegisWin: unlocked, monitors running".into(),
-        None => format!("AegisWin: {state}"),
+        Some(tool) => format!("AegisWin: {state}, running {tool}{paused}"),
+        None if unlocked && engine.background_active() => format!("AegisWin: unlocked, monitors running{paused}"),
+        None if engine.locked_monitoring() => format!("AegisWin: locked, monitoring{paused}"),
+        None => format!("AegisWin: {state}{paused}"),
+    }
+}
+
+fn pause_label(paused: bool) -> &'static str {
+    if paused {
+        "Resume monitoring"
+    } else {
+        "Pause monitoring"
     }
 }
 
@@ -65,23 +86,35 @@ fn quit_app(app: &AppHandle) {
             return;
         }
     }
-    app.exit(0);
+    request_quit(app);
 }
 
-/// Tray menu: Open, Lock, Quit (ADR 0002 §4).
+/// Tray menu: Open, Lock, Pause monitoring, Quit (ADR 0002 §4).
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open AegisWin", true, None::<&str>)?;
     let lock = MenuItem::with_id(app, "lock", "Lock", true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, "pause", pause_label(false), true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let pause_item = pause.clone();
     let mut tray = TrayIconBuilder::with_id("main")
         .tooltip("AegisWin")
-        .menu(&Menu::with_items(app, &[&open, &lock, &quit])?)
+        .menu(&Menu::with_items(app, &[&open, &lock, &pause, &quit])?)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id().as_ref() {
+        .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => show_main(app),
             "lock" => {
                 let engine = app.state::<Arc<Engine>>().inner().clone();
                 tauri::async_runtime::spawn(async move { engine.lock().await });
+            }
+            // No PIN: only the person at this PC can reach the tray.
+            "pause" => {
+                let engine = app.state::<Arc<Engine>>();
+                let paused = !engine.monitoring_paused();
+                engine.set_monitoring_paused(paused);
+                let _ = pause_item.set_text(pause_label(paused));
+                if let Some(tray) = app.tray_by_id("main") {
+                    let _ = tray.set_tooltip(Some(tray_text(&engine)));
+                }
             }
             "quit" => quit_app(app),
             _ => {}
@@ -275,8 +308,9 @@ async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim:
     if let Some(tool) = engine.change_running() {
         return Err(AegisError::new(ErrorCode::Conflict, format!("Wait for {tool} to finish before restarting as administrator.")));
     }
-    // Stop the MCP server first so the elevated copy can bind the same port.
-    engine.lock().await;
+    // Stop the MCP server first so the elevated copy can bind the same port,
+    // and stop monitoring here so only one copy writes the history.
+    engine.exit(ExitReason::Quit).await;
     // Let go of this install before the elevated copy starts and checks it.
     drop(claim.0.lock().unwrap().take());
     let reclaim = || {
@@ -286,7 +320,7 @@ async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim:
     };
     match aegis_core::os::relaunch_elevated() {
         Ok(()) => {
-            app.exit(0);
+            request_quit(&app);
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -319,6 +353,9 @@ fn main() {
                 if window.state::<Arc<Engine>>().background_active() {
                     api.prevent_close();
                     let _ = window.hide();
+                } else {
+                    // Closing the last window quits.
+                    QUIT_REQUESTED.store(true, Ordering::SeqCst);
                 }
             }
         })
@@ -368,9 +405,11 @@ fn main() {
         .expect("error while building AegisWin");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
-            // Removes the firewall rule and stops background sampling on a clean exit.
+            // Writes the clean-stop record (quit, or Windows ending the session),
+            // removes the firewall rule, and stops all background work.
+            let reason = if QUIT_REQUESTED.load(Ordering::SeqCst) { ExitReason::Quit } else { ExitReason::Shutdown };
             let engine = handle.state::<Arc<Engine>>().inner().clone();
-            tauri::async_runtime::block_on(engine.lock());
+            tauri::async_runtime::block_on(engine.exit(reason));
         }
     });
 }
