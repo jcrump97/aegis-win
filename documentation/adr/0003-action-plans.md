@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Not implemented; Phase 1 waits until in-progress MCP server work lands, because both change the approval-ticket code.
+- **Status**: Accepted (2026-11-07). Not implemented yet. The MCP server work it waited on, which also changes the approval-ticket code, is committed (`e66f1a5` on `feat/mcp-loopback`), so Phase 1 builds on it.
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 

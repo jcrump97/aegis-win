@@ -68,7 +68,7 @@ The governing rule for every part of this design: **the AI proposes, code valida
 - **What a monitor can do when it fires**: write a `monitor_hit` record and optionally change the tray icon. **There is no action, script, or tool call.** If actions are ever added, a hit may only open a normal approval ticket.
 - **Validation**: `aegis-core::schema` checks shape and ranges. Per-type rules it cannot express (field sets per `type`, process-name characters, components enabled) are checked in code, as PLUGIN_SPEC §2.2 already allows. A rule that needs a disabled component is rejected with the reason; a monitor never turns a component on.
 - **Privacy flags** shown on review: `foreground` conditions, `"*"` process scope, and all-day schedules.
-- The existing watch window becomes a built-in rule named "Default" (Phase 1), so there is one model, not two.
+- ~~The existing watch window becomes a built-in rule named "Default" (Phase 1), so there is one model, not two.~~ **Dropped (2026-11-07).** The watch window does a job a rule cannot: it decides what the sampler records at all (spikes, the replay history, foreground changes), and it is the PIN-gated privacy boundary that keeps `propose_monitor` replay from showing an agent anything outside it. A rule only decides when something is worth flagging. A migration would also have needed answers to target lists longer than 8 conditions, foreground tracking that is not a threshold, and whether Default could be paused or deleted. So there are two models on purpose: the watch window says what is recorded, rules say what is a hit.
 
 **Activation takes the full rule (Phase 1c).** The first draft had `propose_monitor` return a `proposalId` that `activate_monitor` referenced. Instead, `activate_monitor` takes the whole rule, so the approval request shows exactly what will run and there is no proposal store to expire or clear. The rule is validated again when the approved call runs, against the components enabled at that moment. Monitor ids are `m1`, `m2`, … and are never reused.
 
@@ -97,7 +97,7 @@ The governing rule for every part of this design: **the AI proposes, code valida
 | `list_monitors` | auto | true | Active and paused monitors, with code-generated descriptions |
 | `delete_monitor`, `pause_monitor` | **pin_required** | false | Weakening monitoring could hide evidence, so it needs the PIN |
 | `read_monitor_history` | **pin_required** (open question 2) | true | Decrypted history, needs the vault unlocked |
-| `configure_watch_window` | **auto → pin_required** | false | Closes the gap where an agent could quietly change what is recorded (Phase 0). Removed once "Default" is a rule. |
+| `configure_watch_window` | **auto → pin_required** | false | Closes the gap where an agent could quietly change what is recorded (Phase 0). Kept: the "Default" migration was dropped (§1). |
 | `purge_telemetry_history` | pin_required (unchanged) | false | Now also deletes history files and replaces the monitor keypair (§6) |
 
 The approval portal and the in-app queue show the **code-generated description and privacy flags** for `activate_monitor`, not only the raw arguments.
@@ -260,7 +260,7 @@ Each phase is its own PR with tests, ledger row, and doc updates. Phases 0–2 s
 | Phase | Scope | Depends on |
 | :--- | :--- | :--- |
 | **0. Gate fix** | `configure_watch_window` → `pin_required`; tests; docs | — |
-| **1. Rules without AI** | Rule schema and validation, shared evaluator in the sampler, code-generated descriptions, privacy flags, `propose`/`activate`/`list`/`pause`/`delete` tools, rules stored in the vault, "Default" rule migration, approval page shows descriptions, manual rule editor in the UI, replay against in-memory data | 0 |
+| **1. Rules without AI** | Rule schema and validation, shared evaluator in the sampler, code-generated descriptions, privacy flags, `propose`/`activate`/`list`/`pause`/`delete` tools, rules stored in the vault, ~~"Default" rule migration~~ (dropped, §1), approval page shows descriptions, manual rule editor in the UI, replay against in-memory data | 0 |
 | **2. AI creator** | Chat commands, reply schema, question loop and limits, question filter, reasoning panel and consistency check, process-list consent, LAN/Off-LAN labelling, tests against a loopback LLM mock | 1 |
 | **3. Lifecycle** | Tray, close-to-tray, *locked, monitoring* state and plugin hook, idle auto-lock, single instance, shutdown message handling | 1 |
 | **4. Encrypted history** | Shared `aegis-core` history service with per-stream keypairs and `HistoryHandle`, the `usage-monitor` stream, `runtime.json`, segment writer and reader, 30-second flush, retention, purge with key replacement, tamper check, history view, gap detection with System log classification | 3 |
