@@ -72,6 +72,17 @@ npm install
 
 `npm run dev` and `npm run tauri:dev` both use port 1420, so run only one at a time.
 
+### Connecting Claude Code in this folder
+
+The repo's `.mcp.json` points Claude Code at AegisWin's MCP server. It holds no secrets; it reads two environment variables:
+
+| Variable | Value |
+| :--- | :--- |
+| `AEGIS_MCP_TOKEN` | Required. The bearer token from the MCP tab (**Show token and setup commands**, needs your PIN). Update it after rotating the token. |
+| `AEGIS_MCP_URL` | Optional, defaults to `http://127.0.0.1:47821/mcp`. Set it only if you changed the port. A LAN bind still listens on `127.0.0.1`, so clients on this PC never need the LAN address. |
+
+Set them in your user environment, not in a file in the repo, so the token is never committed.
+
 ## Contributing
 
 - Read [`AGENT.md`](AGENT.md) for the engineering rules, and [`documentation/PLUGIN_SPEC.md`](documentation/PLUGIN_SPEC.md) before touching a plugin.

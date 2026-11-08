@@ -5,8 +5,12 @@
 //! - `GET|POST /approve/{ticketId}`: a no-script HTML page where the owner
 //!   approves or declines with their PIN. Protected by a per-ticket CSRF token.
 //!
-//! Every request must carry a `Host` header naming the bound address (DNS
-//! rebinding defense), and a cross-site `Origin` is rejected.
+//! Every request must carry a `Host` header naming the address it arrived on
+//! (DNS rebinding defense), and a cross-site `Origin` is rejected.
+//!
+//! A LAN bind also listens on `127.0.0.1` at the same port, so clients on this
+//! PC keep one fixed URL whatever the bind address. Approval links always use
+//! the bind address, so other devices on the network can open them.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -21,7 +25,8 @@ use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::engine::{Engine, Origin, RunOutcome};
@@ -38,7 +43,10 @@ const MAX_BODY: usize = 1024 * 1024;
 #[serde(rename_all = "camelCase")]
 pub struct McpStatus {
     pub running: bool,
+    /// The bind address URL. For a LAN bind, what other devices on the network use.
     pub url: Option<String>,
+    /// Set only for a LAN bind: the `127.0.0.1` URL that clients on this PC use.
+    pub local_url: Option<String>,
     pub firewall_rule: bool,
     /// Something the owner should know (e.g. the firewall rule could not be added).
     pub note: Option<String>,
@@ -46,13 +54,14 @@ pub struct McpStatus {
 
 impl McpStatus {
     pub fn stopped() -> Self {
-        Self { running: false, url: None, firewall_rule: false, note: None }
+        Self { running: false, url: None, local_url: None, firewall_rule: false, note: None }
     }
 }
 
 pub struct McpHandle {
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    /// `true` once stopping: listeners stop accepting and refuse every request.
+    stopped: watch::Sender<bool>,
+    tasks: Vec<JoinHandle<()>>,
     status: McpStatus,
     firewall_rule: Option<String>,
 }
@@ -63,8 +72,13 @@ impl McpHandle {
     }
 
     pub async fn stop(self) {
-        let _ = self.shutdown.send(());
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.task).await;
+        self.stopped.send_replace(true);
+        // Connections still open after this run on as their own tasks, but
+        // host_guard refuses anything they send.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for task in self.tasks {
+            let _ = tokio::time::timeout_at(deadline, task).await;
+        }
         if let Some(rule) = self.firewall_rule {
             let _ = tokio::task::spawn_blocking(move || delete_firewall_rule(&rule)).await;
         }
@@ -76,31 +90,52 @@ struct AppState {
     engine: Arc<Engine>,
     allowed_hosts: Arc<Vec<String>>,
     base_url: Arc<String>,
+    stopped: watch::Receiver<bool>,
+}
+
+/// The `Host` values a listener on `host:port` accepts: only its own address.
+fn allowed_hosts(host: Ipv4Addr, port: u16) -> Vec<String> {
+    let mut hosts = vec![format!("{host}:{port}")];
+    if host == Ipv4Addr::LOCALHOST {
+        hosts.push(format!("localhost:{port}"));
+    }
+    hosts
 }
 
 pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall: bool, elevated: bool) -> AegisResult<McpHandle> {
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from((host, port))).await.map_err(|e| {
+    let listener = TcpListener::bind(SocketAddr::from((host, port))).await.map_err(|e| {
         AegisError::new(ErrorCode::Conflict, format!("Could not start the MCP server on {host}:{port} (port in use, or not an address of this PC): {e}"))
     })?;
     let port = listener.local_addr().map_err(|e| AegisError::failed(e.to_string()))?.port();
     let base_url = format!("http://{host}:{port}");
-    let mut allowed_hosts = vec![format!("{host}:{port}")];
-    if host.is_loopback() {
-        allowed_hosts.push(format!("localhost:{port}"));
-    }
 
-    let mut status = McpStatus { running: true, url: Some(format!("{base_url}/mcp")), firewall_rule: false, note: None };
+    // Any other bind keeps 127.0.0.1 too, so this PC's clients never need the
+    // LAN address. That port must be ours: if another program held it, local
+    // clients would hand it their bearer token, so refuse to start instead.
+    let loopback = if host == Ipv4Addr::LOCALHOST {
+        None
+    } else {
+        Some(TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await.map_err(|e| {
+            AegisError::new(
+                ErrorCode::Conflict,
+                format!("Could not also listen on 127.0.0.1:{port}, which clients on this PC use. Another program may be using that port; pick a different one: {e}"),
+            )
+        })?)
+    };
+    let local_url = loopback.is_some().then(|| format!("http://{}:{port}/mcp", Ipv4Addr::LOCALHOST));
+
+    let mut status = McpStatus { running: true, url: Some(format!("{base_url}/mcp")), local_url, firewall_rule: false, note: None };
     let mut firewall_rule = None;
     if !host.is_loopback() && open_firewall {
         if elevated {
             let rule = format!("AegisWin-MCP-{port}");
             let (rule_for_task, host_s) = (rule.clone(), host.to_string());
-            match tokio::task::spawn_blocking(move || add_firewall_rule(&rule_for_task, &host_s, port)).await {
-                Ok(Ok(())) => {
+            let added = tokio::task::spawn_blocking(move || add_firewall_rule(&rule_for_task, &host_s, port)).await.map_err(|e| e.to_string()).and_then(|r| r);
+            match added {
+                Ok(()) => {
                     status.firewall_rule = true;
                     firewall_rule = Some(rule);
                 }
-                Ok(Err(e)) => status.note = Some(format!("The Windows Firewall rule could not be added: {e}")),
                 Err(e) => status.note = Some(format!("The Windows Firewall rule could not be added: {e}")),
             }
         } else {
@@ -110,28 +145,43 @@ pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall
         }
     }
 
-    let state = AppState { engine, allowed_hosts: Arc::new(allowed_hosts), base_url: Arc::new(base_url) };
-    let app = Router::new()
+    let base_url = Arc::new(base_url);
+    let (stopped, rx) = watch::channel(false);
+    let mut tasks = vec![serve(listener, router(engine.clone(), allowed_hosts(host, port), base_url.clone(), rx.clone()), rx.clone())];
+    if let Some(l) = loopback {
+        tasks.push(serve(l, router(engine, allowed_hosts(Ipv4Addr::LOCALHOST, port), base_url, rx.clone()), rx));
+    }
+    Ok(McpHandle { stopped, tasks, status, firewall_rule })
+}
+
+fn router(engine: Arc<Engine>, allowed_hosts: Vec<String>, base_url: Arc<String>, stopped: watch::Receiver<bool>) -> Router {
+    let state = AppState { engine, allowed_hosts: Arc::new(allowed_hosts), base_url, stopped };
+    Router::new()
         .route("/mcp", post(mcp_post).get(method_not_allowed).delete(method_not_allowed))
         .route("/approve/{id}", get(portal_get).post(portal_post))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .with_state(state);
+        .with_state(state)
+}
 
-    let (tx, rx) = oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
+fn serve(listener: TcpListener, app: Router, mut stopped: watch::Receiver<bool>) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = rx.await;
+            .with_graceful_shutdown(async move {
+                let _ = stopped.wait_for(|s| *s).await;
             })
             .await;
-    });
-    Ok(McpHandle { shutdown: tx, task, status, firewall_rule })
+    })
 }
 
 // ---- request guards -----------------------------------------------------
 
 async fn host_guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if *state.stopped.borrow() {
+        let mut response = (StatusCode::SERVICE_UNAVAILABLE, "The MCP server has stopped.").into_response();
+        response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+        return response;
+    }
     let headers = request.headers();
     let host_ok = headers
         .get(header::HOST)

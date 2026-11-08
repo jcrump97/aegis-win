@@ -2,7 +2,10 @@
 
 mod common;
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use aegis_core::engine::SettingsUpdate;
 use common::{ready, Fixture, PIN};
@@ -21,10 +24,14 @@ fn free_port() -> u16 {
 }
 
 async fn server() -> Server {
+    server_on(None).await
+}
+
+async fn server_on(host: Option<String>) -> Server {
     let f = ready().await;
     let view = f
         .engine
-        .update_settings(SettingsUpdate { mcp_enabled: Some(true), mcp_port: Some(free_port()), ..Default::default() })
+        .update_settings(SettingsUpdate { mcp_enabled: Some(true), mcp_host: host, mcp_port: Some(free_port()), ..Default::default() })
         .await
         .unwrap();
     assert!(view.mcp.status.running, "{:?}", view.mcp.status);
@@ -193,4 +200,110 @@ async fn locking_stops_the_server() {
     let s = server().await;
     s.f.engine.lock().await;
     assert!(s.http.post(&s.url).bearer_auth(&s.token).json(&json!({})).send().await.is_err());
+}
+
+#[tokio::test]
+async fn stop_drops_connections_that_outlive_the_grace_period() {
+    let f = ready().await;
+    let handle = aegis_core::mcp::start(f.engine.clone(), Ipv4Addr::LOCALHOST, 0, false, false).await.unwrap();
+    let addr = handle.status().url.unwrap().trim_start_matches("http://").trim_end_matches("/mcp").to_owned();
+    // Headers never finish, so graceful shutdown would wait on this connection forever.
+    let mut slow = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    slow.write_all(b"GET /approve/x HTTP/1.1\r\nHost: ").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    handle.stop().await;
+    assert!(tokio::net::TcpStream::connect(&addr).await.is_err(), "the listener outlived stop()");
+
+    // Finishing the request must not reach the stopped server's handlers.
+    let _ = slow.write_all(format!("{addr}\r\nConnection: close\r\n\r\n").as_bytes()).await;
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), slow.read_to_end(&mut reply)).await;
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.is_empty() || reply.starts_with("HTTP/1.1 503"), "a stopped server answered: {reply}");
+}
+
+#[tokio::test]
+async fn loopback_bind_has_no_separate_local_url() {
+    let s = server().await;
+    assert!(s.url.starts_with("http://127.0.0.1:"));
+    assert_eq!(s.f.engine.mcp_status().await.local_url, None);
+}
+
+/// Checks a running non-loopback bind on `host` and its 127.0.0.1 companion, then stops it.
+async fn assert_dual_listener(s: &Server, host: Ipv4Addr, local: &str) {
+    let port = s.url.trim_end_matches("/mcp").rsplit(':').next().unwrap().to_owned();
+    assert_eq!(s.url, format!("http://{host}:{port}/mcp"));
+    assert_eq!(local, format!("http://127.0.0.1:{port}/mcp"));
+
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    for url in [s.url.as_str(), local] {
+        let r = s.http.post(url).bearer_auth(&s.token).json(&ping).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{url}");
+    }
+    // Each listener accepts only its own address in Host.
+    let r = s.http.post(local).bearer_auth(&s.token).header("host", format!("{host}:{port}")).json(&ping).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    let r = s.http.post(&s.url).bearer_auth(&s.token).header("host", format!("127.0.0.1:{port}")).json(&ping).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+
+    // A ticket asked for over loopback still links to the bind address, so a phone can approve it.
+    let out: Value = s
+        .http
+        .post(local)
+        .bearer_auth(&s.token)
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "demo__fix", "arguments": { "note": "from loopback" } } }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let approval_url = out["result"]["structuredContent"]["approvalUrl"].as_str().unwrap_or_default();
+    assert!(approval_url.starts_with(&format!("http://{host}:{port}/approve/")), "{out}");
+}
+
+/// Runs everywhere: 127.0.0.2 is not 127.0.0.1, so it gets the same companion listener as a LAN bind.
+#[tokio::test]
+async fn non_loopback_bind_also_serves_127_0_0_1() {
+    let f = ready().await;
+    let host = Ipv4Addr::new(127, 0, 0, 2);
+    let handle = aegis_core::mcp::start(f.engine.clone(), host, 0, false, false).await.unwrap();
+    let status = handle.status();
+    let local = status.local_url.clone().expect("companion listener");
+    let token = f.engine.reveal_mcp_token(PIN.into()).await.unwrap();
+    let s = Server { f, url: status.url.unwrap(), base: String::new(), token, http: reqwest::Client::new() };
+    assert_dual_listener(&s, host, &local).await;
+
+    handle.stop().await;
+    for url in [s.url.as_str(), local.as_str()] {
+        assert!(s.http.post(url).bearer_auth(&s.token).json(&json!({})).send().await.is_err(), "{url} still answers after stop");
+    }
+}
+
+#[tokio::test]
+async fn non_loopback_bind_refuses_to_start_when_127_0_0_1_is_taken() {
+    let f = ready().await;
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let err = aegis_core::mcp::start(f.engine.clone(), Ipv4Addr::new(127, 0, 0, 2), port, false, false).await.err().expect("must not start");
+    assert_eq!(err.code, aegis_core::ErrorCode::Conflict);
+    assert!(err.message.contains("127.0.0.1"), "{}", err.message);
+}
+
+/// Through the settings path with this PC's real LAN address. Skipped (with a
+/// message) without one; `non_loopback_bind_also_serves_127_0_0_1` covers the logic.
+#[tokio::test]
+async fn lan_bind_from_settings_also_serves_loopback() {
+    let Some(lan) = aegis_core::os::primary_lan_ipv4() else {
+        eprintln!("skipped: this PC has no private IPv4 address");
+        return;
+    };
+    let s = server_on(Some(lan.to_string())).await;
+    let local = s.f.engine.mcp_status().await.local_url.expect("companion listener");
+    assert_dual_listener(&s, lan, &local).await;
+
+    s.f.engine.lock().await;
+    for url in [s.url.as_str(), local.as_str()] {
+        assert!(s.http.post(url).bearer_auth(&s.token).json(&json!({})).send().await.is_err(), "{url} still answers after lock");
+    }
 }

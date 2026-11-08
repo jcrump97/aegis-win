@@ -110,6 +110,8 @@ export interface Endpoint {
 export interface McpStatus {
   running: boolean;
   url: string | null;
+  /** The URL for clients on this PC (127.0.0.1 even when bound to a LAN address). */
+  localUrl: string | null;
   firewallRule: boolean;
   note: string | null;
 }

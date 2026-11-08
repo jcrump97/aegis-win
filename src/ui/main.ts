@@ -589,6 +589,9 @@ function mcpTab(): HTMLElement {
       statusCard,
       h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'Status'), h('span', { class: `badge ${s.running ? 'ok' : ''}` }, s.running ? 'running' : 'stopped'), toggle),
       s.url ? h('div', { class: 'row' }, h('code', { class: 'grow' }, s.url), h('button', { onclick: () => copyText(s.url!) }, 'Copy URL')) : h('p', { class: 'hint' }, 'The server only runs while AegisWin is unlocked. Starting it also turns on auto-start after unlock.'),
+      s.localUrl
+        ? h('div', {}, h('div', { class: 'hint' }, 'AI clients on this PC can keep using'), h('div', { class: 'row' }, h('code', { class: 'grow' }, s.localUrl), h('button', { onclick: () => copyText(s.localUrl!) }, 'Copy URL')))
+        : null,
       s.firewallRule ? h('div', { class: 'notice ok' }, 'A Windows Firewall rule allows other PCs on your private network to connect. It is removed when the server stops.') : null,
       s.note ? h('div', { class: 'notice' }, s.note) : null,
     );
@@ -628,14 +631,21 @@ function mcpTab(): HTMLElement {
     if (pin === null) return;
     try {
       const token = await api.revealMcpToken(pin);
-      const url = settings!.mcp.status.url ?? `http://${settings!.mcp.host}:${settings!.mcp.port}/mcp`;
-      const claudeCode = `claude mcp add --transport http aegis-win ${url} --header "Authorization: Bearer ${token}"`;
-      const json = JSON.stringify({ mcpServers: { 'aegis-win': { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2);
+      // Clients on this PC always use 127.0.0.1; a LAN bind adds a URL for other devices.
+      const { mcp: m } = settings!;
+      const lan = m.host !== '127.0.0.1';
+      const thisPc = m.status.localUrl ?? (lan ? null : m.status.url) ?? `http://127.0.0.1:${m.port}/mcp`;
+      const network = lan ? (m.status.url ?? `http://${m.host}:${m.port}/mcp`) : null;
+      const claudeCode = (url: string) => `claude mcp add --transport http aegis-win ${url} --header "Authorization: Bearer ${token}"`;
+      const json = (url: string) => JSON.stringify({ mcpServers: { 'aegis-win': { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2);
+      const snippet = (label: string, text: string, button: string) => h('div', {}, h('div', { class: 'hint' }, label), h('pre', {}, text), h('button', { onclick: () => copyText(text) }, button));
       replace(
         tokenArea,
         h('div', { class: 'row' }, h('code', { class: 'grow' }, token), h('button', { onclick: () => copyText(token) }, 'Copy token')),
-        h('div', {}, h('div', { class: 'hint' }, 'Claude Code'), h('pre', {}, claudeCode), h('button', { onclick: () => copyText(claudeCode) }, 'Copy command')),
-        h('div', {}, h('div', { class: 'hint' }, 'JSON config (clients that support HTTP servers)'), h('pre', {}, json), h('button', { onclick: () => copyText(json) }, 'Copy JSON')),
+        snippet(lan ? 'Claude Code on this PC' : 'Claude Code', claudeCode(thisPc), 'Copy command'),
+        snippet(lan ? 'JSON config on this PC (clients that support HTTP servers)' : 'JSON config (clients that support HTTP servers)', json(thisPc), 'Copy JSON'),
+        network ? snippet('Claude Code on another device on your network', claudeCode(network), 'Copy command') : null,
+        network ? snippet('JSON config on another device on your network', json(network), 'Copy JSON') : null,
       );
     } catch (e) {
       await handleError(e);
