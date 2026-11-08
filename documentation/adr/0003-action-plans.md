@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Not implemented yet. The MCP server work it waited on, which also changes the approval-ticket code, is committed (`e66f1a5` on `feat/mcp-loopback`), so Phase 1 builds on it.
+- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`; see "As built" in §10. Phases 2-5 are not.
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 
@@ -191,6 +191,15 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 | **3. Plans over MCP** | `aegis__propose_plan`, `aegis__cancel_ticket`, hashing, dry-run previews, limits, re-checks, sequential executor, per-step results, `cancelled` status, browser page | 2 |
 | **4. In-app plans** | Add to plan, review screen with labelled text, cancel button | 3 |
 | **5. Persisted audit** | `approvals` history stream | 3 and ADR 0002 Phase 4 |
+
+**As built, Phase 1** (decided 2026-11-07, during implementation):
+
+- **The executor** is `aegis-core::executor`: one slot, a FIFO queue of at most 10, and the 30-minute queue limit, as in §5.1. Every admission carries the session it was approved in, so an item admitted just before a lock is refused rather than surviving it. A caller that goes away (an agent disconnects) cannot cut a change off: queued work runs on its own task.
+- **A ticket shows `queued` only when something is ahead of it**, so an approval with nothing else running still answers `running`, as before.
+- **The step-list ticket model moves to Phase 3**, where plans first use it, so the single-tool path is reshaped once rather than twice. Phase 1 changes no ticket fields except the new `queued` status and `queuePosition`.
+- **Cancel buttons** for queued items come with `aegis__cancel_ticket` in Phase 3. Until then, Lock cancels everything waiting.
+- **Quit while running** asks in a Windows Yes/No box (No is the default). Closing the window while a change runs or waits hides to the tray instead.
+- **The top bar** shows "Change in progress: <tool> · N waiting"; the tray tooltip names the running tool.
 
 ## 11. Open questions
 

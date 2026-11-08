@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::error::{AegisError, AegisResult, ErrorCode};
+use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
 use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
@@ -54,6 +55,8 @@ pub struct Engine {
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
     /// Last owner activity, for idle auto-lock.
     activity: Mutex<Instant>,
+    /// One state-changing run at a time.
+    executor: Executor,
 }
 
 /// Where a tool call came from. Only the desktop UI can pass a PIN inline;
@@ -81,6 +84,8 @@ pub struct Status {
     pub data_dir: String,
     pub pin_lockout_seconds: u64,
     pub ui_scale: u32,
+    /// The change running now and how many wait (for the app's top bar).
+    pub change: ChangeView,
 }
 
 #[derive(Debug, Serialize)]
@@ -249,6 +254,7 @@ impl Engine {
             kdf: options.kdf,
             mcp: tokio::sync::Mutex::new(None),
             activity: Mutex::new(Instant::now()),
+            executor: Executor::default(),
         })
     }
 
@@ -312,6 +318,7 @@ impl Engine {
             data_dir: self.data_dir.display().to_string(),
             pin_lockout_seconds: lock(&self.guard).check(Instant::now()).err().map_or(0, |d| d.as_secs().max(1)),
             ui_scale: state.map_or(100, |s| s.ui_scale),
+            change: self.executor.view(),
         }
     }
 
@@ -388,31 +395,46 @@ impl Engine {
         *lock(&self.activity)
     }
 
-    /// True when an installed plugin has background work running (only while
-    /// unlocked: locking stops it).
+    /// True while a change is running or waiting, or an installed plugin has
+    /// background work (only while unlocked: locking stops it). Closing the
+    /// window then hides to the tray, so a repair is not cut off.
     pub fn background_active(&self) -> bool {
+        if self.executor.view() != ChangeView::default() {
+            return true;
+        }
         let installed = lock(&self.vault).as_ref().map(|v| v.state.installed_plugins.clone()).unwrap_or_default();
         installed.iter().filter_map(|id| self.registry.plugin(id)).any(|p| p.background_active())
     }
 
     /// Locks the vault when the owner has been away for the auto-lock
-    /// timeout. Returns true when it locked.
+    /// timeout. Returns true when it locked. A change that is running then
+    /// finishes first, and nothing new starts meanwhile, so a long queue cannot
+    /// hold the vault open.
     pub async fn lock_if_idle(&self, now: Instant) -> bool {
         let Some(minutes) = lock(&self.vault).as_ref().map(|v| v.state.auto_lock_minutes) else {
             return false;
         };
         let minutes = if AUTO_LOCK_CHOICES.contains(&minutes) { minutes } else { DEFAULT_AUTO_LOCK_MINUTES };
-        if now.saturating_duration_since(self.last_activity()) < Duration::from_secs(u64::from(minutes) * 60) {
+        let due = now.saturating_duration_since(self.last_activity()) >= Duration::from_secs(u64::from(minutes) * 60);
+        self.executor.hold(due);
+        if !due || self.executor.running().is_some() {
             return false;
         }
         self.lock().await;
         true
     }
 
+    /// The tool whose change is running now, if any.
+    pub fn change_running(&self) -> Option<String> {
+        self.executor.running()
+    }
+
     /// Stops the MCP server and background work, drops the key, and forgets tickets.
     pub async fn lock(&self) -> Status {
         self.stop_mcp().await;
         let installed = lock(&self.vault).take().map(|v| v.state.installed_plugins.clone()).unwrap_or_default();
+        // Waiting changes never resume after unlock; a running one finishes.
+        self.executor.cancel_all();
         for id in installed {
             if let Some(plugin) = self.registry.plugin(&id) {
                 plugin.on_lock();
@@ -826,6 +848,8 @@ impl Engine {
     }
 
     pub async fn run_tool(&self, origin: Origin, plugin_id: &str, tool_id: &str, args: Value) -> AegisResult<RunOutcome> {
+        // Read before the vault is checked, so a change cannot slip into the queue across a lock.
+        let epoch = self.executor.epoch();
         // Checked before anything else, so an agent learns nothing about an app-only tool.
         if matches!(origin, Origin::Mcp) && self.registry.tool(plugin_id, tool_id).is_some_and(|(_, t)| t.app_only) {
             return Err(AegisError::new(ErrorCode::UnknownTool, format!("unknown tool {plugin_id}:{tool_id}")));
@@ -833,7 +857,7 @@ impl Engine {
         let prepared = self.prepare(plugin_id, tool_id, args)?;
         match prepared.gate {
             Gate::NeedsAdmin => Err(AegisError::requires_admin(&prepared.tool.name)),
-            Gate::Run => execute(prepared).await,
+            Gate::Run => self.run_in_turn(epoch, prepared).await,
             Gate::NeedsPin => match origin {
                 Origin::Ui { pin: None } => {
                     Err(AegisError::new(ErrorCode::PinRequired, format!("Enter your PIN to run {}.", prepared.tool.name)))
@@ -841,7 +865,7 @@ impl Engine {
                 Origin::Ui { pin: Some(pin) } => {
                     let pin = Zeroizing::new(pin);
                     self.check_pin(&pin).await?;
-                    execute(prepared).await
+                    self.run_in_turn(epoch, prepared).await
                 }
                 Origin::Mcp => {
                     let review = prepared.plugin.review_call(&prepared.tool.id, &prepared.args, &prepared.ctx.enabled_components);
@@ -863,14 +887,49 @@ impl Engine {
         }
     }
 
+    /// Runs a call now if it cannot change the system, otherwise in its turn.
+    async fn run_in_turn(&self, epoch: u64, prepared: Prepared) -> AegisResult<RunOutcome> {
+        if !changes_system(&prepared.tool, &prepared.args) {
+            return execute(prepared).await;
+        }
+        let engine = self.self_arc()?;
+        let place = self.executor.enqueue(epoch, &prepared.tool.name, None).map_err(queue_error)?;
+        // On its own task, so a caller that goes away cannot cut a change off halfway.
+        tokio::spawn(async move {
+            let _turn = engine.executor.turn(place, Instant::now() + QUEUE_TIMEOUT).await.map_err(stop_error)?;
+            execute(engine.recheck(&prepared)?).await
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    /// Checked again when an item leaves the queue: the plugin may have been
+    /// turned off, or the vault locked, while it waited.
+    fn recheck(&self, prepared: &Prepared) -> AegisResult<Prepared> {
+        let fresh = self.prepare(&prepared.plugin.manifest().id, &prepared.tool.id, prepared.args.clone())?;
+        if fresh.gate == Gate::NeedsAdmin {
+            return Err(AegisError::requires_admin(&fresh.tool.name));
+        }
+        Ok(fresh)
+    }
+
     // ---- approval tickets ------------------------------------------------
 
+    fn with_position(&self, mut view: TicketView) -> TicketView {
+        if view.status == TicketStatus::Queued {
+            view.queue_position = self.executor.position(&view.ticket_id);
+        }
+        view
+    }
+
     pub fn list_tickets(&self) -> Vec<TicketView> {
-        lock(&self.tickets).list(Instant::now())
+        let views = lock(&self.tickets).list(Instant::now());
+        views.into_iter().map(|v| self.with_position(v)).collect()
     }
 
     pub fn ticket(&self, id: &str) -> Option<TicketView> {
-        lock(&self.tickets).get(id, Instant::now()).map(|t| t.view())
+        let view = lock(&self.tickets).get(id, Instant::now()).map(|t| t.view());
+        view.map(|v| self.with_position(v))
     }
 
     /// Constant-time check of a ticket's CSRF token (browser approval portal).
@@ -895,7 +954,12 @@ impl Engine {
         via: &'static str,
     ) -> AegisResult<TicketView> {
         let pin = Zeroizing::new(pin);
+        let epoch = self.executor.epoch();
         self.pending_ticket(id)?;
+        // A full queue is refused before the PIN is checked; the request stays pending.
+        if approve && self.ticket_changes_system(id) && !self.executor.has_room() {
+            return Err(queue_error(executor::Full::Full));
+        }
         let verified = {
             let _serial = self.pin_check.lock().await;
             self.pending_ticket(id)?;
@@ -920,9 +984,10 @@ impl Engine {
             }
             Err(e) => return Err(e),
         }
-        ticket.comment = comment.map(|c| c.trim().chars().take(MAX_COMMENT_CHARS).collect::<String>()).filter(|c| !c.is_empty());
-        ticket.decided_via = Some(via);
+        let comment = comment.map(|c| c.trim().chars().take(MAX_COMMENT_CHARS).collect::<String>()).filter(|c| !c.is_empty());
         if !approve {
+            ticket.comment = comment;
+            ticket.decided_via = Some(via);
             ticket.status = TicketStatus::Declined;
             return Ok(ticket.view());
         }
@@ -935,8 +1000,22 @@ impl Engine {
             Gate::NeedsAdmin => Err(AegisError::requires_admin(&p.tool.name)),
             _ => Ok(p),
         });
+        // Taken before the ticket changes, so a full queue leaves it pending.
+        let place = match &prepared {
+            Ok(p) if changes_system(&p.tool, &p.args) => Some(self.executor.enqueue(epoch, &p.tool.name, Some(id)).map_err(queue_error)?),
+            _ => None,
+        };
         let mut store = lock(&self.tickets);
-        let ticket = store.get_mut(id, Instant::now()).ok_or_else(ticket_not_found)?;
+        let Some(ticket) = store.get_mut(id, Instant::now()) else {
+            drop(store);
+            if let Some(place) = place {
+                // Gone meanwhile (locked): give the place back.
+                self.executor.withdraw(place);
+            }
+            return Err(ticket_not_found());
+        };
+        ticket.comment = comment;
+        ticket.decided_via = Some(via);
         match prepared {
             Err(e) => {
                 ticket.status = TicketStatus::ExecutionFailed;
@@ -944,29 +1023,64 @@ impl Engine {
                 Ok(ticket.view())
             }
             Ok(prepared) => {
-                ticket.status = TicketStatus::Running;
+                // Shown as queued only when something is ahead of it.
+                let waits = place.is_some_and(|p| !self.executor.is_next(p));
+                ticket.status = if waits { TicketStatus::Queued } else { TicketStatus::Running };
                 let view = ticket.view();
                 drop(store);
                 let id = id.to_owned();
-                tokio::spawn(async move {
-                    let result = prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await;
-                    let mut store = lock(&engine.tickets);
-                    if let Some(ticket) = store.get_mut(&id, Instant::now()) {
-                        match result {
-                            Ok(value) => {
-                                ticket.status = TicketStatus::Approved;
-                                ticket.result = Some(value);
-                            }
-                            Err(e) => {
-                                ticket.status = TicketStatus::ExecutionFailed;
-                                ticket.error = Some(e);
-                            }
-                        }
-                    }
-                });
-                Ok(view)
+                tokio::spawn(async move { engine.run_ticket(&id, place, prepared).await });
+                Ok(self.with_position(view))
             }
         }
+    }
+
+    /// Runs an approved ticket, in its turn when it changes the system.
+    async fn run_ticket(&self, id: &str, place: Option<Place>, prepared: Prepared) {
+        let finish = |result: AegisResult<Value>, failed: TicketStatus| {
+            if let Some(ticket) = lock(&self.tickets).get_mut(id, Instant::now()) {
+                match result {
+                    Ok(value) => {
+                        ticket.status = TicketStatus::Approved;
+                        ticket.result = Some(value);
+                    }
+                    Err(e) => {
+                        ticket.status = failed;
+                        ticket.error = Some(e);
+                    }
+                }
+            }
+        };
+        let failed = TicketStatus::ExecutionFailed;
+        let _turn = match place {
+            None => None,
+            Some(place) => match self.executor.turn(place, Instant::now() + QUEUE_TIMEOUT).await {
+                Ok(turn) => Some(turn),
+                Err(stop) => {
+                    let status = if stop == Stop::Expired { TicketStatus::Expired } else { failed };
+                    return finish(Err(stop_error(stop)), status);
+                }
+            },
+        };
+        let prepared = if place.is_some() {
+            match self.recheck(&prepared) {
+                Ok(p) => p,
+                Err(e) => return finish(Err(e), failed),
+            }
+        } else {
+            prepared
+        };
+        if let Some(ticket) = lock(&self.tickets).get_mut(id, Instant::now()) {
+            ticket.status = TicketStatus::Running;
+        }
+        finish(prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await, failed);
+    }
+
+    fn ticket_changes_system(&self, id: &str) -> bool {
+        let Some((plugin_id, tool_id, args)) = lock(&self.tickets).get(id, Instant::now()).map(|t| (t.plugin_id.clone(), t.tool_id.clone(), t.args.clone())) else {
+            return false;
+        };
+        self.registry.tool(&plugin_id, &tool_id).is_some_and(|(_, tool)| changes_system(tool, &args))
     }
 
     fn pending_ticket(&self, id: &str) -> AegisResult<()> {
@@ -1045,6 +1159,29 @@ impl Engine {
 
     fn self_arc(&self) -> AegisResult<Arc<Self>> {
         self.me.upgrade().ok_or_else(|| internal("engine is shutting down"))
+    }
+}
+
+/// Every run that can change Windows or AegisWin goes through the executor.
+/// Read-only tools and dry runs never wait.
+fn changes_system(tool: &ToolManifest, args: &Value) -> bool {
+    !tool.read_only && args.get("dryRun") != Some(&Value::Bool(true))
+}
+
+fn queue_error(e: executor::Full) -> AegisError {
+    match e {
+        executor::Full::Full => AegisError::new(
+            ErrorCode::Conflict,
+            format!("{} changes are already waiting to run. Try again when one has finished.", executor::MAX_QUEUED),
+        ),
+        executor::Full::Locked => locked(),
+    }
+}
+
+fn stop_error(stop: Stop) -> AegisError {
+    match stop {
+        Stop::Locked => AegisError::new(ErrorCode::VaultLocked, "AegisWin locked before this change could start, so it was cancelled."),
+        Stop::Expired => AegisError::new(ErrorCode::ExecutionFailed, "This change waited more than 30 minutes behind others, so it was cancelled. Ask again if it is still needed."),
     }
 }
 

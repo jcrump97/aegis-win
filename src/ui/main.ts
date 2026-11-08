@@ -16,7 +16,7 @@ let tickets: TicketView[] = [];
 let activeTab = '';
 let pollTimer: number | undefined;
 let mainEl: HTMLElement | null = null;
-let shellParts: { approvalsCount: HTMLElement; mcpPill: HTMLElement } | null = null;
+let shellParts: { approvalsCount: HTMLElement; mcpPill: HTMLElement; changePill: HTMLElement } | null = null;
 
 const PIN_MIN = 6;
 
@@ -251,6 +251,7 @@ async function appShell(): Promise<void> {
 
   const approvalsCount = h('span');
   const mcpPill = h('button', { class: 'badge', onclick: () => selectTab('mcp') });
+  const changePill = h('span', { class: 'badge warn', role: 'status' });
   const lock = h('button', {}, 'Lock');
   lock.addEventListener('click', async () => {
     status = await api.lockVault();
@@ -277,13 +278,13 @@ async function appShell(): Promise<void> {
     nav('settings', 'Settings'),
   );
   mainEl = h('main', { class: 'main' });
-  shellParts = { approvalsCount, mcpPill };
+  shellParts = { approvalsCount, mcpPill, changePill };
   replace(
     root,
     h(
       'div',
       { class: 'app' },
-      h('header', { class: 'topbar' }, brand(), h('div', { class: 'row' }, mcpPill, adminPart, lock)),
+      h('header', { class: 'topbar' }, brand(), h('div', { class: 'row' }, changePill, mcpPill, adminPart, lock)),
       sidebar,
       mainEl,
     ),
@@ -306,6 +307,12 @@ function updateShellBadges(): void {
   const mcp = settings?.mcp;
   shellParts.mcpPill.className = `badge ${mcp?.status.running ? 'ok' : ''}`;
   replace(shellParts.mcpPill, mcp?.status.running ? `MCP on :${mcp.port}` : 'MCP off');
+  // One change runs at a time; tool results read meanwhile may show a system mid-change.
+  const { running, queued } = status.change;
+  const waiting = queued ? `${queued} waiting` : '';
+  const text = running ? `Change in progress: ${running}${waiting ? ` · ${waiting}` : ''}` : waiting;
+  shellParts.changePill.hidden = !text;
+  replace(shellParts.changePill, text);
 }
 
 function renderTab(): void {
@@ -322,7 +329,7 @@ function renderTab(): void {
 // ---- polling for approval requests ------------------------------------------
 
 function ticketSignature(list: TicketView[]): string {
-  return list.map((t) => `${t.ticketId}:${t.status}`).join('|');
+  return list.map((t) => `${t.ticketId}:${t.status}:${t.queuePosition ?? ''}`).join('|');
 }
 
 function startPolling(): void {
@@ -331,10 +338,8 @@ function startPolling(): void {
     try {
       // The vault can lock without the UI asking (idle auto-lock, tray Lock).
       const now = await api.status();
-      if (!now.unlocked) {
-        status = now;
-        return route();
-      }
+      status = now;
+      if (!now.unlocked) return route();
       const next = await api.listTickets();
       const before = new Set(tickets.filter((t) => t.status === 'pending_approval').map((t) => t.ticketId));
       for (const t of next) if (t.status === 'pending_approval' && !before.has(t.ticketId)) toast(`An AI agent is asking to run "${t.toolName}". Open Approvals to decide.`);
@@ -527,6 +532,7 @@ async function askTrust(plugin: PluginView): Promise<boolean> {
 
 const STATUS_TEXT: Record<string, [string, string]> = {
   pending_approval: ['waiting for you', 'warn'],
+  queued: ['approved, waiting its turn', 'accent'],
   running: ['running', 'accent'],
   approved: ['approved', 'ok'],
   declined: ['declined', ''],
@@ -541,7 +547,7 @@ function approvalsTab(): HTMLElement {
   return h(
     'div',
     { class: 'stack' },
-    h('div', {}, h('h2', {}, 'Approvals'), h('p', { class: 'hint' }, 'When an AI agent calls a tool that needs your PIN, the request waits here. The agent can also show you a browser link for the same request. Requests expire after 30 minutes and are forgotten when AegisWin locks.')),
+    h('div', {}, h('h2', {}, 'Approvals'), h('p', { class: 'hint' }, 'When an AI agent calls a tool that needs your PIN, the request waits here. The agent can also show you a browser link for the same request. Requests expire after 30 minutes and are forgotten when AegisWin locks. Approved changes run one at a time, in the order you approve them.')),
     pending.length === 0 ? h('div', { class: 'card' }, h('p', {}, 'No requests are waiting.')) : null,
     ...pending.map(ticketCard),
     done.length ? h('h3', {}, 'Earlier requests') : null,
@@ -550,7 +556,8 @@ function approvalsTab(): HTMLElement {
 }
 
 function ticketCard(t: TicketView): HTMLElement {
-  const [label, tone] = STATUS_TEXT[t.status] ?? [t.status, ''];
+  const [base, tone] = STATUS_TEXT[t.status] ?? [t.status, ''];
+  const label = t.status === 'queued' && t.queuePosition ? `${base} (#${t.queuePosition})` : base;
   const head = h(
     'div',
     { class: 'tool-head' },

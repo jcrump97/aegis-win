@@ -346,6 +346,9 @@ fn ticket_payload(state: &AppState, ticket: &TicketView) -> Value {
         value["approvalUrl"] = json!(format!("{}/approve/{}", state.base_url, ticket.ticket_id));
         value["message"] = json!("Waiting for the owner. Show them the approvalUrl (or they can approve in the AegisWin app), then call aegis__check_ticket.");
     }
+    if ticket.status == TicketStatus::Queued {
+        value["message"] = json!("Approved. Another change is running first; this one starts when its turn comes. Keep calling aegis__check_ticket.");
+    }
     value
 }
 
@@ -474,6 +477,7 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
             escape_html(csrf),
             ticket.attempts_remaining
         )),
+        (TicketStatus::Queued, _) => body.push_str("<p>Approved. Another change is running first; this one starts when it finishes. You can close this page.</p>"),
         (TicketStatus::Running, _) => body.push_str("<p>Approved. The action is running; you can close this page.</p>"),
         _ => body.push_str("<p>This request is closed. You can close this page.</p>"),
     }
@@ -527,6 +531,7 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
             let text = match view.status {
                 TicketStatus::Declined => "Declined. The agent has been told.",
                 TicketStatus::ExecutionFailed => "Approved, but the action could not start. The agent can see the error.",
+                TicketStatus::Queued => "Approved. It runs after the change ahead of it finishes.",
                 _ => "Approved. The action is running.",
             };
             page(StatusCode::OK, &render_ticket(&view, None, Some((text, true))))
@@ -597,6 +602,31 @@ mod tests {
         assert!(shown.contains(&expected.format("%-I:%M:%S").to_string()), "{shown}");
         assert!(!shown.contains(utc), "{shown}");
         assert_eq!(local_time("not a time"), "not a time");
+    }
+
+    #[test]
+    fn a_queued_request_shows_no_form_and_says_it_waits() {
+        let ticket = TicketView {
+            ticket_id: "0".repeat(32),
+            plugin_id: "windows-health".into(),
+            tool_id: "flush_dns".into(),
+            tool_name: "Flush DNS".into(),
+            tool_description: "d".into(),
+            requires_admin: false,
+            args: json!({}),
+            review: None,
+            created_at: "2026-11-07T10:00:00Z".into(),
+            status: TicketStatus::Queued,
+            queue_position: Some(2),
+            attempts_remaining: 3,
+            comment: None,
+            decided_via: Some("app"),
+            result: None,
+            error: None,
+        };
+        let html = render_ticket(&ticket, Some("csrf-token"), None);
+        assert!(html.contains("Another change is running first"), "{html}");
+        assert!(!html.contains("<form") && !html.contains("csrf-token"), "a decided request offers no form");
     }
 
     #[test]

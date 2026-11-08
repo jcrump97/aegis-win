@@ -20,6 +20,8 @@ export interface Status {
   dataDir: string;
   pinLockoutSeconds: number;
   uiScale: number;
+  /** The change running now and how many wait their turn (one at a time). */
+  change: { running: string | null; queued: number };
 }
 
 export interface JsonSchema {
@@ -75,6 +77,7 @@ export interface PluginView {
 
 export type TicketStatus =
   | 'pending_approval'
+  | 'queued'
   | 'running'
   | 'approved'
   | 'declined'
@@ -99,6 +102,8 @@ export interface TicketView {
   review?: CallReview;
   createdAt: string;
   status: TicketStatus;
+  /** While queued: 1 means it runs next. */
+  queuePosition?: number;
   attemptsRemaining: number;
   comment: string | null;
   decidedVia: string | null;

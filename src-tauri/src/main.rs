@@ -45,12 +45,26 @@ fn show_main(app: &AppHandle) {
     }
 }
 
-fn tray_text(engine: &Engine) -> &'static str {
-    match (engine.status().unlocked, engine.background_active()) {
-        (false, _) => "AegisWin: locked",
-        (true, true) => "AegisWin: unlocked, monitors running",
-        (true, false) => "AegisWin: unlocked",
+fn tray_text(engine: &Engine) -> String {
+    let unlocked = engine.status().unlocked;
+    let state = if unlocked { "unlocked" } else { "locked" };
+    match engine.change_running() {
+        Some(tool) => format!("AegisWin: {state}, running {tool}"),
+        None if unlocked && engine.background_active() => "AegisWin: unlocked, monitors running".into(),
+        None => format!("AegisWin: {state}"),
     }
+}
+
+/// Quitting while a change runs can leave it half done, so ask first.
+fn quit_app(app: &AppHandle) {
+    let running = app.state::<Arc<Engine>>().change_running();
+    if let Some(tool) = running {
+        let text = format!("{tool} is still running. Quitting now may leave the change half done.\n\nQuit anyway?");
+        if !os::confirm("Quit AegisWin?", &text) {
+            return;
+        }
+    }
+    app.exit(0);
 }
 
 /// Tray menu: Open, Lock, Quit (ADR 0002 §4).
@@ -68,7 +82,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 let engine = app.state::<Arc<Engine>>().inner().clone();
                 tauri::async_runtime::spawn(async move { engine.lock().await });
             }
-            "quit" => app.exit(0),
+            "quit" => quit_app(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -227,6 +241,10 @@ async fn rotate_mcp_token(engine: EngineState<'_>) -> Cmd<()> {
 async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim: State<'_, InstanceClaim>) -> Cmd<()> {
     if engine.elevated() {
         return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is already running as administrator."));
+    }
+    // Restarting would cut the running change off; waiting ones are cancelled by the lock below.
+    if let Some(tool) = engine.change_running() {
+        return Err(AegisError::new(ErrorCode::Conflict, format!("Wait for {tool} to finish before restarting as administrator.")));
     }
     // Stop the MCP server first so the elevated copy can bind the same port.
     engine.lock().await;

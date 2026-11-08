@@ -20,7 +20,9 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenProcessToken, SetEvent, WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE, INFINITE,
 };
 use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, SW_SHOWNORMAL,
+};
 
 /// True when this process runs with an elevated (administrator) token.
 pub fn is_elevated() -> bool {
@@ -270,6 +272,13 @@ pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) 
         on_second_launch();
     })?;
     Ok(Instance::First(guard))
+}
+
+/// Asks a Yes/No question in a Windows warning box; true on Yes. No is the
+/// default, so pressing Enter keeps things as they are.
+pub fn confirm(title: &str, text: &str) -> bool {
+    let (title, text) = (HSTRING::from(title), HSTRING::from(text));
+    unsafe { MessageBoxW(None, &text, &title, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
 }
 
 /// A short, stable name for an install: FNV-1a of its folder, case-insensitive.

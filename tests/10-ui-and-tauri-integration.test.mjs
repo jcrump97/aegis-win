@@ -112,5 +112,15 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.match(main, /document\.addEventListener\('keydown', noteActivity, true\);/);
   assert.equal(main.match(/api\.noteActivity\(\)/g)?.length, 1, 'activity is reported from one place');
   // The poll checks the lock state first, because the vault can lock without the UI asking.
-  assert.match(main, /pollTimer = window\.setInterval\(async \(\) => \{\s*try \{\s*\/\/[^\n]*\n\s*const now = await api\.status\(\);\s*if \(!now\.unlocked\)/);
+  assert.match(main, /pollTimer = window\.setInterval\(async \(\) => \{\s*try \{\s*\/\/[^\n]*\n\s*const now = await api\.status\(\);\s*status = now;\s*if \(!now\.unlocked\) return route\(\);/);
+});
+
+test('Serial executor: the app shows the change in progress, and the shell never cuts one off', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  assert.match(main, /const \{ running, queued \} = status\.change;/);
+  assert.match(main, /queued: \['approved, waiting its turn'/);
+  // Restarting as administrator is refused while a change runs; Quit asks first.
+  assert.match(mainRs, /async fn restart_as_admin[\s\S]*?if let Some\(tool\) = engine\.change_running\(\) \{\s*return Err/);
+  assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
+  assert.match(mainRs, /"quit" => quit_app\(app\),/);
 });

@@ -18,6 +18,8 @@ const MAX_TICKETS: usize = 200;
 #[serde(rename_all = "snake_case")]
 pub enum TicketStatus {
     PendingApproval,
+    /// Approved, waiting for the one state-changing slot (ADR 0003 §5.1).
+    Queued,
     Running,
     Approved,
     Declined,
@@ -28,7 +30,7 @@ pub enum TicketStatus {
 
 impl TicketStatus {
     pub fn is_final(self) -> bool {
-        !matches!(self, Self::PendingApproval | Self::Running)
+        !matches!(self, Self::PendingApproval | Self::Queued | Self::Running)
     }
 }
 
@@ -69,6 +71,9 @@ pub struct TicketView {
     pub review: Option<CallReview>,
     pub created_at: String,
     pub status: TicketStatus,
+    /// While `queued`: 1 means it runs next. Other items are never described.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
     pub attempts_remaining: u8,
     pub comment: Option<String>,
     pub decided_via: Option<&'static str>,
@@ -91,6 +96,7 @@ impl Ticket {
             review: self.review.clone(),
             created_at: self.created_at.clone(),
             status: self.status,
+            queue_position: None,
             attempts_remaining: STRIKES_PER_TICKET.saturating_sub(self.strikes),
             comment: self.comment.clone(),
             decided_via: self.decided_via,

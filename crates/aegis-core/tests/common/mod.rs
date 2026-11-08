@@ -21,6 +21,12 @@ pub struct DemoPlugin {
     /// The store handed to the last `on_unlock` and the last tool call.
     pub unlock_store: Mutex<Option<PluginStore>>,
     pub call_store: Mutex<Option<PluginStore>>,
+    /// `fix` with a note starting "wait" records the note, then blocks until
+    /// a permit is added to `release`.
+    pub started: Mutex<Vec<String>>,
+    pub release: tokio::sync::Semaphore,
+    pub running: AtomicUsize,
+    pub max_running: AtomicUsize,
 }
 
 impl Default for DemoPlugin {
@@ -58,7 +64,17 @@ impl DemoPlugin {
             .replace("\"demo", &format!("\"{id}")),
         )
         .unwrap();
-        Self { manifest, unlocks: AtomicUsize::new(0), locks: AtomicUsize::new(0), unlock_store: Mutex::new(None), call_store: Mutex::new(None) }
+        Self {
+            manifest,
+            unlocks: AtomicUsize::new(0),
+            locks: AtomicUsize::new(0),
+            unlock_store: Mutex::new(None),
+            call_store: Mutex::new(None),
+            started: Mutex::new(Vec::new()),
+            release: tokio::sync::Semaphore::new(0),
+            running: AtomicUsize::new(0),
+            max_running: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -70,6 +86,14 @@ impl Plugin for DemoPlugin {
 
     async fn call(&self, tool: &str, args: Value, ctx: ToolContext) -> AegisResult<Value> {
         *self.call_store.lock().unwrap() = ctx.store;
+        let note = args["note"].as_str().unwrap_or_default().to_owned();
+        if tool == "fix" && args["dryRun"] != true && note.starts_with("wait") {
+            self.started.lock().unwrap().push(note);
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_running.fetch_max(now, Ordering::SeqCst);
+            self.release.acquire().await.unwrap().forget();
+            self.running.fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(match tool {
             "echo" => json!({ "echo": args }),
             "fix" if args["dryRun"] == true => json!({ "dryRun": true, "wouldRun": ["fix.exe"] }),
