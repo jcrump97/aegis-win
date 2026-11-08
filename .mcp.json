@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "aegis-win": {
+      "type": "http",
+      "url": "${AEGIS_MCP_URL:-http://127.0.0.1:47821/mcp}",
+      "headers": {
+        "Authorization": "Bearer ${AEGIS_MCP_TOKEN}"
+      }
+    }
+  }
+}
