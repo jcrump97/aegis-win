@@ -137,6 +137,22 @@ test('Action plans: the app shows the plan as AegisWin describes it and approves
   assert.match(main, /if \(t\.plan\) return planCard\(t, t\.plan\);/);
 });
 
+test('Approvals: a running or queued request is shown as in progress, never as an earlier request', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  const tab = main.slice(main.indexOf('function approvalsTab('), main.indexOf('/** Refreshes the list after a decision'));
+  assert.ok(tab.length > 0, 'approvalsTab exists');
+  // Requests that are running or waiting their turn get their own section...
+  assert.match(tab, /const active = tickets\.filter\(\(t\) => t\.status === 'running' \|\| t\.status === 'queued'\)/);
+  // ...and "Earlier requests" holds only finished ones.
+  assert.match(tab, /const done = tickets\.filter\(\(t\) => t\.status !== 'pending_approval' && !active\.includes\(t\)\)/);
+  // The empty notice appears only when nothing is waiting for the owner and nothing is in progress.
+  assert.match(tab, /pending\.length === 0 && active\.length === 0 \? h\('div', \{ class: 'card' \}, h\('p', \{\}, 'No requests are waiting\.'\)\) : null/);
+  // Order on the page: waiting for you, in progress, then earlier requests.
+  const order = ['Waiting for you', 'In progress', 'Earlier requests'].map((heading) => tab.indexOf(`'${heading}'`));
+  assert.ok(order.every((i) => i > 0), 'all three headings exist');
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'sections in order');
+});
+
 test('In-app plans: the owner builds a draft in memory and approves it like any plan', () => {
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   // The app's plans go through the same engine entry point, marked as the owner's.

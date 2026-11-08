@@ -627,15 +627,21 @@ const STEP_TEXT: Record<string, [string, string]> = {
   cancelled: ['cancelled', ''],
 };
 
+/** Waiting for the owner, then in progress (running, then queued in turn), then finished. */
 function approvalsTab(): HTMLElement {
   const pending = tickets.filter((t) => t.status === 'pending_approval');
-  const done = tickets.filter((t) => t.status !== 'pending_approval');
+  const active = tickets.filter((t) => t.status === 'running' || t.status === 'queued');
+  active.sort((a, b) => (a.status === 'running' ? 0 : a.queuePosition ?? 99) - (b.status === 'running' ? 0 : b.queuePosition ?? 99));
+  const done = tickets.filter((t) => t.status !== 'pending_approval' && !active.includes(t));
   return h(
     'div',
     { class: 'stack' },
     h('div', {}, h('h2', {}, 'Approvals'), h('p', { class: 'hint' }, 'When an AI agent calls a tool that needs your PIN, or proposes a plan of several repairs, the request waits here. The agent can also show you a browser link for the same request. Requests expire after 30 minutes (plans after 10) and are forgotten when AegisWin locks. Approved changes run one at a time, in the order you approve them.')),
-    pending.length === 0 ? h('div', { class: 'card' }, h('p', {}, 'No requests are waiting.')) : null,
+    pending.length === 0 && active.length === 0 ? h('div', { class: 'card' }, h('p', {}, 'No requests are waiting.')) : null,
+    pending.length ? h('h3', {}, 'Waiting for you') : null,
     ...pending.map(ticketCard),
+    active.length ? h('h3', {}, 'In progress') : null,
+    ...active.map(ticketCard),
     done.length ? h('h3', {}, 'Earlier requests') : null,
     ...done.map(ticketCard),
   );
