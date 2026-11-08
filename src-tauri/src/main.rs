@@ -5,18 +5,94 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use aegis_core::engine::{Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
+use aegis_core::os::{self, Instance, SingleInstance};
 use aegis_core::registry::{GatePolicy, Plugin, Registry};
 use aegis_core::tickets::TicketView;
 use aegis_core::{AegisError, ErrorCode};
 use serde_json::Value;
-use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 type Cmd<T> = Result<T, AegisError>;
 type EngineState<'a> = State<'a, Arc<Engine>>;
+
+static APP: OnceLock<AppHandle> = OnceLock::new();
+
+/// This install's single-instance claim, held for the life of the process.
+/// Released only for the elevated restart, so the elevated copy can start.
+struct InstanceClaim(Mutex<Option<SingleInstance>>);
+
+/// Claims this install; a later launch shows this copy's window instead.
+fn claim_instance() -> std::io::Result<Instance> {
+    os::single_instance(&os::install_key(&data_dir()), || {
+        if let Some(app) = APP.get() {
+            show_main(app);
+        }
+    })
+}
+
+fn show_main(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn tray_text(engine: &Engine) -> &'static str {
+    match (engine.status().unlocked, engine.background_active()) {
+        (false, _) => "AegisWin: locked",
+        (true, true) => "AegisWin: unlocked, monitors running",
+        (true, false) => "AegisWin: unlocked",
+    }
+}
+
+/// Tray menu: Open, Lock, Quit (ADR 0002 §4).
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Open AegisWin", true, None::<&str>)?;
+    let lock = MenuItem::with_id(app, "lock", "Lock", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("AegisWin")
+        .menu(&Menu::with_items(app, &[&open, &lock, &quit])?)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => show_main(app),
+            "lock" => {
+                let engine = app.state::<Arc<Engine>>().inner().clone();
+                tauri::async_runtime::spawn(async move { engine.lock().await });
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
+
+/// Every 5 seconds: idle auto-lock, and the tray tooltip shows the state.
+fn start_idle_watch(app: AppHandle, engine: Arc<Engine>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        tauri::async_runtime::block_on(engine.lock_if_idle(Instant::now()));
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_tooltip(Some(tray_text(&engine)));
+        }
+    });
+}
 
 /// Portable: everything lives in `data` next to the executable.
 fn data_dir() -> PathBuf {
@@ -51,6 +127,14 @@ async fn unlock_vault(engine: EngineState<'_>, pin: String) -> Cmd<Status> {
 #[tauri::command]
 async fn lock_vault(engine: EngineState<'_>) -> Cmd<Status> {
     Ok(engine.lock().await)
+}
+
+/// Input in the app window (sent at most every 30 seconds) keeps the vault
+/// unlocked; nothing an agent does can call this.
+#[tauri::command]
+async fn note_activity(engine: EngineState<'_>) -> Cmd<()> {
+    engine.note_activity();
+    Ok(())
 }
 
 #[tauri::command]
@@ -140,30 +224,61 @@ async fn rotate_mcp_token(engine: EngineState<'_>) -> Cmd<()> {
 
 /// Starts an elevated copy through UAC, then exits this one.
 #[tauri::command]
-async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>) -> Cmd<()> {
+async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim: State<'_, InstanceClaim>) -> Cmd<()> {
     if engine.elevated() {
         return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is already running as administrator."));
     }
     // Stop the MCP server first so the elevated copy can bind the same port.
     engine.lock().await;
+    // Let go of this install before the elevated copy starts and checks it.
+    drop(claim.0.lock().unwrap().take());
+    let reclaim = || {
+        if let Ok(Instance::First(guard)) = claim_instance() {
+            *claim.0.lock().unwrap() = Some(guard);
+        }
+    };
     match aegis_core::os::relaunch_elevated() {
         Ok(()) => {
             app.exit(0);
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            reclaim();
             Err(AegisError::new(ErrorCode::AccessDenied, "The administrator prompt was cancelled. AegisWin is locked; unlock to continue."))
         }
-        Err(e) => Err(AegisError::failed(format!("Could not restart as administrator: {e}"))),
+        Err(e) => {
+            reclaim();
+            Err(AegisError::failed(format!("Could not restart as administrator: {e}")))
+        }
     }
 }
 
 fn main() {
+    // One copy per install: a second launch shows the running one and exits.
+    let claim = match claim_instance() {
+        Ok(Instance::First(guard)) => Some(guard),
+        Ok(Instance::AlreadyRunning) => return,
+        // The check never stops AegisWin from starting.
+        Err(_) => None,
+    };
     let data_dir = data_dir();
     let engine = Engine::new(&data_dir, registry(), EngineOptions::default());
     let app = tauri::Builder::default()
         .manage(engine)
+        .manage(InstanceClaim(Mutex::new(claim)))
+        .on_window_event(|window, event| {
+            // With a monitor running, closing hides to the tray; otherwise it quits as before.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.state::<Arc<Engine>>().background_active() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(move |app| {
+            let _ = APP.set(app.handle().clone());
+            build_tray(app)?;
+            start_idle_watch(app.handle().clone(), app.state::<Arc<Engine>>().inner().clone());
             let title = if aegis_core::os::is_elevated() { "AegisWin (Administrator)" } else { "AegisWin" };
             WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title(title)
@@ -179,6 +294,7 @@ fn main() {
             setup_vault,
             unlock_vault,
             lock_vault,
+            note_activity,
             change_pin,
             get_settings,
             update_settings,

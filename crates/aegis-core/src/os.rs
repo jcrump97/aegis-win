@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, E_ACCESSDENIED, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Globalization::{GetOEMCP, MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenProcessToken, SetEvent, WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE, INFINITE,
+};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SW_SHOWNORMAL};
 
@@ -215,6 +217,65 @@ pub fn relaunch_elevated() -> io::Result<()> {
             io::Error::other(e.message())
         }
     })
+}
+
+/// Proof that this process is the one running copy of AegisWin for an
+/// install (ADR 0002 §4). Dropping it lets another copy start, which the
+/// elevated restart needs.
+pub struct SingleInstance {
+    mutex: isize,
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(HANDLE(self.mutex as *mut _)) };
+    }
+}
+
+pub enum Instance {
+    First(SingleInstance),
+    /// Another copy holds this install; it was asked to show its window
+    /// (unless it runs as administrator and this copy does not, which
+    /// Windows does not allow).
+    AlreadyRunning,
+}
+
+/// Claims `key` (one per install, e.g. derived from the data folder) for this
+/// process. The first copy gets `on_second_launch` called, on its own
+/// thread, each time another copy starts.
+pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) -> io::Result<Instance> {
+    let mutex_name = HSTRING::from(format!(r"Local\AegisWin-{key}-instance"));
+    let event_name = HSTRING::from(format!(r"Local\AegisWin-{key}-show"));
+    let mutex = match unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) } {
+        Ok(handle) => handle,
+        // Created by an elevated copy: this copy may not even open it.
+        Err(e) if e.code() == E_ACCESSDENIED => return Ok(Instance::AlreadyRunning),
+        Err(e) => return Err(io::Error::other(e.message())),
+    };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(mutex) };
+        if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_name.as_ptr())) } {
+            let _ = unsafe { SetEvent(event) };
+            let _ = unsafe { CloseHandle(event) };
+        }
+        return Ok(Instance::AlreadyRunning);
+    }
+    let guard = SingleInstance { mutex: mutex.0 as isize };
+    // Auto-reset: one wake-up per second launch. The handle lives as long as the process.
+    let event = unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) }.map_err(|e| io::Error::other(e.message()))?.0 as isize;
+    std::thread::Builder::new().name("aegis-single-instance".into()).spawn(move || loop {
+        if unsafe { WaitForSingleObject(HANDLE(event as *mut _), INFINITE) } != WAIT_OBJECT_0 {
+            return;
+        }
+        on_second_launch();
+    })?;
+    Ok(Instance::First(guard))
+}
+
+/// A short, stable name for an install: FNV-1a of its folder, case-insensitive.
+pub fn install_key(dir: &std::path::Path) -> String {
+    let hash = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016x}")
 }
 
 /// The private IPv4 address this PC uses to reach other networks, if any.
@@ -519,6 +580,23 @@ pub mod eventlog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_copy_of_an_install_wakes_the_first_and_steps_aside() {
+        let dir = |s: &str| install_key(std::path::Path::new(s));
+        let key = format!("test-{}-{}", std::process::id(), dir(r"C:\Some\Dir"));
+        assert_eq!(dir(r"C:\Some\Dir"), dir(r"c:\some\dir"));
+        assert_ne!(dir(r"C:\Some\Dir"), dir(r"D:\Some\Dir"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Instance::First(guard) = single_instance(&key, move || tx.send(()).unwrap()).unwrap() else { panic!("first copy") };
+        assert!(matches!(single_instance(&key, || {}).unwrap(), Instance::AlreadyRunning));
+        rx.recv_timeout(Duration::from_secs(5)).expect("the first copy is asked to show itself");
+        // Another install is independent.
+        assert!(matches!(single_instance(&format!("{key}-other"), || {}).unwrap(), Instance::First(_)));
+        // Once the first copy lets go (elevated restart), a new copy can start.
+        drop(guard);
+        assert!(matches!(single_instance(&key, || {}).unwrap(), Instance::First(_)));
+    }
 
     #[test]
     fn decodes_utf16_and_collapses_progress_redraws() {

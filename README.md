@@ -12,6 +12,7 @@ AegisWin is a single `.exe` you can run from a USB stick or a downloads folder. 
 - **Standard user by default.** Runs `asInvoker`, so it never forces a UAC prompt at launch. Admin-only tools (`sfc /scannow`, Winsock reset) say so up front and offer to restart AegisWin as administrator.
 - **PIN-gated approvals for AI agents.** Each tool is either `auto` (e.g. read-only log queries) or `pin_required`. A gated MCP call returns a local approval link where you review the exact action, add a comment, and accept or decline with your PIN. The PIN never reaches the agent, an LLM, or a log.
 - **LAN-aware LLM use.** Local endpoints (Ollama, LM Studio, private LAN addresses) are trusted. Before a plugin sends diagnostics to an LLM outside your LAN, you have to trust that plugin, and usernames, hostnames, and local paths are scrubbed from the payload.
+- **Locks itself.** The vault locks after 15 minutes without you (5 to 60 in Settings); what AI agents do never keeps it open. While a monitor runs, closing the window keeps AegisWin in the tray, and only one copy runs per folder.
 - **Self-contained plugins.** `event-logs`, `windows-health`, and `usage-monitor`, each with its own manifest, tests, and docs.
 
 See [`documentation/ARCHITECTURE.md`](documentation/ARCHITECTURE.md) for diagrams and [`documentation/SECURITY_MODEL.md`](documentation/SECURITY_MODEL.md) for the threat model.

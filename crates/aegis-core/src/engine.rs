@@ -20,7 +20,7 @@ use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
 use crate::registry::{self, Gate, GatePolicy, Plugin, Registry, ToolContext, ToolManifest, UnlockContext};
 use crate::schema;
 use crate::secret::Secret;
-use crate::state::VaultState;
+use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
 use crate::tickets::{NewTicket, TicketStatus, TicketStore, TicketView, STRIKES_PER_TICKET};
 use crate::vault::{self, KdfParams, NewKey, PinGuard, UnlockedVault, VaultError};
 
@@ -52,6 +52,8 @@ pub struct Engine {
     elevated: bool,
     kdf: KdfParams,
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
+    /// Last owner activity, for idle auto-lock.
+    activity: Mutex<Instant>,
 }
 
 /// Where a tool call came from. Only the desktop UI can pass a PIN inline;
@@ -108,6 +110,7 @@ pub struct McpSettingsView {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
     pub ui_scale: u32,
+    pub auto_lock_minutes: u32,
     pub llm: LlmSettingsView,
     pub mcp: McpSettingsView,
 }
@@ -116,6 +119,7 @@ pub struct SettingsView {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SettingsUpdate {
     pub ui_scale: Option<u32>,
+    pub auto_lock_minutes: Option<u32>,
     pub llm_base_url: Option<String>,
     pub llm_model: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -244,6 +248,7 @@ impl Engine {
             elevated: options.elevated,
             kdf: options.kdf,
             mcp: tokio::sync::Mutex::new(None),
+            activity: Mutex::new(Instant::now()),
         })
     }
 
@@ -356,6 +361,7 @@ impl Engine {
     }
 
     async fn finish_unlock(&self, vault: UnlockedVault<VaultState>) {
+        self.note_activity();
         let mcp_enabled = vault.state.mcp.enabled;
         let installed: Vec<(String, Vec<String>)> =
             vault.state.installed_plugins.iter().map(|id| (id.clone(), vault.state.components_for(id))).collect();
@@ -369,6 +375,38 @@ impl Engine {
             // A failure (port in use) is shown on the MCP tab; unlocking still succeeds.
             let _ = self.start_mcp_inner().await;
         }
+    }
+
+    /// Records that the owner is using AegisWin: input in the app window, or
+    /// a correct PIN anywhere. Agent requests never count, and neither does
+    /// loading the approval page, which an agent can do too.
+    pub fn note_activity(&self) {
+        *lock(&self.activity) = Instant::now();
+    }
+
+    pub fn last_activity(&self) -> Instant {
+        *lock(&self.activity)
+    }
+
+    /// True when an installed plugin has background work running (only while
+    /// unlocked: locking stops it).
+    pub fn background_active(&self) -> bool {
+        let installed = lock(&self.vault).as_ref().map(|v| v.state.installed_plugins.clone()).unwrap_or_default();
+        installed.iter().filter_map(|id| self.registry.plugin(id)).any(|p| p.background_active())
+    }
+
+    /// Locks the vault when the owner has been away for the auto-lock
+    /// timeout. Returns true when it locked.
+    pub async fn lock_if_idle(&self, now: Instant) -> bool {
+        let Some(minutes) = lock(&self.vault).as_ref().map(|v| v.state.auto_lock_minutes) else {
+            return false;
+        };
+        let minutes = if AUTO_LOCK_CHOICES.contains(&minutes) { minutes } else { DEFAULT_AUTO_LOCK_MINUTES };
+        if now.saturating_duration_since(self.last_activity()) < Duration::from_secs(u64::from(minutes) * 60) {
+            return false;
+        }
+        self.lock().await;
+        true
     }
 
     /// Stops the MCP server and background work, drops the key, and forgets tickets.
@@ -401,6 +439,8 @@ impl Engine {
         let ok = tokio::task::spawn_blocking(move || verifier.verify(&pin)).await.map_err(internal)?;
         lock(&self.guard).record(ok, Instant::now());
         if ok {
+            // A correct PIN, in the app or on the approval page, is the owner.
+            self.note_activity();
             Ok(())
         } else {
             Err(vault_err(VaultError::WrongPin))
@@ -431,6 +471,7 @@ impl Engine {
             };
             SettingsView {
                 ui_scale: s.ui_scale,
+                auto_lock_minutes: s.auto_lock_minutes,
                 llm: LlmSettingsView {
                     base_url: s.llm.base_url.clone(),
                     model: s.llm.model.clone(),
@@ -457,6 +498,12 @@ impl Engine {
                     return Err(AegisError::invalid("UI scale must be between 80 and 150 percent."));
                 }
                 s.ui_scale = scale;
+            }
+            if let Some(minutes) = update.auto_lock_minutes {
+                if !AUTO_LOCK_CHOICES.contains(&minutes) {
+                    return Err(AegisError::invalid("Auto-lock must be 5, 15, 30, or 60 minutes."));
+                }
+                s.auto_lock_minutes = minutes;
             }
             let destination = |llm: &crate::llm::LlmConfig| classify(&llm.base_url, &llm.model).ok().map(|e| (e.host, e.relayed));
             let before_destination = destination(&s.llm);

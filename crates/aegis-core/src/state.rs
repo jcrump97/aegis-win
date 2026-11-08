@@ -31,6 +31,10 @@ impl Default for McpConfig {
     }
 }
 
+/// The idle auto-lock choices. There is no "off".
+pub const AUTO_LOCK_CHOICES: [u32; 4] = [5, 15, 30, 60];
+pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 15;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct VaultState {
@@ -43,6 +47,8 @@ pub struct VaultState {
     pub tool_gate_overrides: BTreeMap<String, GatePolicy>,
     /// UI zoom in percent (80-150).
     pub ui_scale: u32,
+    /// Minutes without owner activity before the vault locks itself (ADR 0002 §4).
+    pub auto_lock_minutes: u32,
     pub llm: LlmConfig,
     pub mcp: McpConfig,
     /// Plugin id → key → record (`plugin_data::PluginStore`). Kept when a
@@ -59,6 +65,7 @@ impl Default for VaultState {
             trusted_external_llm_plugins: vec![],
             tool_gate_overrides: BTreeMap::new(),
             ui_scale: 100,
+            auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             llm: LlmConfig::default(),
             mcp: McpConfig::default(),
             plugin_data: BTreeMap::new(),
@@ -89,6 +96,7 @@ mod tests {
         let state: VaultState = serde_json::from_str(r#"{ "firstRunCompleted": true, "installedPlugins": ["event-logs"] }"#).unwrap();
         assert!(state.first_run_completed);
         assert_eq!(state.ui_scale, 100);
+        assert_eq!(state.auto_lock_minutes, 15);
         assert_eq!(state.mcp.port, DEFAULT_MCP_PORT);
         assert_eq!(state.mcp.auth_token.expose().len(), 48);
         assert!(state.plugin_data.is_empty());

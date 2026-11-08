@@ -127,12 +127,14 @@ export interface McpStatus {
 
 export interface SettingsView {
   uiScale: number;
+  autoLockMinutes: number;
   llm: { baseUrl: string; model: string; hasApiKey: boolean; endpoint: Endpoint | null; endpointError: string | null };
   mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; status: McpStatus; suggestedLanHost: string | null };
 }
 
 export interface SettingsUpdate {
   uiScale?: number;
+  autoLockMinutes?: number;
   llmBaseUrl?: string;
   llmModel?: string;
   mcpEnabled?: boolean;
@@ -169,6 +171,7 @@ export const api = {
   setupVault: (pin: string) => call<Status>('setup_vault', { pin }),
   unlockVault: (pin: string) => call<Status>('unlock_vault', { pin }),
   lockVault: () => call<Status>('lock_vault'),
+  noteActivity: () => call<void>('note_activity'),
   changePin: (current: string, next: string) => call<void>('change_pin', { current, next }),
   getSettings: () => call<SettingsView>('get_settings'),
   updateSettings: (update: SettingsUpdate) => call<SettingsView>('update_settings', { update }),

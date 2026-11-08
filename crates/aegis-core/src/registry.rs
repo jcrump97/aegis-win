@@ -188,6 +188,13 @@ pub trait Plugin: Send + Sync {
     fn review_call(&self, _tool: &str, _args: &Value, _enabled_components: &[String]) -> Option<CallReview> {
         None
     }
+
+    /// True while the plugin is doing work the owner asked to keep running
+    /// in the background (for example an active monitor). Closing the window
+    /// then hides AegisWin to the tray instead of quitting.
+    fn background_active(&self) -> bool {
+        false
+    }
 }
 
 pub struct Registry {

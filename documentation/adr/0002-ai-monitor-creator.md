@@ -1,6 +1,6 @@
 # ADR 0002: AI-assisted monitor creator, background monitoring, and encrypted monitor history
 
-- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phases 3-5 are not.
+- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phase 3 is implemented on `feat/lifecycle` except the *locked, monitoring* state and tray *Pause monitoring*, which move to Phase 4 (§4). Phases 4-5 are not.
 - **Date**: 2026-11-07
 - **Amends**: [ADR 0001](0001-rust-core.md) rejected-option row 13 (telemetry on disk), [GUIDING_PRINCIPLES §2](../GUIDING_PRINCIPLES.md)
 - **Plugin**: `usage-monitor` (the encrypted history writer in §5 is a shared `aegis-core` service)
@@ -169,10 +169,19 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
 - **Plugin trait.** It gains a monitoring-only lifecycle hook, because `on_lock` today means "stop everything".
 - **Notifications in v1** are the tray icon and the in-app list. Windows toasts for an unpackaged app usually need an AUMID registry entry, so they are deferred.
 
+**As built in Phase 3** (decided 2026-11-07, during implementation):
+
+- **The *locked, monitoring* state and tray *Pause monitoring* move to Phase 4.** Without the encrypted history, a hit made while locked would have to be dropped or kept in plaintext memory after lock, which breaks "telemetry is cleared on lock". So in Phase 3, **Lock stops every monitor** as before, and the plugin hook is `background_active` (is there work that should keep AegisWin in the tray?) rather than a locked-monitoring hook.
+- **Tray**: menu Open, Lock, Quit; a left click opens the window. The state (locked, unlocked, unlocked with monitors running) shows in the tooltip, not as different icons.
+- **Close to tray**: closing the window hides it only while a monitor is running (`background_active`); otherwise it quits. The one-time notice is a standing hint on the Usage Monitor screen, because there are no toasts.
+- **Single instance** is a named mutex plus an auto-reset event in the session namespace, both keyed on a hash of the install folder, so two portable copies in different folders run side by side. A second launch signals the first to show its window and exits. A standard-user launch while an elevated copy runs cannot open the elevated copy's objects, so it exits without focusing it. The elevated restart releases the claim just before it starts the elevated copy and takes it back if the prompt is cancelled. `tauri-plugin-single-instance` was not used: it is keyed on the app identifier, not the install.
+
 ### Idle auto-lock
 
 - **Timeout:** default 15 minutes. Options: 5, 15, 30, or 60 minutes. There is no "off".
 - **What counts as idle:** no interaction with the AegisWin window or the approval portal. **MCP agent activity does not keep the vault unlocked.**
+  - As built: clicks and key presses in the app window (reported at most every 30 seconds through `note_activity`), and any correct PIN, in the app or on the approval page. Loading the approval page does not count, because an agent holding the link can load it too. Unlocking counts.
+  - The check runs every 5 seconds. Changing the timeout needs no PIN; it is a UI-only setting and only shortens or lengthens an already bounded wait.
 - **Running tools:** when auto-lock is due, no new queued item or plan step starts. Auto-lock waits for the running step only, then cancels everything queued ([ADR 0003 §5.1](0003-action-plans.md)). Pending, undecided tickets are cleared by the lock, as today.
 
 ## 5. Encrypted monitor history on disk
@@ -276,7 +285,7 @@ Decided on 2026-11-07 by taking the written recommendation, except where marked 
 4. **HPKE crate**: confirm the chosen crate meets the "audited, no hand-rolled cryptography" bar before Phase 4, or compose `x25519-dalek` + `hkdf` + `aes-gcm` exactly per RFC 9180. **Open: a crypto choice the owner decides before Phase 4 starts.**
 5. **Caps**: confirm 20 monitors and 8 conditions per monitor. **Decided: 20 monitors, 8 conditions per monitor.**
 6. **Windows toast notifications**: stay deferred until there is a way to show them without a registry entry? **Decided: deferred**; v1 uses the tray icon and the in-app list only.
-7. **Shutdown messages**: confirm in Phase 3 whether Tauri delivers them or a hidden message window is needed. **Decided: investigated at the start of Phase 3**; the result is recorded here.
+7. **Shutdown messages**: confirm in Phase 3 whether Tauri delivers them or a hidden message window is needed. **Decided: Tauri delivers them.** The window library (tao 0.37) handles `WM_ENDSESSION` and ends the event loop, which Tauri reports as `RunEvent::Exit`, so no hidden message window is needed. Phase 4 writes its clean-stop record there. Still to confirm by hand with a real sign-out and shutdown.
 
 ## 11. Set aside and dropped
 

@@ -803,6 +803,10 @@ impl Plugin for UsageMonitorPlugin {
         self.load_monitors(ctx.store.as_ref(), enabled_components);
     }
 
+    fn background_active(&self) -> bool {
+        !self.telemetry.lock().unwrap().monitors.active.is_empty()
+    }
+
     fn on_lock(&self) {
         // Waits for a monitor change in progress, so it cannot restart the
         // sampler after this. Later changes fail: the vault is already locked.

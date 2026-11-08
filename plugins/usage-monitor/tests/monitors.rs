@@ -208,3 +208,20 @@ async fn replacing_keeps_the_id_and_invalid_rules_never_save() {
     assert_eq!(listed["monitors"].as_array().unwrap().len(), 1);
     assert_eq!(listed["monitors"][0]["name"], "v2", "a rejected replacement changes nothing");
 }
+
+#[tokio::test]
+async fn only_running_monitors_keep_aegiswin_in_the_tray() {
+    let (engine, _dir) = engine().await;
+    assert!(!engine.background_active(), "no monitors");
+    run(&engine, ui(Some(PIN)), "activate_monitor", json!({ "rule": crash_rule("tray") })).await.unwrap();
+    assert!(engine.background_active());
+    run(&engine, ui(Some(PIN)), "pause_monitor", json!({ "id": "m1", "paused": true })).await.unwrap();
+    assert!(!engine.background_active(), "paused");
+    run(&engine, ui(Some(PIN)), "pause_monitor", json!({ "id": "m1", "paused": false })).await.unwrap();
+    engine.set_installed(BTreeMap::from([(UM.to_owned(), vec![])])).unwrap();
+    assert!(!engine.background_active(), "its component is off");
+    engine.set_installed(BTreeMap::from([(UM.to_owned(), vec![COMPONENT_CRASHES.to_owned()])])).unwrap();
+    assert!(engine.background_active());
+    engine.lock().await;
+    assert!(!engine.background_active(), "locking stops monitors");
+}

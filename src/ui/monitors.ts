@@ -43,7 +43,8 @@ export function monitorPanel(deps: MonitorDeps): HTMLElement {
   const editor = ruleEditor(deps, () => list.refresh());
   list.onAdjust = (rule, id) => editor.load(rule, id);
   const chat = monitorChat(deps, (rule) => editor.load(rule, null), () => list.refresh());
-  panel = h('div', { class: 'stack' }, list.element, chat, editor.element);
+  const hint = h('p', { class: 'hint' }, 'While a monitor runs, closing this window keeps AegisWin running in the tray. Quit from the tray icon to stop it. Locking stops all monitors.');
+  panel = h('div', { class: 'stack' }, hint, list.element, chat, editor.element);
   return panel;
 }
 

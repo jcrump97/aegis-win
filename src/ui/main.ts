@@ -329,6 +329,12 @@ function startPolling(): void {
   stopPolling();
   pollTimer = window.setInterval(async () => {
     try {
+      // The vault can lock without the UI asking (idle auto-lock, tray Lock).
+      const now = await api.status();
+      if (!now.unlocked) {
+        status = now;
+        return route();
+      }
       const next = await api.listTickets();
       const before = new Set(tickets.filter((t) => t.status === 'pending_approval').map((t) => t.ticketId));
       for (const t of next) if (t.status === 'pending_approval' && !before.has(t.ticketId)) toast(`An AI agent is asking to run "${t.toolName}". Open Approvals to decide.`);
@@ -864,6 +870,17 @@ function settingsTab(): HTMLElement {
     }
   });
 
+  const autoLock = h('select', { id: 'auto-lock' }, ...[5, 15, 30, 60].map((m) => h('option', { value: m }, `${m} minutes`)));
+  autoLock.value = String(settings?.autoLockMinutes ?? 15);
+  autoLock.addEventListener('change', async () => {
+    try {
+      settings = await api.updateSettings({ autoLockMinutes: Number(autoLock.value) });
+      toast('Auto-lock updated.');
+    } catch (e) {
+      await handleError(e);
+    }
+  });
+
   const selector = pluginSelector(plugins, false);
   const savePlugins = h('button', { class: 'primary' }, 'Save plugins');
   savePlugins.addEventListener('click', async () => {
@@ -901,6 +918,14 @@ function settingsTab(): HTMLElement {
     { class: 'stack' },
     h('h2', {}, 'Settings'),
     h('section', { class: 'card' }, h('h3', {}, 'Display'), h('label', { for: 'ui-scale' }, 'Text size'), h('div', { class: 'row' }, scale, scaleLabel)),
+    h(
+      'section',
+      { class: 'card' },
+      h('h3', {}, 'Security'),
+      h('label', { for: 'auto-lock' }, 'Lock automatically after no use for'),
+      autoLock,
+      h('p', { class: 'hint' }, 'Clicks, typing, and entering your PIN count as use. Nothing an AI agent does counts. Locking stops all monitors.'),
+    ),
     h('section', { class: 'stack' }, h('h3', {}, 'Plugins and components'), selector.element, h('div', { class: 'row end' }, savePlugins)),
     pinForm,
     h(
@@ -913,6 +938,16 @@ function settingsTab(): HTMLElement {
 }
 
 // ---- start ------------------------------------------------------------------
+
+/** Tells the idle auto-lock the owner is here, at most every 30 seconds. */
+let lastActivity = 0;
+function noteActivity(): void {
+  if (!status?.unlocked || Date.now() - lastActivity < 30_000) return;
+  lastActivity = Date.now();
+  api.noteActivity().catch(() => {});
+}
+document.addEventListener('pointerdown', noteActivity, true);
+document.addEventListener('keydown', noteActivity, true);
 
 async function boot(): Promise<void> {
   try {

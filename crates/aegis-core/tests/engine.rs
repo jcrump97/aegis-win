@@ -276,3 +276,36 @@ async fn a_rejected_settings_change_changes_nothing() {
     f.engine.unlock(PIN.into()).await.unwrap();
     assert_eq!(f.engine.settings().await.unwrap().ui_scale, 100);
 }
+
+#[tokio::test]
+async fn idle_auto_lock_counts_only_the_owner() {
+    let f = ready().await;
+    let minutes = |m: u64| Duration::from_secs(m * 60);
+    assert_eq!(f.engine.settings().await.unwrap().auto_lock_minutes, 15, "default");
+    assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(14)).await);
+
+    // Agent requests and the approval page do not count as the owner being here.
+    let before = f.engine.last_activity();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let RunOutcome::PendingApproval { ticket } = f.engine.run_tool(Origin::Mcp, "demo", "fix", json!({})).await.unwrap() else { panic!() };
+    f.engine.run_tool(Origin::Mcp, "demo", "echo", json!({ "text": "hi" })).await.unwrap();
+    f.engine.ticket(&ticket.ticket_id).unwrap();
+    assert_eq!(f.engine.last_activity(), before);
+    // A wrong PIN does not either; a correct one does, wherever it is typed.
+    f.engine.decide_ticket(&ticket.ticket_id, false, "000000".into(), None, "browser").await.unwrap_err();
+    assert_eq!(f.engine.last_activity(), before);
+    f.engine.decide_ticket(&ticket.ticket_id, false, PIN.into(), None, "browser").await.unwrap();
+    assert!(f.engine.last_activity() > before);
+
+    // Only the listed choices; there is no "off".
+    for bad in [0, 1, 10, 120] {
+        let err = f.engine.update_settings(SettingsUpdate { auto_lock_minutes: Some(bad), ..Default::default() }).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArguments, "{bad}");
+    }
+    f.engine.update_settings(SettingsUpdate { auto_lock_minutes: Some(5), ..Default::default() }).await.unwrap();
+    assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(4)).await);
+    f.engine.note_activity();
+    assert!(f.engine.lock_if_idle(f.engine.last_activity() + minutes(5)).await);
+    assert!(!f.engine.status().unlocked);
+    assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(60)).await, "already locked");
+}

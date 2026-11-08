@@ -98,3 +98,19 @@ test('UI: the monitor screen starts monitors only through the PIN-gated tool, an
   assert.match(main, /plugin\.tools\.filter\(\(t\) => !t\.appOnly/);
   assert.match(main, /p\.tools\.filter\(\(t\) => !t\.appOnly\)\.map/);
 });
+
+test('Lifecycle: one copy per install, close-to-tray only while monitors run, and the UI notices a lock', () => {
+  // The single-instance claim comes before anything else starts.
+  assert.match(mainRs, /fn main\(\) \{\s*\/\/[^\n]*\n\s*let claim = match claim_instance\(\) \{[\s\S]*?Ok\(Instance::AlreadyRunning\) => return,/);
+  // Closing hides the window only when a plugin is working in the background.
+  assert.match(mainRs, /CloseRequested \{ api, \.\. \} = event \{\s*if window\.state::<Arc<Engine>>\(\)\.background_active\(\) \{\s*api\.prevent_close\(\);/);
+  // The elevated restart releases the claim so the elevated copy can start.
+  assert.match(mainRs, /drop\(claim\.0\.lock\(\)\.unwrap\(\)\.take\(\)\);\s*let reclaim[\s\S]*?relaunch_elevated\(\)/);
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // Only input in the app window counts as activity.
+  assert.match(main, /document\.addEventListener\('pointerdown', noteActivity, true\);/);
+  assert.match(main, /document\.addEventListener\('keydown', noteActivity, true\);/);
+  assert.equal(main.match(/api\.noteActivity\(\)/g)?.length, 1, 'activity is reported from one place');
+  // The poll checks the lock state first, because the vault can lock without the UI asking.
+  assert.match(main, /pollTimer = window\.setInterval\(async \(\) => \{\s*try \{\s*\/\/[^\n]*\n\s*const now = await api\.status\(\);\s*if \(!now\.unlocked\)/);
+});
