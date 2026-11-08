@@ -146,6 +146,18 @@ impl ToolContext {
     }
 }
 
+/// What a call would do, written by the plugin's own code from the arguments
+/// (never from AI- or agent-supplied text). Shown with an approval request,
+/// next to the raw arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallReview {
+    /// Plain sentences describing exactly what will happen.
+    pub lines: Vec<String>,
+    /// Things the owner should notice before approving.
+    pub warnings: Vec<String>,
+}
+
 /// Handed to [`Plugin::on_unlock`]. The store stays usable from background
 /// threads, but only while the vault is unlocked and the plugin installed.
 #[derive(Clone, Default)]
@@ -169,6 +181,13 @@ pub trait Plugin: Send + Sync {
 
     /// Called when the vault locks or the plugin is uninstalled.
     fn on_lock(&self) {}
+
+    /// Describes a gated call for its approval request. Arguments are already
+    /// validated. `None` (the default) shows the tool description and the
+    /// arguments only.
+    fn review_call(&self, _tool: &str, _args: &Value, _enabled_components: &[String]) -> Option<CallReview> {
+        None
+    }
 }
 
 pub struct Registry {

@@ -523,7 +523,15 @@ function ticketCard(t: TicketView): HTMLElement {
     h('div', {}, h('h3', {}, t.toolName), h('p', { class: 'hint' }, `${t.pluginId} · requested ${new Date(t.createdAt).toLocaleString()}`)),
     h('div', { class: 'badges' }, t.requiresAdmin ? h('span', { class: 'badge danger' }, 'administrator') : null, h('span', { class: `badge ${tone}` }, label)),
   );
-  const body: Node[] = [head, h('p', {}, t.toolDescription), h('div', { class: 'hint' }, 'Arguments'), h('pre', {}, JSON.stringify(t.args, null, 2))];
+  const body: Node[] = [head, h('p', {}, t.toolDescription)];
+  if (t.review) {
+    body.push(
+      h('div', { class: 'hint' }, 'What this does (written by AegisWin from the arguments)'),
+      h('ul', {}, ...t.review.lines.map((line) => h('li', {}, line))),
+      ...t.review.warnings.map((w) => h('div', { class: 'notice' }, w)),
+    );
+  }
+  body.push(h('div', { class: 'hint' }, 'Arguments'), h('pre', {}, JSON.stringify(t.args, null, 2)));
   if (t.status === 'pending_approval') {
     const pin = h('input', { type: 'password', autocomplete: 'off', id: `pin-${t.ticketId}` });
     const comment = h('textarea', { rows: 2, maxlength: 500, id: `comment-${t.ticketId}` });

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use aegis_core::engine::{Engine, EngineOptions};
 use aegis_core::plugin_data::PluginStore;
-use aegis_core::registry::{Plugin, PluginManifest, Registry, ToolContext, UnlockContext};
+use aegis_core::registry::{CallReview, Plugin, PluginManifest, Registry, ToolContext, UnlockContext};
 use aegis_core::vault::KdfParams;
 use aegis_core::AegisResult;
 use async_trait::async_trait;
@@ -84,6 +84,13 @@ impl Plugin for DemoPlugin {
 
     fn on_lock(&self) {
         self.locks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn review_call(&self, tool: &str, args: &Value, _enabled_components: &[String]) -> Option<CallReview> {
+        (tool == "fix").then(|| CallReview {
+            lines: vec![format!("Fixes {}.", args["note"].as_str().unwrap_or("nothing"))],
+            warnings: vec!["Fixing <b>cannot</b> be undone.".into()],
+        })
     }
 }
 

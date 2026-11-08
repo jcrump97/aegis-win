@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::AegisError;
+use crate::registry::CallReview;
 
 pub const TICKET_TTL: Duration = Duration::from_secs(30 * 60);
 pub const STRIKES_PER_TICKET: u8 = 3;
@@ -41,6 +42,7 @@ pub struct Ticket {
     pub tool_description: String,
     pub requires_admin: bool,
     pub args: Value,
+    pub review: Option<CallReview>,
     pub created: Instant,
     pub created_at: String,
     pub status: TicketStatus,
@@ -62,6 +64,9 @@ pub struct TicketView {
     pub tool_description: String,
     pub requires_admin: bool,
     pub args: Value,
+    /// The plugin's code-generated description of the call, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<CallReview>,
     pub created_at: String,
     pub status: TicketStatus,
     pub attempts_remaining: u8,
@@ -83,6 +88,7 @@ impl Ticket {
             tool_description: self.tool_description.clone(),
             requires_admin: self.requires_admin,
             args: self.args.clone(),
+            review: self.review.clone(),
             created_at: self.created_at.clone(),
             status: self.status,
             attempts_remaining: STRIKES_PER_TICKET.saturating_sub(self.strikes),
@@ -112,6 +118,7 @@ pub struct NewTicket {
     pub tool_description: String,
     pub requires_admin: bool,
     pub args: Value,
+    pub review: Option<CallReview>,
 }
 
 impl TicketStore {
@@ -132,6 +139,7 @@ impl TicketStore {
             tool_description: t.tool_description,
             requires_admin: t.requires_admin,
             args: t.args,
+            review: t.review,
             created: now,
             created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             status: TicketStatus::PendingApproval,
@@ -191,6 +199,7 @@ mod tests {
             tool_description: "d".into(),
             requires_admin: false,
             args: json!({}),
+            review: None,
         }
     }
 

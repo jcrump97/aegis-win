@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use aegis_core::llm::LlmHandle;
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
-use aegis_core::registry::{Plugin, PluginManifest, ToolContext, UnlockContext};
+use aegis_core::registry::{CallReview, Plugin, PluginManifest, ToolContext, UnlockContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, NaiveTime, Utc};
@@ -814,6 +814,25 @@ impl Plugin for UsageMonitorPlugin {
         t.clear();
         t.sampling_since = None;
         t.monitors = MonitorRuntime::default();
+    }
+
+    /// The approval request for `activate_monitor` shows the description
+    /// AegisWin writes from the rule, not only the raw JSON (ADR 0002 §1).
+    fn review_call(&self, tool: &str, args: &Value, enabled_components: &[String]) -> Option<CallReview> {
+        if tool != "activate_monitor" {
+            return None;
+        }
+        Some(match rules::validate(&args["rule"], enabled_components) {
+            Ok(rule) => {
+                let mut lines = rules::describe(&rule);
+                if let Some(id) = args.get("replaceId").and_then(Value::as_str) {
+                    lines.insert(0, format!("Replaces the rule of monitor {}.", rules::echo(id, 20)));
+                }
+                let warnings = rules::privacy_flags(&rule).into_iter().map(|f| f.explain().to_owned()).collect();
+                CallReview { lines, warnings }
+            }
+            Err(problems) => CallReview { lines: Vec::new(), warnings: vec![format!("This rule is not valid, so approving it will fail: {}", problems.join("; "))] },
+        })
     }
 }
 

@@ -130,8 +130,25 @@ async fn an_agent_activation_waits_for_approval_and_runs_the_exact_rule() {
     let (engine, _dir) = engine().await;
     let outcome = engine.run_tool(Origin::Mcp, UM, "activate_monitor", json!({ "rule": crash_rule("From the agent") })).await.unwrap();
     let RunOutcome::PendingApproval { ticket } = outcome else { panic!("an agent cannot start a monitor itself") };
-    // The approval shows the full rule that will run, not a reference to it.
+    // The approval shows the full rule that will run, not a reference to it,
+    // and the description AegisWin writes from it.
     assert_eq!(ticket.args["rule"]["name"], "From the agent");
+    let review = ticket.review.as_ref().expect("activate_monitor approvals carry a review");
+    assert_eq!(review.lines[0], "Monitor \"From the agent\"");
+    assert!(review.lines.iter().any(|l| l.contains("game.exe crashes or hangs")), "{review:?}");
+
+    let mut wide = crash_rule("Everything");
+    wide["schedule"] = json!({ "startTime": "00:00", "endTime": "00:00" });
+    wide["trigger"] = json!({ "any": [{ "type": "crash", "process": "*" }] });
+    let RunOutcome::PendingApproval { ticket: wide } = engine.run_tool(Origin::Mcp, UM, "activate_monitor", json!({ "rule": wide, "replaceId": "m7" })).await.unwrap() else { panic!() };
+    let review = wide.review.unwrap();
+    assert_eq!(review.lines[0], "Replaces the rule of monitor m7.");
+    assert_eq!(review.warnings.len(), 2, "any app and always on are flagged: {review:?}");
+
+    let RunOutcome::PendingApproval { ticket: bad } = engine.run_tool(Origin::Mcp, UM, "activate_monitor", json!({ "rule": { "version": 1 } })).await.unwrap() else { panic!() };
+    assert!(bad.review.unwrap().warnings[0].starts_with("This rule is not valid"));
+    let RunOutcome::PendingApproval { ticket: pause } = engine.run_tool(Origin::Mcp, UM, "pause_monitor", json!({ "id": "m1" })).await.unwrap() else { panic!() };
+    assert!(pause.review.is_none(), "other tools keep the generic view");
     assert_eq!(list(&engine).await["monitors"], json!([]), "nothing runs before approval");
     assert_eq!(approve(&engine, &ticket.ticket_id).await, TicketStatus::Approved);
     assert_eq!(list(&engine).await["monitors"][0]["name"], "From the agent");

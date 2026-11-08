@@ -794,6 +794,7 @@ impl Engine {
                     execute(prepared).await
                 }
                 Origin::Mcp => {
+                    let review = prepared.plugin.review_call(&prepared.tool.id, &prepared.args, &prepared.ctx.enabled_components);
                     let ticket = lock(&self.tickets).create(
                         NewTicket {
                             plugin_id: plugin_id.to_owned(),
@@ -802,6 +803,7 @@ impl Engine {
                             tool_description: prepared.tool.description.clone(),
                             requires_admin: prepared.tool.requires_admin,
                             args: prepared.args,
+                            review,
                         },
                         Instant::now(),
                     );

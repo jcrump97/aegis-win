@@ -80,6 +80,11 @@ export type TicketStatus =
   | 'locked_out'
   | 'expired';
 
+export interface CallReview {
+  lines: string[];
+  warnings: string[];
+}
+
 export interface TicketView {
   ticketId: string;
   pluginId: string;
@@ -88,6 +93,8 @@ export interface TicketView {
   toolDescription: string;
   requiresAdmin: boolean;
   args: unknown;
+  /** What the call does, written by the plugin's code from the arguments. */
+  review?: CallReview;
   createdAt: string;
   status: TicketStatus;
   attemptsRemaining: number;

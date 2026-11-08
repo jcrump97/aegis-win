@@ -451,6 +451,16 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
         escape_html(&status_label(ticket.status)),
         escape_html(&args),
     ));
+    if let Some(review) = &ticket.review {
+        body.push_str("<p><strong>What this does</strong> (written by AegisWin from the arguments):</p><ul>");
+        for line in &review.lines {
+            body.push_str(&format!("<li>{}</li>", escape_html(line)));
+        }
+        body.push_str("</ul>");
+        for warning in &review.warnings {
+            body.push_str(&format!("<div class=\"msg\">{}</div>", escape_html(warning)));
+        }
+    }
     if ticket.requires_admin {
         body.push_str("<p>This action changes system settings and runs with administrator rights.</p>");
     }

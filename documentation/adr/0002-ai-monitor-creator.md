@@ -100,7 +100,7 @@ The governing rule for every part of this design: **the AI proposes, code valida
 | `configure_watch_window` | **auto → pin_required** | false | Closes the gap where an agent could quietly change what is recorded (Phase 0). Kept: the "Default" migration was dropped (§1). |
 | `purge_telemetry_history` | pin_required (unchanged) | false | Now also deletes history files and replaces the monitor keypair (§6) |
 
-The approval portal and the in-app queue show the **code-generated description and privacy flags** for `activate_monitor`, not only the raw arguments.
+The approval portal and the in-app queue show the **code-generated description and privacy flags** for `activate_monitor`, not only the raw arguments. **Done (Phase 1):** through a new optional plugin hook, `review_call`, that every plugin can use; the description is stored on the ticket when it is opened, so it matches the arguments that will run. A rule that does not validate shows a warning that approving will fail. `pause_monitor` and `delete_monitor` keep the generic view (the monitor id).
 
 **None of these tools is ever plan-eligible** ([ADR 0003 §4](0003-action-plans.md)). Monitor management and purge keep their own single-ticket review, so a monitor can never be switched on or off as one step among others.
 

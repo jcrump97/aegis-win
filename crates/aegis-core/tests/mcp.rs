@@ -155,6 +155,10 @@ async fn pin_gated_tools_are_approved_in_the_browser_portal() {
     let html = page.text().await.unwrap();
     assert!(html.contains("Fix &lt;it&gt;"), "tool name is escaped");
     assert!(!html.contains("<script>"), "arguments are escaped");
+    // The plugin's own description of the call is shown, escaped.
+    assert!(html.contains("<li>Fixes &lt;script&gt;alert(1)&lt;/script&gt;.</li>"), "{html}");
+    assert!(html.contains("Fixing &lt;b&gt;cannot&lt;/b&gt; be undone."));
+    assert_eq!(content["review"]["warnings"][0], "Fixing <b>cannot</b> be undone.", "agents see the same review");
     let csrf = extract_csrf(&html);
 
     let post = |origin: &str, csrf: &str, pin: &str, decision: &str| {
