@@ -4,6 +4,7 @@
 import './styles.css';
 import { api, asError, type AegisError, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
+import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { rawJson, renderValue, schemaForm } from './render';
 
 const root = document.getElementById('app')!;
@@ -87,6 +88,7 @@ function route(): void {
   stopPolling();
   shellParts = null;
   mainEl = null;
+  forgetMonitorPanel();
   if (!status.vaultExists) setupScreen();
   else if (!status.unlocked) unlockScreen();
   else if (!status.firstRunCompleted) void wizardScreen();
@@ -389,12 +391,32 @@ const FOLLOW_UPS: Record<string, FollowUp> = {
 function pluginTab(pluginId: string): HTMLElement {
   const plugin = plugins.find((p) => p.id === pluginId);
   if (!plugin) return h('p', {}, 'Plugin not found.');
+  const monitors = pluginId === 'usage-monitor';
   return h(
     'div',
     { class: 'stack' },
     h('div', {}, h('h2', {}, plugin.name), h('p', { class: 'hint' }, plugin.description)),
-    ...plugin.tools.map((tool) => toolCard(plugin, tool)),
+    monitors ? monitorPanel(monitorDeps(pluginId)) : null,
+    monitors ? h('h3', {}, 'Other tools') : null,
+    ...plugin.tools.filter((t) => !t.appOnly && !(monitors && MONITOR_TOOLS.has(t.id))).map((tool) => toolCard(plugin, tool)),
   );
+}
+
+function monitorDeps(pluginId: string) {
+  const find = (id: string) => plugins.find((p) => p.id === pluginId)?.tools.find((t) => t.id === id);
+  return {
+    tool: find,
+    run: async (toolId: string, args: Record<string, unknown>, button: HTMLButtonElement): Promise<ToolRun> => {
+      const plugin = plugins.find((p) => p.id === pluginId);
+      const tool = find(toolId);
+      if (!plugin || !tool) return { ok: false, error: { code: 'UNKNOWN_TOOL', message: 'This tool is not available. Check the plugin in Settings.' } };
+      return invokeTool(plugin, tool, args, button);
+    },
+    llmDestination: () => {
+      const e = settings?.llm.endpoint;
+      return e ? { host: e.host, offLan: !e.isLan || e.relayed } : null;
+    },
+  };
 }
 
 function toolBadges(tool: ToolView): HTMLElement {
@@ -432,29 +454,35 @@ function toolCard(plugin: PluginView, tool: ToolView): HTMLElement {
   );
 }
 
-async function runTool(plugin: PluginView, tool: ToolView, args: Record<string, unknown>, resultEl: HTMLElement, button: HTMLButtonElement): Promise<void> {
+/** Runs a tool from the app, asking for the PIN or Off-LAN trust when needed. `error: null` means cancelled or already handled. */
+async function invokeTool(plugin: PluginView, tool: ToolView, args: Record<string, unknown>, button: HTMLButtonElement): Promise<ToolRun> {
   const dryRun = args.dryRun === true;
-  if (tool.requiresAdmin && !status.elevated && !dryRun) {
-    replace(resultEl, h('div', { class: 'result' }, adminNotice(tool.name)));
-    return;
-  }
+  if (tool.requiresAdmin && !status.elevated && !dryRun) return { ok: false, error: { code: 'REQUIRES_ADMIN', message: `${tool.name} needs administrator rights.` } };
   let pin: string | null = null;
   if (tool.effectivePolicy === 'pin_required' && !dryRun) {
     pin = await askPin(`Run "${tool.name}"?`, tool.description, 'Run');
-    if (pin === null) return;
+    if (pin === null) return { ok: false, error: null };
   }
   try {
     const outcome = await busy(button, () => api.runTool(plugin.id, tool.id, args, pin));
-    if (outcome.status === 'completed') showResult(resultEl, plugin, tool, outcome.result);
+    // The app's own calls never wait for approval; that is only for agents.
+    return outcome.status === 'completed' ? { ok: true, value: outcome.result } : { ok: false, error: null };
   } catch (e) {
     const err = asError(e);
-    if (err.code === 'VAULT_LOCKED') return handleError(e);
-    if (err.code === 'REQUIRES_ADMIN') return replace(resultEl, h('div', { class: 'result' }, adminNotice(tool.name)));
-    if (err.code === 'OFF_LAN_TRUST_REQUIRED') {
-      if (await askTrust(plugin)) return runTool(plugin, tool, args, resultEl, button);
+    if (err.code === 'VAULT_LOCKED') {
+      await handleError(e);
+      return { ok: false, error: null };
     }
-    replace(resultEl, h('div', { class: 'result' }, errorNotice(err)));
+    if (err.code === 'OFF_LAN_TRUST_REQUIRED' && (await askTrust(plugin))) return invokeTool(plugin, tool, args, button);
+    return { ok: false, error: err };
   }
+}
+
+async function runTool(plugin: PluginView, tool: ToolView, args: Record<string, unknown>, resultEl: HTMLElement, button: HTMLButtonElement): Promise<void> {
+  const r = await invokeTool(plugin, tool, args, button);
+  if (r.ok) showResult(resultEl, plugin, tool, r.value);
+  else if (r.error?.code === 'REQUIRES_ADMIN') replace(resultEl, h('div', { class: 'result' }, adminNotice(tool.name)));
+  else if (r.error) replace(resultEl, h('div', { class: 'result' }, errorNotice(r.error)));
 }
 
 function showResult(resultEl: HTMLElement, plugin: PluginView, tool: ToolView, value: unknown): void {
@@ -679,7 +707,7 @@ function gatesCard(): HTMLElement {
   const rows = plugins
     .filter((p) => p.installed)
     .flatMap((p) =>
-      p.tools.map((t) => {
+      p.tools.filter((t) => !t.appOnly).map((t) => {
         const select = h('select', { 'aria-label': `Gate for ${t.name}` }, h('option', { value: 'auto' }, 'runs immediately'), h('option', { value: 'pin_required' }, 'needs my PIN'));
         select.value = t.effectivePolicy;
         select.addEventListener('change', async () => {

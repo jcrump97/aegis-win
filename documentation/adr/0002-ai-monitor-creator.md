@@ -1,6 +1,6 @@
 # ADR 0002: AI-assisted monitor creator, background monitoring, and encrypted monitor history
 
-- **Status**: Accepted (2026-11-07). Phase 0 is implemented (commit `8b7ad4b`); later phases are not.
+- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phases 3-5 are not.
 - **Date**: 2026-11-07
 - **Amends**: [ADR 0001](0001-rust-core.md) rejected-option row 13 (telemetry on disk), [GUIDING_PRINCIPLES §2](../GUIDING_PRINCIPLES.md)
 - **Plugin**: `usage-monitor` (the encrypted history writer in §5 is a shared `aegis-core` service)

@@ -147,6 +147,8 @@ pub struct ToolView {
     pub default_gate_policy: GatePolicy,
     pub effective_policy: GatePolicy,
     pub mcp_name: String,
+    /// Reached only from the app; agents never see it (PLUGIN_SPEC §2).
+    pub app_only: bool,
     pub input_schema: Value,
 }
 
@@ -571,6 +573,7 @@ impl Engine {
                                 default_gate_policy: t.default_gate_policy,
                                 effective_policy: registry::effective_policy(&m.id, t, &s.tool_gate_overrides),
                                 mcp_name: registry::mcp_tool_name(&m.id, &t.id),
+                                app_only: t.app_only,
                                 input_schema: t.input_schema.clone(),
                             })
                             .collect(),

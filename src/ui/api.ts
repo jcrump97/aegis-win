@@ -55,6 +55,8 @@ export interface ToolView {
   defaultGatePolicy: GatePolicy;
   effectivePolicy: GatePolicy;
   mcpName: string;
+  /** Reached only from the app, never listed for agents. */
+  appOnly: boolean;
   inputSchema: JsonSchema;
 }
 

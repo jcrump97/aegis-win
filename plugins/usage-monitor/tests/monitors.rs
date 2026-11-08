@@ -123,6 +123,7 @@ async fn activating_needs_the_pin_in_the_app() {
     let m = &listed["monitors"][0];
     assert_eq!((m["id"].as_str(), m["running"].as_bool(), m["paused"].as_bool()), (Some("m1"), Some(true), Some(false)));
     assert_eq!(m["name"], "Friday freezes");
+    assert_eq!(m["rule"], crash_rule("Friday freezes"), "the stored rule, for adjusting");
 }
 
 #[tokio::test]

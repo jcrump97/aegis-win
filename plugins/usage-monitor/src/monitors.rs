@@ -173,6 +173,8 @@ pub fn view(m: &StoredMonitor, rt: &MonitorRuntime, hits: &[MonitorHit]) -> Valu
         "running": rt.is_active(&m.id),
         "problems": rt.problems_for(&m.id),
         "review": rule.as_ref().map(review),
+        // As stored, so the owner can adjust it and activate it with `replaceId`.
+        "rule": m.rule,
         "createdAt": m.created_at,
         "updatedAt": m.updated_at,
         "hitsSinceUnlock": mine.len(),

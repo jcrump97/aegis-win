@@ -77,3 +77,24 @@ test('UI: LLM answers parse a safe Markdown subset into plain data', async () =>
   const render = fs.readFileSync('src/ui/render.ts', 'utf8');
   assert.match(render, /markdown\(answer\.text\)/, 'LLM answers go through the Markdown renderer');
 });
+
+test('UI: the monitor screen starts monitors only through the PIN-gated tool, and labels AI text', () => {
+  const monitors = fs.readFileSync('src/ui/monitors.ts', 'utf8');
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // One place starts a monitor: the Start button of a rule AegisWin has just checked and described.
+  assert.equal(monitors.match(/run\('activate_monitor'/g)?.length, 1, 'activate_monitor is called from one place');
+  assert.match(monitors, /function proposalView[\s\S]*?deps\.run\('activate_monitor', args, start\)/);
+  // Every tool call goes through invokeTool, which asks for the PIN when the gate needs it.
+  assert.match(main, /function monitorDeps[\s\S]*?return invokeTool\(plugin, tool, args, button\);/);
+  assert.match(main, /async function invokeTool[\s\S]*?effectivePolicy === 'pin_required'[\s\S]*?askPin\(/);
+  // Editing the rule throws away the last check, so a stale review is never started.
+  assert.match(monitors, /addEventListener\('input', \(e\) => \{\s*if \(form\.contains\(e\.target as Node\)\) replace\(result\);/);
+  assert.match(monitors, /addEventListener\('change', \(e\) => \{\s*if \(form\.contains\(e\.target as Node\)\) replace\(result\);/);
+  // Text an AI wrote is always shown with a label saying so.
+  const labels = [...monitors.matchAll(/aiText\(('[^']*'|str\(reasoning\.label\))/g)].map((m) => m[1]);
+  assert.equal(labels.length, 3);
+  for (const l of labels) assert.ok(l === 'str(reasoning.label)' || /AI-generated, may be wrong/.test(l), l);
+  // App-only tools are never offered as generic forms or as agent gates.
+  assert.match(main, /plugin\.tools\.filter\(\(t\) => !t\.appOnly/);
+  assert.match(main, /p\.tools\.filter\(\(t\) => !t\.appOnly\)\.map/);
+});

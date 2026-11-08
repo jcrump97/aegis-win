@@ -42,7 +42,7 @@ Plugins are registered at compile time in `src-tauri`. There is no runtime loadi
 }
 ```
 
-Every tool MUST declare `requiresAdmin: boolean`, `defaultGatePolicy: "auto" | "pin_required"`, and `readOnly: boolean` (sent to MCP clients as `readOnlyHint`). A tool that belongs to an optional sub-component also names it in `component`, and fails with `COMPONENT_DISABLED` while that component is off. A tool only the AegisWin app may call sets `appOnly: true` (default `false`): it is left out of MCP `tools/list`, and an MCP call gets the same `unknown tool` error as a tool that does not exist, so agents cannot find or reach it. Its gate still applies in the app. Unknown fields are rejected.
+Every tool MUST declare `requiresAdmin: boolean`, `defaultGatePolicy: "auto" | "pin_required"`, and `readOnly: boolean` (sent to MCP clients as `readOnlyHint`). A tool that belongs to an optional sub-component also names it in `component`, and fails with `COMPONENT_DISABLED` while that component is off. A tool only the AegisWin app may call sets `appOnly: true` (default `false`): it is left out of MCP `tools/list`, and an MCP call gets the same `unknown tool` error as a tool that does not exist, so agents cannot find or reach it. Its gate still applies in the app, and the app's generic tool forms and gate settings leave it out (the engine's plugin view reports `appOnly`), so the plugin's own screen is the only way in. Unknown fields are rejected.
 
 ### 2.1 Naming
 - Plugin ids: lowercase letters, digits and `-`. Tool ids: lowercase letters, digits and `_`. Neither may contain `__`.

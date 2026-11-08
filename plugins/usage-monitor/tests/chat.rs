@@ -68,6 +68,9 @@ async fn agents_cannot_see_or_use_the_chat() {
     let engine = Engine::new(dir.path().join("data"), registry, EngineOptions { kdf: KdfParams::INSECURE_TEST, elevated: false });
     engine.setup("246810".into()).await.unwrap();
     engine.set_installed(BTreeMap::from([("usage-monitor".to_owned(), vec![COMPONENT_CRASHES.to_owned()])])).unwrap();
+    let views = engine.plugins().unwrap();
+    let app_only: Vec<&str> = views[0].tools.iter().filter(|t| t.app_only).map(|t| t.id.as_str()).collect();
+    assert_eq!(app_only, CHAT_TOOLS, "the app hides these from its generic tool lists");
     let exposed: Vec<String> = engine.exposed_tools().unwrap().into_iter().map(|t| t.tool.id).collect();
     assert!(exposed.contains(&"propose_monitor".to_owned()));
     for id in CHAT_TOOLS {
