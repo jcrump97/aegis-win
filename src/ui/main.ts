@@ -3,7 +3,7 @@
 
 import './styles.css';
 import { api, asError, type AegisError, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
-import { askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
+import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { rawJson, renderValue, schemaForm } from './render';
 
@@ -329,7 +329,11 @@ function renderTab(): void {
 // ---- polling for approval requests ------------------------------------------
 
 function ticketSignature(list: TicketView[]): string {
-  return list.map((t) => `${t.ticketId}:${t.status}:${t.queuePosition ?? ''}`).join('|');
+  return list.map((t) => `${t.ticketId}:${t.status}:${t.queuePosition ?? ''}:${(t.steps ?? []).map((s) => s.status).join(',')}`).join('|');
+}
+
+function askedFor(t: TicketView): string {
+  return t.plan ? `An AI agent proposes an action plan with ${t.steps?.length ?? 0} step(s). Open Approvals to review it.` : `An AI agent is asking to run "${t.toolName}". Open Approvals to decide.`;
 }
 
 function startPolling(): void {
@@ -342,7 +346,7 @@ function startPolling(): void {
       if (!now.unlocked) return route();
       const next = await api.listTickets();
       const before = new Set(tickets.filter((t) => t.status === 'pending_approval').map((t) => t.ticketId));
-      for (const t of next) if (t.status === 'pending_approval' && !before.has(t.ticketId)) toast(`An AI agent is asking to run "${t.toolName}". Open Approvals to decide.`);
+      for (const t of next) if (t.status === 'pending_approval' && !before.has(t.ticketId)) toast(askedFor(t));
       const changed = ticketSignature(next) !== ticketSignature(tickets);
       tickets = next;
       updateShellBadges();
@@ -539,6 +543,16 @@ const STATUS_TEXT: Record<string, [string, string]> = {
   execution_failed: ['failed', 'danger'],
   locked_out: ['locked (wrong PINs)', 'danger'],
   expired: ['expired', ''],
+  cancelled: ['cancelled', ''],
+};
+
+const STEP_TEXT: Record<string, [string, string]> = {
+  pending: ['not started', ''],
+  running: ['running', 'accent'],
+  succeeded: ['done', 'ok'],
+  failed: ['failed', 'danger'],
+  skipped: ['skipped (an earlier step failed)', ''],
+  cancelled: ['cancelled', ''],
 };
 
 function approvalsTab(): HTMLElement {
@@ -547,7 +561,7 @@ function approvalsTab(): HTMLElement {
   return h(
     'div',
     { class: 'stack' },
-    h('div', {}, h('h2', {}, 'Approvals'), h('p', { class: 'hint' }, 'When an AI agent calls a tool that needs your PIN, the request waits here. The agent can also show you a browser link for the same request. Requests expire after 30 minutes and are forgotten when AegisWin locks. Approved changes run one at a time, in the order you approve them.')),
+    h('div', {}, h('h2', {}, 'Approvals'), h('p', { class: 'hint' }, 'When an AI agent calls a tool that needs your PIN, or proposes a plan of several repairs, the request waits here. The agent can also show you a browser link for the same request. Requests expire after 30 minutes (plans after 10) and are forgotten when AegisWin locks. Approved changes run one at a time, in the order you approve them.')),
     pending.length === 0 ? h('div', { class: 'card' }, h('p', {}, 'No requests are waiting.')) : null,
     ...pending.map(ticketCard),
     done.length ? h('h3', {}, 'Earlier requests') : null,
@@ -555,7 +569,132 @@ function approvalsTab(): HTMLElement {
   );
 }
 
+/** Refreshes the list after a decision or cancel, so the card shows its new state. */
+async function reloadTickets(): Promise<void> {
+  tickets = await api.listTickets();
+  updateShellBadges();
+  renderTab();
+}
+
+/** A PIN-free button that only withdraws or stops. */
+function cancelButton(t: TicketView, label: string, message: HTMLElement): HTMLButtonElement {
+  const button = h('button', {}, label);
+  button.addEventListener('click', async () => {
+    try {
+      await busy(button, () => api.cancelTicket(t.ticketId));
+      await reloadTickets();
+    } catch (e) {
+      replace(message, errorNotice(asError(e)));
+      await reloadTickets().catch(() => undefined);
+    }
+  });
+  return button;
+}
+
+/** PIN and note fields with Approve and Decline; a plan's approval names its hash. */
+function decisionForm(t: TicketView, approveLabel: string): Node[] {
+  const pin = h('input', { type: 'password', autocomplete: 'off', id: `pin-${t.ticketId}` });
+  const comment = h('textarea', { rows: 2, maxlength: 500, id: `comment-${t.ticketId}` });
+  const message = h('div');
+  const approve = h('button', { class: 'primary' }, approveLabel);
+  const decline = h('button', {}, 'Decline');
+  const decide = async (yes: boolean, button: HTMLButtonElement) => {
+    if (!pin.value) return replace(message, errorNotice({ code: 'PIN_REQUIRED', message: 'Enter your PIN to approve or decline.' }));
+    try {
+      await busy(button, () => api.decideTicket(t.ticketId, yes, pin.value, comment.value.trim() || null, t.plan?.hash ?? null));
+      pin.value = '';
+      comment.value = '';
+      await reloadTickets();
+    } catch (e) {
+      pin.value = '';
+      const err = asError(e);
+      replace(message, errorNotice(err));
+      if (err.code === 'CONFLICT' || err.code === 'NOT_FOUND' || (err.code === 'PIN_LOCKED_OUT' && err.message.includes('request'))) {
+        await reloadTickets();
+      }
+    }
+  };
+  approve.addEventListener('click', () => decide(true, approve));
+  decline.addEventListener('click', () => decide(false, decline));
+  return [
+    h('div', { class: 'grid2' }, h('div', {}, h('label', { for: `pin-${t.ticketId}` }, 'Your PIN'), pin, h('div', { class: 'hint' }, `${t.attemptsRemaining} attempt(s) left for this request`)), h('div', {}, h('label', { for: `comment-${t.ticketId}` }, 'Note for the agent (optional)'), comment)),
+    message,
+    h('div', { class: 'row', style: 'margin-top:0.6rem' }, approve, decline),
+  ];
+}
+
+function decidedNotes(t: TicketView): Node[] {
+  const out: Node[] = [];
+  if (t.decidedVia) out.push(h('p', { class: 'hint' }, `Decided in the ${t.decidedVia === 'browser' ? 'browser' : 'app'}${t.comment ? `: "${t.comment}"` : ''}`));
+  if (t.error) out.push(errorNotice(t.error));
+  return out;
+}
+
+/** Supplied text, kept apart from what AegisWin wrote and labelled with who wrote it. */
+function suppliedText(label: string, ...parts: Array<HTMLElement | null>): HTMLElement {
+  return h('div', { class: 'ai-text' }, h('div', { class: 'hint' }, label), ...parts);
+}
+
+/** The plan review (ADR 0003 §2): AegisWin's summary and steps, then the supplied text. */
+function planCard(t: TicketView, plan: NonNullable<TicketView['plan']>): HTMLElement {
+  const [base, tone] = STATUS_TEXT[t.status] ?? [t.status, ''];
+  const pending = t.status === 'pending_approval';
+  const steps = t.steps ?? [];
+  const head = h(
+    'div',
+    { class: 'tool-head' },
+    h('div', {}, h('h3', {}, t.toolName), h('p', { class: 'hint' }, `Action plan · requested ${new Date(t.createdAt).toLocaleString()}${pending ? ` · expires ${new Date(plan.expiresAt).toLocaleTimeString()}` : ''}`)),
+    h('div', { class: 'badges' }, t.requiresAdmin ? h('span', { class: 'badge danger' }, 'administrator') : null, h('span', { class: `badge ${tone}` }, t.status === 'queued' && t.queuePosition ? `${base} (#${t.queuePosition})` : base)),
+  );
+  const body: Node[] = [
+    head,
+    h('p', {}, h('strong', {}, plan.summary)),
+    h('p', { class: 'hint' }, 'Plan fingerprint: ', h('code', {}, plan.shortHash), '. If the agent told you one, it should match.'),
+    h('p', { class: 'hint' }, 'The steps run one at a time, in this order. The plan stops at the first failure, and changes made by earlier steps stay: Windows repairs cannot be undone.'),
+  ];
+  const list = h('ol', { class: 'stack' });
+  for (const s of steps) {
+    const [stepText, stepTone] = STEP_TEXT[s.status] ?? [s.status, ''];
+    append(
+      list,
+      h(
+        'li',
+        {},
+        h(
+          'div',
+          { class: 'tool-head' },
+          h('div', {}, h('strong', {}, s.toolName), h('span', { class: 'hint' }, ` · ${s.pluginId}`)),
+          h('div', { class: 'badges' }, s.requiresAdmin ? h('span', { class: 'badge danger' }, 'administrator') : null, pending ? null : h('span', { class: `badge ${stepTone}` }, stepText)),
+        ),
+        h('p', {}, s.toolDescription),
+        h('div', { class: 'hint' }, 'Arguments'),
+        h('pre', {}, JSON.stringify(s.args, null, 2)),
+        h('div', { class: 'hint' }, 'Commands it will run'),
+        h('pre', {}, s.commands.length ? s.commands.join('\n') : '(the dry run listed no commands)'),
+        s.reasoning ? suppliedText(plan.suppliedLabel, h('p', {}, s.reasoning)) : null,
+        s.error ? errorNotice(s.error) : null,
+        s.result !== undefined ? h('details', {}, h('summary', {}, 'Result'), renderValue(s.result), rawJson(s.result)) : null,
+      ),
+    );
+  }
+  body.push(list);
+  const { title, reasoning } = plan;
+  if (title || reasoning) body.push(suppliedText(plan.suppliedLabel, title ? h('p', {}, h('strong', {}, title)) : null, reasoning ? h('p', {}, reasoning) : null));
+  for (const flag of plan.flags) body.push(h('div', { class: 'notice' }, flag));
+  if (plan.stopReason) body.push(h('div', { class: 'notice' }, plan.stopReason));
+  const message = h('div');
+  if (pending) {
+    body.push(...decisionForm(t, `Approve and run ${steps.length} step${steps.length === 1 ? '' : 's'}`));
+  } else {
+    body.push(...decidedNotes(t));
+    if (t.status === 'running') body.push(message, h('div', { class: 'row' }, cancelButton(t, 'Stop after this step', message)));
+    if (t.status === 'queued') body.push(message, h('div', { class: 'row' }, cancelButton(t, 'Cancel before it starts', message)));
+  }
+  return h('section', { class: 'card ticket' }, ...body);
+}
+
 function ticketCard(t: TicketView): HTMLElement {
+  if (t.plan) return planCard(t, t.plan);
   const [base, tone] = STATUS_TEXT[t.status] ?? [t.status, ''];
   const label = t.status === 'queued' && t.queuePosition ? `${base} (#${t.queuePosition})` : base;
   const head = h(
@@ -574,41 +713,14 @@ function ticketCard(t: TicketView): HTMLElement {
   }
   body.push(h('div', { class: 'hint' }, 'Arguments'), h('pre', {}, JSON.stringify(t.args, null, 2)));
   if (t.status === 'pending_approval') {
-    const pin = h('input', { type: 'password', autocomplete: 'off', id: `pin-${t.ticketId}` });
-    const comment = h('textarea', { rows: 2, maxlength: 500, id: `comment-${t.ticketId}` });
-    const message = h('div');
-    const approve = h('button', { class: 'primary' }, 'Approve and run');
-    const decline = h('button', {}, 'Decline');
-    const decide = async (yes: boolean, button: HTMLButtonElement) => {
-      if (!pin.value) return replace(message, errorNotice({ code: 'PIN_REQUIRED', message: 'Enter your PIN to approve or decline.' }));
-      try {
-        await busy(button, () => api.decideTicket(t.ticketId, yes, pin.value, comment.value.trim() || null));
-        pin.value = '';
-        comment.value = '';
-        tickets = await api.listTickets();
-        updateShellBadges();
-        renderTab();
-      } catch (e) {
-        pin.value = '';
-        const err = asError(e);
-        replace(message, errorNotice(err));
-        if (err.code === 'CONFLICT' || err.code === 'NOT_FOUND' || (err.code === 'PIN_LOCKED_OUT' && err.message.includes('request'))) {
-          tickets = await api.listTickets();
-          renderTab();
-        }
-      }
-    };
-    approve.addEventListener('click', () => decide(true, approve));
-    decline.addEventListener('click', () => decide(false, decline));
-    body.push(
-      h('div', { class: 'grid2' }, h('div', {}, h('label', { for: `pin-${t.ticketId}` }, 'Your PIN'), pin, h('div', { class: 'hint' }, `${t.attemptsRemaining} attempt(s) left for this request`)), h('div', {}, h('label', { for: `comment-${t.ticketId}` }, 'Note for the agent (optional)'), comment)),
-      message,
-      h('div', { class: 'row', style: 'margin-top:0.6rem' }, approve, decline),
-    );
+    body.push(...decisionForm(t, 'Approve and run'));
   } else {
-    if (t.decidedVia) body.push(h('p', { class: 'hint' }, `Decided in the ${t.decidedVia === 'browser' ? 'browser' : 'app'}${t.comment ? `: "${t.comment}"` : ''}`));
-    if (t.error) body.push(errorNotice(t.error));
+    body.push(...decidedNotes(t));
     if (t.result !== undefined) body.push(h('details', {}, h('summary', {}, 'Result'), renderValue(t.result), rawJson(t.result)));
+    if (t.status === 'queued') {
+      const message = h('div');
+      body.push(message, h('div', { class: 'row' }, cancelButton(t, 'Cancel before it starts', message)));
+    }
   }
   return h('section', { class: 'card ticket' }, ...body);
 }

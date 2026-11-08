@@ -212,8 +212,21 @@ async fn list_tickets(engine: EngineState<'_>) -> Cmd<Vec<TicketView>> {
 }
 
 #[tauri::command]
-async fn decide_ticket(engine: EngineState<'_>, ticket_id: String, approve: bool, pin: String, comment: Option<String>) -> Cmd<TicketView> {
-    engine.decide_ticket(&ticket_id, approve, pin, comment, "app").await
+async fn decide_ticket(
+    engine: EngineState<'_>,
+    ticket_id: String,
+    approve: bool,
+    pin: String,
+    comment: Option<String>,
+    plan_hash: Option<String>,
+) -> Cmd<TicketView> {
+    engine.decide(&ticket_id, approve, pin, comment, "app", plan_hash.as_deref()).await
+}
+
+/// Withdraws a request or stops a plan before its next step; needs no PIN.
+#[tauri::command]
+async fn cancel_ticket(engine: EngineState<'_>, ticket_id: String) -> Cmd<TicketView> {
+    engine.cancel_ticket(&ticket_id)
 }
 
 #[tauri::command]
@@ -326,6 +339,7 @@ fn main() {
             run_tool,
             list_tickets,
             decide_ticket,
+            cancel_ticket,
             start_mcp,
             stop_mcp,
             reveal_mcp_token,

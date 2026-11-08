@@ -1355,7 +1355,9 @@ impl Engine {
             NewTicket {
                 plugin_id: "aegis".into(),
                 tool_id: "plan".into(),
-                tool_name: request.title.unwrap_or_else(|| "Action plan".into()),
+                // Written by code: the name also shows in the top bar, the tray, and
+                // notifications, where the supplied title would appear without its label.
+                tool_name: format!("Action plan ({} step{})", shown.len(), if shown.len() == 1 { "" } else { "s" }),
                 tool_description: summary,
                 requires_admin: admin_steps > 0,
                 args: Value::Null,

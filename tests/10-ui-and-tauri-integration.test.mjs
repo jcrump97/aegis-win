@@ -115,6 +115,28 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.match(main, /pollTimer = window\.setInterval\(async \(\) => \{\s*try \{\s*\/\/[^\n]*\n\s*const now = await api\.status\(\);\s*status = now;\s*if \(!now\.unlocked\) return route\(\);/);
 });
 
+test('Action plans: the app shows the plan as AegisWin describes it and approves it by hash', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // A plan approval sends the hash of the plan that was shown; the command passes it to the engine.
+  assert.match(main, /api\.decideTicket\(t\.ticketId, yes, pin\.value, comment\.value\.trim\(\) \|\| null, t\.plan\?\.hash \?\? null\)/);
+  assert.match(mainRs, /async fn decide_ticket\([\s\S]*?plan_hash: Option<String>,[\s\S]*?engine\.decide\(&ticket_id, approve, pin, comment, "app", plan_hash\.as_deref\(\)\)/);
+  // Cancel needs no PIN and goes straight to the engine.
+  assert.match(apiTs, /cancelTicket: \(ticketId: string\) => call<TicketView>\('cancel_ticket', \{ ticketId \}\)/);
+  assert.match(mainRs, /async fn cancel_ticket\(engine: EngineState<'_>, ticket_id: String\) -> Cmd<TicketView> \{\s*engine\.cancel_ticket\(&ticket_id\)\s*\}/);
+  // Every piece of supplied text is shown under the label of who wrote it.
+  const plan = main.slice(main.indexOf('function planCard('), main.indexOf('function ticketCard('));
+  assert.ok(plan.length > 0, 'planCard exists');
+  assert.equal(plan.match(/suppliedText\(plan\.suppliedLabel,/g)?.length, 2, 'step reasoning and the plan title and reasoning');
+  // Outside the lines that build a labelled block, supplied text is never read.
+  const unlabelled = plan.split('\n').filter((line) => !line.includes('suppliedText(plan.suppliedLabel,') && !line.includes('const { title, reasoning } = plan;'));
+  assert.deepEqual(unlabelled.filter((line) => /reasoning|title\b/.test(line)), [], 'no supplied text outside its label');
+  // The heading, toast, top bar, and tray use the code-written name, never the supplied title.
+  assert.match(plan, /h\('h3', \{\}, t\.toolName\)/);
+  assert.match(plan, /h\('pre', \{\}, s\.commands\.length/);
+  assert.match(plan, /'Stop after this step'/);
+  assert.match(main, /if \(t\.plan\) return planCard\(t, t\.plan\);/);
+});
+
 test('Serial executor: the app shows the change in progress, and the shell never cuts one off', () => {
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   assert.match(main, /const \{ running, queued \} = status\.change;/);

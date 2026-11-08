@@ -83,7 +83,43 @@ export type TicketStatus =
   | 'declined'
   | 'execution_failed'
   | 'locked_out'
-  | 'expired';
+  | 'expired'
+  | 'cancelled';
+
+export type StepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'cancelled';
+
+/** One step of an action plan, described by AegisWin's code. */
+export interface PlanStep {
+  index: number;
+  tool: string;
+  pluginId: string;
+  toolId: string;
+  toolName: string;
+  toolDescription: string;
+  requiresAdmin: boolean;
+  args: unknown;
+  /** Supplied by whoever wrote the plan; shown under `PlanMeta.suppliedLabel`. */
+  reasoning?: string;
+  /** What the step's dry run said it would run. */
+  commands: string[];
+  status: StepStatus;
+  result?: unknown;
+  error?: AegisError;
+}
+
+export interface PlanMeta {
+  title?: string;
+  reasoning?: string;
+  origin: 'agent' | 'owner';
+  suppliedLabel: string;
+  /** Approving must send this back. */
+  hash: string;
+  shortHash: string;
+  summary: string;
+  flags: string[];
+  expiresAt: string;
+  stopReason?: string;
+}
 
 export interface CallReview {
   lines: string[];
@@ -109,6 +145,9 @@ export interface TicketView {
   decidedVia: string | null;
   result?: unknown;
   error?: AegisError;
+  /** Present for action plans only. */
+  plan?: PlanMeta;
+  steps?: PlanStep[];
 }
 
 export type RunOutcome = { status: 'completed'; result: unknown } | { status: 'pending_approval'; ticket: TicketView };
@@ -191,8 +230,9 @@ export const api = {
   runTool: (pluginId: string, toolId: string, args: unknown, pin: string | null) =>
     call<RunOutcome>('run_tool', { pluginId, toolId, args, pin }),
   listTickets: () => call<TicketView[]>('list_tickets'),
-  decideTicket: (ticketId: string, approve: boolean, pin: string, comment: string | null) =>
-    call<TicketView>('decide_ticket', { ticketId, approve, pin, comment }),
+  decideTicket: (ticketId: string, approve: boolean, pin: string, comment: string | null, planHash: string | null) =>
+    call<TicketView>('decide_ticket', { ticketId, approve, pin, comment, planHash }),
+  cancelTicket: (ticketId: string) => call<TicketView>('cancel_ticket', { ticketId }),
   startMcp: () => call<McpStatus>('start_mcp'),
   stopMcp: () => call<McpStatus>('stop_mcp'),
   revealMcpToken: (pin: string) => call<string>('reveal_mcp_token', { pin }),

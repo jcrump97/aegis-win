@@ -58,7 +58,8 @@ async fn a_proposed_plan_is_dry_run_and_runs_nothing_until_approved() {
     let f = ready().await;
     let t = propose(&f, vec![fix("one"), fix("two")]).await;
     assert_eq!(t.status, TicketStatus::PendingApproval);
-    assert_eq!((t.plugin_id.as_str(), t.tool_name.as_str()), ("aegis", "Repair"));
+    assert_eq!((t.plugin_id.as_str(), t.tool_name.as_str()), ("aegis", "Action plan (2 steps)"), "the supplied title never names the ticket");
+    assert_eq!(t.plan.as_ref().unwrap().title.as_deref(), Some("Repair"));
     let plan = t.plan.as_ref().unwrap();
     assert_eq!(plan.hash.len(), 64);
     assert_eq!(plan.supplied_label, "Supplied by the requesting agent");
