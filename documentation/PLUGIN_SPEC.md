@@ -52,7 +52,7 @@ Every tool MUST declare `requiresAdmin: boolean`, `defaultGatePolicy: "auto" | "
 `aegis-core::schema` enforces exactly these keywords: `type` (`object`, `string`, `integer`, `number`, `boolean`, `array`), `properties`, `required`, `additionalProperties: false`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `items`, `maxItems`, `default`, `description`. A manifest using any other keyword fails validation at startup, so a schema never looks stricter than what is enforced. Defaults are filled in before the tool runs. Anything the subset cannot express (such as a character allow-list) is validated in the tool itself.
 
 ### 2.3 `dryRun`
-A tool that declares a boolean `dryRun` property MUST make `dryRun: true` side-effect free: it describes the commands it would run and their impact, and runs nothing. Dry runs skip the PIN and admin gates.
+A tool that declares a boolean `dryRun` property MUST make `dryRun: true` side-effect free: it describes the commands it would run and their impact, and runs nothing. Dry runs skip the PIN and admin gates. A `planEligible` tool's dry run SHOULD return the commands as a `commands` array of strings, which the plan review shows. When a real run does not succeed but returns normally, it MUST say so with `"success": false`: a plan treats that as a failed step and stops.
 
 ## 3. Tool Gate Policy Values
 - `"auto"`: Executes immediately when invoked from the UI or MCP server (ideal for read-only log queries or telemetry snapshots).

@@ -167,6 +167,19 @@ impl Executor {
         self.changed.notify_waiters();
     }
 
+    /// Gives up the place of an approval ticket, if it is waiting.
+    pub fn withdraw_ticket(&self, ticket: &str) {
+        let place = self.lock().queue.iter().find(|w| w.ticket.as_deref() == Some(ticket)).map(|w| Place(w.id));
+        if let Some(place) = place {
+            self.withdraw(place);
+        }
+    }
+
+    /// True while idle auto-lock is waiting: a plan does not start its next step.
+    pub fn held(&self) -> bool {
+        self.lock().hold
+    }
+
     /// While set, nothing new starts (idle auto-lock is waiting for the running item).
     pub fn hold(&self, on: bool) {
         let mut inner = self.lock();

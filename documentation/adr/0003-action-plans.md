@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor` and Phase 2 (`planEligible`) on `feat/plan-eligible`; see "As built" in §10. Phases 3-5 are not.
+- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phase 3 on `feat/plans-mcp` (the engine so far); see "As built" in §10. Phases 4-5 are not.
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 
@@ -202,6 +202,18 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 - **The top bar** shows "Change in progress: <tool> · N waiting"; the tray tooltip names the running tool.
 
 **As built, Phase 2**: `planEligible` also refuses `appOnly` tools, since a plan step must be reachable from both MCP and the app. Nothing reads the flag yet; Phase 3 does.
+
+**As built, Phase 3, engine** (decided 2026-11-07, during implementation):
+
+- **Single-tool tickets keep their own fields** rather than literally becoming one-step plans. A plan ticket adds a `plan` object (title, reasoning, origin and its label, hash, short hash, summary, consistency flags, expiry, stop reason) and a top-level `steps` array; a single-tool ticket has neither. Both go through the same decision, queue, and re-check code, so the effect is the one §9 asks for without changing what agents already parse.
+- **A step that runs but reports `"success": false` has failed**, like one that returns an error. The `windows-health` repairs report a failed command that way, so without this a plan would carry on after a failed repair. Its output is kept as the step's result.
+- **The plan's error names the step** ("Step 2 failed: …"); the step keeps the plain error.
+- **A plan holds the one slot for all its steps**, so nothing else starts between them. Before each step it stops if it was cancelled or if idle auto-lock is waiting (`cancelled`, with the reason).
+- **Lock forgets the plan** with every other ticket, as Lock does today, so an agent polling afterwards gets "ticket not found" rather than `cancelled`. The step that was running finishes; nothing after it runs. A lasting record waits for the approvals stream in Phase 5.
+- **The approval must name the plan hash.** A missing or wrong hash is refused with `CONFLICT` before the PIN is checked, so a stale page costs no attempt. The single-ticket call (`decide_ticket`) passes no hash, so it cannot approve a plan.
+- **A step's tool that is `appOnly` is reported to an agent as unknown**, as a direct call would be. (Phase 2 already makes such tools ineligible.)
+- **Cancel** of a running single-tool request is refused with `CONFLICT`: it is one step, already running, and stopping a repair halfway is unsafe.
+- **Found while building this: two approvals of the same request could both run it.** The decision re-read the ticket only before the PIN check, so two correct-PIN approvals arriving together (the app and the browser page at once) could both start it. The decision now re-checks that the ticket is still pending at the moment it changes it, so exactly one wins. The race predates this ADR.
 
 ## 11. Open questions
 

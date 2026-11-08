@@ -8,9 +8,12 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::AegisError;
+use crate::plan::PlanOrigin;
 use crate::registry::CallReview;
 
 pub const TICKET_TTL: Duration = Duration::from_secs(30 * 60);
+/// Plans wait for a decision for less time than single requests (ADR 0003 §3).
+pub const PLAN_TTL: Duration = Duration::from_secs(10 * 60);
 pub const STRIKES_PER_TICKET: u8 = 3;
 const MAX_TICKETS: usize = 200;
 
@@ -26,12 +29,76 @@ pub enum TicketStatus {
     ExecutionFailed,
     LockedOut,
     Expired,
+    /// Withdrawn before it ran, or a plan stopped before its next step.
+    Cancelled,
 }
 
 impl TicketStatus {
     pub fn is_final(self) -> bool {
         !matches!(self, Self::PendingApproval | Self::Queued | Self::Running)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    /// Not run because an earlier step failed.
+    Skipped,
+    /// Not run because the plan was cancelled or AegisWin was locking.
+    Cancelled,
+}
+
+/// One step of a plan, as approved: its arguments never change.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStep {
+    /// 1-based.
+    pub index: usize,
+    /// The MCP tool name, `<plugin>__<tool>`.
+    pub tool: String,
+    pub plugin_id: String,
+    pub tool_id: String,
+    pub tool_name: String,
+    pub tool_description: String,
+    pub requires_admin: bool,
+    /// Validated, with defaults filled in.
+    pub args: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// The commands the step's dry run said it would run.
+    pub commands: Vec<String>,
+    pub status: StepStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<AegisError>,
+}
+
+/// What a plan ticket adds; the per-step details are in `steps`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    pub origin: PlanOrigin,
+    /// "Supplied by the requesting agent" or "Written by you".
+    pub supplied_label: &'static str,
+    /// SHA-256 of the canonical plan; an approval must name it.
+    pub hash: String,
+    pub short_hash: String,
+    /// Written by AegisWin from the steps.
+    pub summary: String,
+    /// Tools the supplied text names that are not steps.
+    pub flags: Vec<String>,
+    pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +120,11 @@ pub struct Ticket {
     pub decided_via: Option<&'static str>,
     pub result: Option<Value>,
     pub error: Option<AegisError>,
+    pub ttl: Duration,
+    pub plan: Option<PlanMeta>,
+    pub steps: Vec<PlanStep>,
+    /// A running plan stops before its next step.
+    pub cancel_requested: bool,
 }
 
 /// What agents and the UI may see about a ticket (never the CSRF token).
@@ -81,6 +153,11 @@ pub struct TicketView {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<AegisError>,
+    /// Present for action plans only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanMeta>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<PlanStep>,
 }
 
 impl Ticket {
@@ -102,6 +179,8 @@ impl Ticket {
             decided_via: self.decided_via,
             result: self.result.clone(),
             error: self.error.clone(),
+            plan: self.plan.clone(),
+            steps: self.steps.clone(),
         }
     }
 }
@@ -125,6 +204,8 @@ pub struct NewTicket {
     pub requires_admin: bool,
     pub args: Value,
     pub review: Option<CallReview>,
+    pub plan: Option<PlanMeta>,
+    pub steps: Vec<PlanStep>,
 }
 
 impl TicketStore {
@@ -135,6 +216,12 @@ impl TicketStore {
             if let Some(oldest) = self.tickets.values().filter(|t| t.status.is_final()).min_by_key(|t| t.created).map(|t| t.id.clone()) {
                 self.tickets.remove(&oldest);
             }
+        }
+        let ttl = if t.plan.is_some() { PLAN_TTL } else { TICKET_TTL };
+        let mut plan = t.plan;
+        if let Some(p) = &mut plan {
+            let expires = Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default();
+            p.expires_at = expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         }
         let ticket = Ticket {
             id: random_hex(16),
@@ -154,6 +241,10 @@ impl TicketStore {
             decided_via: None,
             result: None,
             error: None,
+            ttl,
+            plan,
+            steps: t.steps,
+            cancel_requested: false,
         };
         let view = ticket.view();
         self.tickets.insert(ticket.id.clone(), ticket);
@@ -163,7 +254,7 @@ impl TicketStore {
     /// Marks pending tickets older than the TTL as expired.
     pub fn expire(&mut self, now: Instant) {
         for t in self.tickets.values_mut() {
-            if t.status == TicketStatus::PendingApproval && now.duration_since(t.created) >= TICKET_TTL {
+            if t.status == TicketStatus::PendingApproval && now.duration_since(t.created) >= t.ttl {
                 t.status = TicketStatus::Expired;
             }
         }
@@ -187,6 +278,11 @@ impl TicketStore {
         all.into_iter().map(Ticket::view).collect()
     }
 
+    pub fn pending_plans(&mut self, now: Instant) -> usize {
+        self.expire(now);
+        self.tickets.values().filter(|t| t.plan.is_some() && t.status == TicketStatus::PendingApproval).count()
+    }
+
     pub fn clear(&mut self) {
         self.tickets.clear();
     }
@@ -206,6 +302,8 @@ mod tests {
             requires_admin: false,
             args: json!({}),
             review: None,
+            plan: None,
+            steps: Vec::new(),
         }
     }
 

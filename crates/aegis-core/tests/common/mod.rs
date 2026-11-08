@@ -22,11 +22,14 @@ pub struct DemoPlugin {
     pub unlock_store: Mutex<Option<PluginStore>>,
     pub call_store: Mutex<Option<PluginStore>>,
     /// `fix` with a note starting "wait" records the note, then blocks until
-    /// a permit is added to `release`.
+    /// a permit is added to `release`. A note starting "fail" makes `fix`
+    /// fail, "unwell" makes it report `"success": false`, and "nodry" makes
+    /// its dry run fail. Every real `fix` run is recorded in `fixed`.
     pub started: Mutex<Vec<String>>,
     pub release: tokio::sync::Semaphore,
     pub running: AtomicUsize,
     pub max_running: AtomicUsize,
+    pub fixed: Mutex<Vec<String>>,
 }
 
 impl Default for DemoPlugin {
@@ -52,7 +55,7 @@ impl DemoPlugin {
                       "defaultGatePolicy": "auto", "readOnly": true,
                       "inputSchema": { "type": "object", "properties": { "text": { "type": "string", "maxLength": 200 } }, "additionalProperties": false } },
                     { "id": "fix", "name": "Fix <it>", "description": "Changes something.", "requiresAdmin": false,
-                      "defaultGatePolicy": "pin_required", "readOnly": false,
+                      "defaultGatePolicy": "pin_required", "readOnly": false, "planEligible": true,
                       "inputSchema": { "type": "object", "properties": { "dryRun": { "type": "boolean", "default": false }, "note": { "type": "string" } } } },
                     { "id": "admin_fix", "name": "Admin fix", "description": "Needs admin.", "requiresAdmin": true,
                       "defaultGatePolicy": "pin_required", "readOnly": false, "inputSchema": { "type": "object", "properties": {} } },
@@ -74,6 +77,7 @@ impl DemoPlugin {
             release: tokio::sync::Semaphore::new(0),
             running: AtomicUsize::new(0),
             max_running: AtomicUsize::new(0),
+            fixed: Mutex::new(Vec::new()),
         }
     }
 }
@@ -88,15 +92,30 @@ impl Plugin for DemoPlugin {
         *self.call_store.lock().unwrap() = ctx.store;
         let note = args["note"].as_str().unwrap_or_default().to_owned();
         if tool == "fix" && args["dryRun"] != true && note.starts_with("wait") {
-            self.started.lock().unwrap().push(note);
+            self.started.lock().unwrap().push(note.clone());
             let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_running.fetch_max(now, Ordering::SeqCst);
             self.release.acquire().await.unwrap().forget();
             self.running.fetch_sub(1, Ordering::SeqCst);
         }
+        if tool == "fix" {
+            let dry = args["dryRun"] == true;
+            if dry && note.starts_with("nodry") {
+                return Err(aegis_core::AegisError::new(aegis_core::ErrorCode::ExecutionFailed, "dry run broke"));
+            }
+            if !dry {
+                self.fixed.lock().unwrap().push(note.clone());
+                if note.starts_with("fail") {
+                    return Err(aegis_core::AegisError::new(aegis_core::ErrorCode::ExecutionFailed, "fix broke"));
+                }
+                if note.starts_with("unwell") {
+                    return Ok(json!({ "executed": true, "success": false }));
+                }
+            }
+        }
         Ok(match tool {
             "echo" => json!({ "echo": args }),
-            "fix" if args["dryRun"] == true => json!({ "dryRun": true, "wouldRun": ["fix.exe"] }),
+            "fix" if args["dryRun"] == true => json!({ "dryRun": true, "commands": [format!("fix.exe {note}")] }),
             _ => json!({ "done": tool }),
         })
     }

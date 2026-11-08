@@ -7,6 +7,7 @@ pub mod executor;
 pub mod llm;
 pub mod mcp;
 pub mod os;
+pub mod plan;
 pub mod plugin_data;
 pub mod registry;
 pub mod schema;

@@ -160,12 +160,7 @@ pub enum Condition {
     Foreground { process: String },
 }
 
-/// Control characters, and invisible format characters (bidi overrides,
-/// zero-width marks) that could make the review text read differently from
-/// what the rule does.
-fn is_hidden(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
-}
+use aegis_core::schema::is_hidden_char as is_hidden;
 
 /// Free text such as an AI's reasoning, cleaned for display: hidden
 /// characters removed, trimmed, and capped.

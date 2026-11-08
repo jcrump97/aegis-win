@@ -623,6 +623,8 @@ mod tests {
             decided_via: Some("app"),
             result: None,
             error: None,
+            plan: None,
+            steps: Vec::new(),
         };
         let html = render_ticket(&ticket, Some("csrf-token"), None);
         assert!(html.contains("Another change is running first"), "{html}");

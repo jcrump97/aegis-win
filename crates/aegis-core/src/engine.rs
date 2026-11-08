@@ -17,12 +17,13 @@ use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
 use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
+use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
 use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
 use crate::registry::{self, Gate, GatePolicy, Plugin, Registry, ToolContext, ToolManifest, UnlockContext};
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
-use crate::tickets::{NewTicket, TicketStatus, TicketStore, TicketView, STRIKES_PER_TICKET};
+use crate::tickets::{NewTicket, PlanMeta, PlanStep, StepStatus, TicketStatus, TicketStore, TicketView, STRIKES_PER_TICKET};
 use crate::vault::{self, KdfParams, NewKey, PinGuard, UnlockedVault, VaultError};
 
 pub const VAULT_FILE: &str = "vault.enc.json";
@@ -878,6 +879,8 @@ impl Engine {
                             requires_admin: prepared.tool.requires_admin,
                             args: prepared.args,
                             review,
+                            plan: None,
+                            steps: Vec::new(),
                         },
                         Instant::now(),
                     );
@@ -953,9 +956,33 @@ impl Engine {
         comment: Option<String>,
         via: &'static str,
     ) -> AegisResult<TicketView> {
+        self.decide(id, approve, pin, comment, via, None).await
+    }
+
+    /// Like [`Self::decide_ticket`]; approving a plan must also name its hash,
+    /// so the decision is bound to the plan that was shown.
+    pub async fn decide(
+        &self,
+        id: &str,
+        approve: bool,
+        pin: String,
+        comment: Option<String>,
+        via: &'static str,
+        plan_hash: Option<&str>,
+    ) -> AegisResult<TicketView> {
         let pin = Zeroizing::new(pin);
         let epoch = self.executor.epoch();
         self.pending_ticket(id)?;
+        // Checked before the PIN, so a stale page does not cost an attempt.
+        if approve {
+            let expected = lock(&self.tickets).get(id, Instant::now()).and_then(|t| t.plan.as_ref().map(|p| p.hash.clone()));
+            if let Some(expected) = expected {
+                let matches = plan_hash.is_some_and(|h| bool::from(h.as_bytes().ct_eq(expected.as_bytes())));
+                if !matches {
+                    return Err(AegisError::new(ErrorCode::Conflict, "This approval does not match the plan's fingerprint. Reload the request and check its steps again."));
+                }
+            }
+        }
         // A full queue is refused before the PIN is checked; the request stays pending.
         if approve && self.ticket_changes_system(id) && !self.executor.has_room() {
             return Err(queue_error(executor::Full::Full));
@@ -991,18 +1018,29 @@ impl Engine {
             ticket.status = TicketStatus::Declined;
             return Ok(ticket.view());
         }
-        let (plugin_id, tool_id, args) = (ticket.plugin_id.clone(), ticket.tool_id.clone(), ticket.args.clone());
+        let calls: Vec<(String, String, Value)> = if ticket.plan.is_some() {
+            ticket.steps.iter().map(|s| (s.plugin_id.clone(), s.tool_id.clone(), s.args.clone())).collect()
+        } else {
+            vec![(ticket.plugin_id.clone(), ticket.tool_id.clone(), ticket.args.clone())]
+        };
+        let is_plan = ticket.plan.is_some();
+        let label = ticket.tool_name.clone();
         drop(store);
         let engine = self.self_arc()?;
 
         // Re-check everything: the plugin may have been turned off since the ticket was opened.
-        let prepared = self.prepare(&plugin_id, &tool_id, args).and_then(|p| match p.gate {
-            Gate::NeedsAdmin => Err(AegisError::requires_admin(&p.tool.name)),
-            _ => Ok(p),
-        });
+        let prepared: AegisResult<Vec<Prepared>> = calls
+            .into_iter()
+            .map(|(plugin_id, tool_id, args)| {
+                self.prepare(&plugin_id, &tool_id, args).and_then(|p| match p.gate {
+                    Gate::NeedsAdmin => Err(AegisError::requires_admin(&p.tool.name)),
+                    _ => Ok(p),
+                })
+            })
+            .collect();
         // Taken before the ticket changes, so a full queue leaves it pending.
         let place = match &prepared {
-            Ok(p) if changes_system(&p.tool, &p.args) => Some(self.executor.enqueue(epoch, &p.tool.name, Some(id)).map_err(queue_error)?),
+            Ok(p) if is_plan || changes_system(&p[0].tool, &p[0].args) => Some(self.executor.enqueue(epoch, &label, Some(id)).map_err(queue_error)?),
             _ => None,
         };
         let mut store = lock(&self.tickets);
@@ -1014,10 +1052,25 @@ impl Engine {
             }
             return Err(ticket_not_found());
         };
+        // Decided or cancelled meanwhile by another call: only one decision counts.
+        if ticket.status != TicketStatus::PendingApproval {
+            let status = ticket.status;
+            drop(store);
+            if let Some(place) = place {
+                self.executor.withdraw(place);
+            }
+            return Err(ticket_conflict(status));
+        }
         ticket.comment = comment;
         ticket.decided_via = Some(via);
         match prepared {
             Err(e) => {
+                if let Some(plan) = &mut ticket.plan {
+                    plan.stop_reason = Some(format!("Nothing ran: {}", e.message));
+                    for step in &mut ticket.steps {
+                        step.status = StepStatus::Cancelled;
+                    }
+                }
                 ticket.status = TicketStatus::ExecutionFailed;
                 ticket.error = Some(e);
                 Ok(ticket.view())
@@ -1036,9 +1089,19 @@ impl Engine {
     }
 
     /// Runs an approved ticket, in its turn when it changes the system.
-    async fn run_ticket(&self, id: &str, place: Option<Place>, prepared: Prepared) {
+    async fn run_ticket(&self, id: &str, place: Option<Place>, mut steps: Vec<Prepared>) {
         let finish = |result: AegisResult<Value>, failed: TicketStatus| {
             if let Some(ticket) = lock(&self.tickets).get_mut(id, Instant::now()) {
+                // Cancelled while it waited: leave it so.
+                if ticket.status.is_final() {
+                    return;
+                }
+                if let (Some(plan), Err(e)) = (&mut ticket.plan, &result) {
+                    plan.stop_reason = Some(e.message.clone());
+                    for step in &mut ticket.steps {
+                        step.status = StepStatus::Cancelled;
+                    }
+                }
                 match result {
                     Ok(value) => {
                         ticket.status = TicketStatus::Approved;
@@ -1062,6 +1125,16 @@ impl Engine {
                 }
             },
         };
+        let is_plan = match lock(&self.tickets).get_mut(id, Instant::now()) {
+            // Locked, or cancelled just as its turn came.
+            None => return,
+            Some(ticket) if ticket.status.is_final() => return,
+            Some(ticket) => ticket.plan.is_some(),
+        };
+        if is_plan {
+            return self.run_plan(id, steps).await;
+        }
+        let Some(prepared) = steps.pop() else { return };
         let prepared = if place.is_some() {
             match self.recheck(&prepared) {
                 Ok(p) => p,
@@ -1076,10 +1149,233 @@ impl Engine {
         finish(prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await, failed);
     }
 
+    /// Runs a plan's steps in order while holding the one slot. Before each
+    /// step it stops if the plan was cancelled, AegisWin locked, or idle
+    /// auto-lock is waiting, and it checks the step again. The first failure
+    /// ends the plan; later steps are skipped and earlier changes stay.
+    async fn run_plan(&self, id: &str, steps: Vec<Prepared>) {
+        // Applies `f` to the ticket; false when it is gone (AegisWin locked).
+        let update = |f: &mut dyn FnMut(&mut crate::tickets::Ticket)| -> bool {
+            match lock(&self.tickets).get_mut(id, Instant::now()) {
+                Some(ticket) => {
+                    f(ticket);
+                    true
+                }
+                None => false,
+            }
+        };
+        let end = |status: TicketStatus, reason: String, from: usize, rest: StepStatus| {
+            update(&mut |t| {
+                t.status = status;
+                for step in t.steps.iter_mut().skip(from) {
+                    step.status = rest;
+                }
+                if let Some(plan) = &mut t.plan {
+                    plan.stop_reason = Some(reason.clone());
+                }
+            });
+        };
+        for (i, step) in steps.iter().enumerate() {
+            let n = i + 1;
+            let mut cancelled = false;
+            if !update(&mut |t| cancelled = t.cancel_requested || t.status.is_final()) {
+                return;
+            }
+            if cancelled {
+                return end(TicketStatus::Cancelled, format!("Cancelled before step {n}."), i, StepStatus::Cancelled);
+            }
+            if self.executor.held() {
+                return end(TicketStatus::Cancelled, format!("AegisWin is locking after inactivity, so step {n} did not start."), i, StepStatus::Cancelled);
+            }
+            let fresh = match self.recheck(step) {
+                Ok(p) => p,
+                Err(e) => {
+                    let reason = format!("Step {n} could not start: {}", e.message);
+                    update(&mut |t| {
+                        t.steps[i].status = StepStatus::Failed;
+                        t.steps[i].error = Some(e.clone());
+                        t.error = Some(AegisError { message: reason.clone(), ..e.clone() });
+                    });
+                    return end(TicketStatus::ExecutionFailed, reason, n, StepStatus::Skipped);
+                }
+            };
+            update(&mut |t| {
+                t.status = TicketStatus::Running;
+                t.steps[i].status = StepStatus::Running;
+            });
+            let (output, outcome) = match fresh.plugin.call(&fresh.tool.id, fresh.args, fresh.ctx).await {
+                // A tool that ran but reports `"success": false` failed too; its output is kept.
+                Ok(value) if value.get("success") == Some(&Value::Bool(false)) => {
+                    (Some(value), Err(AegisError::new(ErrorCode::ExecutionFailed, format!("{} reported that it did not succeed.", fresh.tool.name))))
+                }
+                Ok(value) => (Some(value), Ok(())),
+                Err(e) => (None, Err(e)),
+            };
+            let failed = outcome.as_ref().err().cloned();
+            update(&mut |t| {
+                t.steps[i].result = output.clone();
+                t.steps[i].status = if failed.is_some() { StepStatus::Failed } else { StepStatus::Succeeded };
+                if let Some(e) = &failed {
+                    t.steps[i].error = Some(e.clone());
+                    t.error = Some(AegisError { message: format!("Step {n} failed: {}", e.message), ..e.clone() });
+                }
+            });
+            if let Some(e) = failed {
+                return end(TicketStatus::ExecutionFailed, format!("Step {n} failed: {}", e.message), n, StepStatus::Skipped);
+            }
+        }
+        update(&mut |t| t.status = TicketStatus::Approved);
+    }
+
+    /// Withdraws a pending or waiting request, or stops a running plan before
+    /// its next step. Needs no PIN: it can only make less happen. A running
+    /// single action is not stopped, since killing a repair mid-run is unsafe.
+    pub fn cancel_ticket(&self, id: &str) -> AegisResult<TicketView> {
+        let mut store = lock(&self.tickets);
+        let ticket = store.get_mut(id, Instant::now()).ok_or_else(ticket_not_found)?;
+        match ticket.status {
+            TicketStatus::PendingApproval | TicketStatus::Queued => {
+                let queued = ticket.status == TicketStatus::Queued;
+                ticket.status = TicketStatus::Cancelled;
+                for step in &mut ticket.steps {
+                    step.status = StepStatus::Cancelled;
+                }
+                if let Some(plan) = &mut ticket.plan {
+                    plan.stop_reason = Some(if queued { "Cancelled while it waited its turn." } else { "Withdrawn before a decision." }.into());
+                }
+                let view = ticket.view();
+                drop(store);
+                if queued {
+                    self.executor.withdraw_ticket(id);
+                }
+                Ok(view)
+            }
+            TicketStatus::Running if ticket.plan.is_some() => {
+                ticket.cancel_requested = true;
+                Ok(ticket.view())
+            }
+            TicketStatus::Running => Err(AegisError::new(ErrorCode::Conflict, "This action is already running, and stopping a repair halfway is unsafe. It will finish on its own.")),
+            status => Err(ticket_conflict(status)),
+        }
+    }
+
+    // ---- action plans ----------------------------------------------------
+
+    /// Opens a plan ticket: every step is an opted-in tool, checked, filled
+    /// in, and dry-run now, so the review shows the exact commands. Nothing
+    /// runs until the owner approves with the PIN.
+    pub async fn propose_plan(&self, origin: PlanOrigin, request: Value) -> AegisResult<TicketView> {
+        let request = PlanRequest::parse(request).map_err(AegisError::invalid)?;
+        let at = |n: usize, e: AegisError| AegisError { message: format!("Step {n}: {}", e.message), ..e };
+        let unknown = |n: usize, name: &str| AegisError::new(ErrorCode::UnknownTool, format!("Step {n}: unknown tool {name}"));
+        let mut steps = Vec::with_capacity(request.steps.len());
+        for (i, step) in request.steps.iter().enumerate() {
+            let n = i + 1;
+            let (plugin_id, tool_id) = registry::parse_mcp_tool_name(&step.tool).ok_or_else(|| unknown(n, &step.tool))?;
+            let (_, tool) = self.registry.tool(plugin_id, tool_id).ok_or_else(|| unknown(n, &step.tool))?;
+            if tool.app_only && origin == PlanOrigin::Agent {
+                return Err(unknown(n, &step.tool));
+            }
+            if !tool.plan_eligible {
+                return Err(AegisError::invalid(format!("Step {n}: {} cannot be a plan step. Plans can only use repairs that allow it.", tool.name)));
+            }
+            let prepared = self.prepare(plugin_id, tool_id, step.args.clone()).map_err(|e| at(n, e))?;
+            if prepared.gate == Gate::NeedsAdmin {
+                return Err(AegisError::new(
+                    ErrorCode::RequiresAdmin,
+                    format!("Step {n}: {} needs administrator rights. Restart AegisWin as administrator first: restarting later locks AegisWin and would throw the plan away.", tool.name),
+                ));
+            }
+            steps.push((step, prepared));
+        }
+        for (i, (_, a)) in steps.iter().enumerate() {
+            for (j, (_, b)) in steps.iter().enumerate().skip(i + 1) {
+                if a.tool.id == b.tool.id && a.plugin.manifest().id == b.plugin.manifest().id && a.args == b.args {
+                    return Err(AegisError::invalid(format!("Steps {} and {} are the same; a plan runs each change once.", i + 1, j + 1)));
+                }
+            }
+        }
+        if lock(&self.tickets).pending_plans(Instant::now()) >= MAX_PENDING_PLANS {
+            return Err(too_many_plans());
+        }
+
+        // Dry runs: the exact commands each step would run. One that fails rejects the plan.
+        let mut shown = Vec::with_capacity(steps.len());
+        for (i, (step, p)) in steps.iter().enumerate() {
+            let mut args = p.args.clone();
+            args["dryRun"] = Value::Bool(true);
+            let preview = p.plugin.call(&p.tool.id, args, p.ctx.clone()).await.map_err(|e| at(i + 1, AegisError { message: format!("its dry run failed: {}", e.message), ..e }))?;
+            let commands: Vec<String> = preview.get("commands").and_then(Value::as_array).map(|c| c.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            shown.push(PlanStep {
+                index: i + 1,
+                tool: step.tool.clone(),
+                plugin_id: p.plugin.manifest().id.clone(),
+                tool_id: p.tool.id.clone(),
+                tool_name: p.tool.name.clone(),
+                tool_description: p.tool.description.clone(),
+                requires_admin: p.tool.requires_admin,
+                args: p.args.clone(),
+                reasoning: step.reasoning.clone(),
+                commands,
+                status: StepStatus::Pending,
+                result: None,
+                error: None,
+            });
+        }
+
+        let hashed: Vec<(String, Value, Option<String>)> = shown.iter().map(|s| (s.tool.clone(), s.args.clone(), s.reasoning.clone())).collect();
+        let hash = plan::plan_hash(request.title.as_deref(), request.reasoning.as_deref(), &hashed);
+        let known: Vec<(String, String, String)> = self
+            .registry
+            .plugins()
+            .iter()
+            .flat_map(|p| p.manifest().tools.iter().map(|t| (registry::mcp_tool_name(&p.manifest().id, &t.id), t.id.clone(), t.name.clone())).collect::<Vec<_>>())
+            .collect();
+        let in_plan: Vec<String> = shown.iter().map(|s| s.tool.clone()).collect();
+        let texts: Vec<&str> = request.reasoning.iter().chain(request.title.iter()).chain(shown.iter().filter_map(|s| s.reasoning.as_ref())).map(String::as_str).collect();
+        let admin_steps = shown.iter().filter(|s| s.requires_admin).count();
+        let summary = plan::summary(shown.len(), admin_steps);
+        let meta = PlanMeta {
+            title: request.title.clone(),
+            reasoning: request.reasoning.clone(),
+            origin,
+            supplied_label: origin.label(),
+            short_hash: plan::short_hash(&hash).to_owned(),
+            hash,
+            summary: summary.clone(),
+            flags: plan::consistency_flags(&texts, &known, &in_plan),
+            expires_at: String::new(),
+            stop_reason: None,
+        };
+        let mut store = lock(&self.tickets);
+        if store.pending_plans(Instant::now()) >= MAX_PENDING_PLANS {
+            return Err(too_many_plans());
+        }
+        Ok(store.create(
+            NewTicket {
+                plugin_id: "aegis".into(),
+                tool_id: "plan".into(),
+                tool_name: request.title.unwrap_or_else(|| "Action plan".into()),
+                tool_description: summary,
+                requires_admin: admin_steps > 0,
+                args: Value::Null,
+                review: None,
+                plan: Some(meta),
+                steps: shown,
+            },
+            Instant::now(),
+        ))
+    }
+
     fn ticket_changes_system(&self, id: &str) -> bool {
-        let Some((plugin_id, tool_id, args)) = lock(&self.tickets).get(id, Instant::now()).map(|t| (t.plugin_id.clone(), t.tool_id.clone(), t.args.clone())) else {
+        let Some((plugin_id, tool_id, args, is_plan)) =
+            lock(&self.tickets).get(id, Instant::now()).map(|t| (t.plugin_id.clone(), t.tool_id.clone(), t.args.clone(), t.plan.is_some()))
+        else {
             return false;
         };
+        if is_plan {
+            return true;
+        }
         self.registry.tool(&plugin_id, &tool_id).is_some_and(|(_, tool)| changes_system(tool, &args))
     }
 
@@ -1183,6 +1479,10 @@ fn stop_error(stop: Stop) -> AegisError {
         Stop::Locked => AegisError::new(ErrorCode::VaultLocked, "AegisWin locked before this change could start, so it was cancelled."),
         Stop::Expired => AegisError::new(ErrorCode::ExecutionFailed, "This change waited more than 30 minutes behind others, so it was cancelled. Ask again if it is still needed."),
     }
+}
+
+fn too_many_plans() -> AegisError {
+    AegisError::new(ErrorCode::Conflict, format!("{MAX_PENDING_PLANS} plans are already waiting for a decision. Wait for those to be decided or to expire."))
 }
 
 fn ticket_not_found() -> AegisError {
