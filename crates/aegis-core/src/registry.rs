@@ -301,6 +301,13 @@ pub trait Plugin: Send + Sync {
     fn resume_notice(&self) -> Option<ResumeNotice> {
         None
     }
+
+    /// Whether the owner has saved background work (for `usage-monitor`:
+    /// any monitor, running or paused) that the Startup shortcut exists
+    /// for. `None` while not known yet; the shortcut is then kept.
+    fn saved_background_work(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 pub struct Registry {

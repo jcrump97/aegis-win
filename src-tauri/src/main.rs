@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use aegis_core::autostart::{Autostart, AutostartState};
 use aegis_core::engine::{Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
@@ -16,6 +17,7 @@ use aegis_core::registry::{ExitReason, GatePolicy, Launch, Plugin, Registry};
 use aegis_core::plan::PlanOrigin;
 use aegis_core::tickets::TicketView;
 use aegis_core::{AegisError, ErrorCode};
+use serde::Serialize;
 use serde_json::Value;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -140,6 +142,15 @@ fn start_idle_watch(app: AppHandle, engine: Arc<Engine>) {
         tauri::async_runtime::block_on(engine.lock_if_idle(Instant::now()));
         // Flushes history frames to disk every 30 seconds, even when nothing new is written.
         engine.history_tick();
+        // The last monitor was deleted (in the app or by an approved agent request):
+        // this copy's Startup shortcut has nothing left to start.
+        if engine.autostart_wanted() == Some(false) {
+            if let Ok(autostart) = Autostart::for_this_exe() {
+                if autostart.link_path().exists() {
+                    let _ = autostart.remove_if_ours();
+                }
+            }
+        }
         if let Some(tray) = app.tray_by_id("main") {
             let _ = tray.set_tooltip(Some(tray_text(&engine)));
         }
@@ -243,6 +254,48 @@ async fn revoke_llm_trust(engine: EngineState<'_>, plugin_id: String) -> Cmd<()>
 #[tauri::command]
 async fn rewrite_runtime(engine: EngineState<'_>, plugin_id: String) -> Cmd<()> {
     engine.rewrite_runtime_from_vault(&plugin_id)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutostartView {
+    #[serde(flatten)]
+    state: AutostartState,
+    /// Where the shortcut lives, for the owner.
+    shortcut: String,
+    /// Some monitor is saved (`None` while unknown).
+    wanted: Option<bool>,
+}
+
+fn autostart_view(engine: &Engine, autostart: &Autostart) -> AutostartView {
+    AutostartView { state: autostart.state(), shortcut: autostart.link_path().display().to_string(), wanted: engine.autostart_wanted() }
+}
+
+/// The Startup shortcut's state (ADR 0002 §6). App only, never MCP.
+#[tauri::command]
+async fn get_autostart(engine: EngineState<'_>) -> Cmd<AutostartView> {
+    Ok(autostart_view(&engine, &Autostart::for_this_exe()?))
+}
+
+/// Creates the Startup shortcut for this copy. Needs the PIN; replacing
+/// another copy's shortcut needs `replace`, after the owner was asked.
+#[tauri::command]
+async fn enable_autostart(engine: EngineState<'_>, pin: String, replace: bool) -> Cmd<AutostartView> {
+    engine.check_pin(&pin).await?;
+    if engine.autostart_wanted() != Some(true) {
+        return Err(AegisError::invalid("Save a monitor first: the Startup shortcut only resumes monitors you have saved."));
+    }
+    let autostart = Autostart::for_this_exe()?;
+    autostart.enable(replace)?;
+    Ok(autostart_view(&engine, &autostart))
+}
+
+/// Deletes the Startup shortcut. No PIN, like revoking trust.
+#[tauri::command]
+async fn disable_autostart(engine: EngineState<'_>) -> Cmd<AutostartView> {
+    let autostart = Autostart::for_this_exe()?;
+    autostart.remove()?;
+    Ok(autostart_view(&engine, &autostart))
 }
 
 /// Closes the banner about the gap before a resume at launch.
@@ -409,6 +462,9 @@ fn main() {
             revoke_llm_trust,
             rewrite_runtime,
             dismiss_resume_notice,
+            get_autostart,
+            enable_autostart,
+            disable_autostart,
             run_tool,
             list_tickets,
             decide_ticket,

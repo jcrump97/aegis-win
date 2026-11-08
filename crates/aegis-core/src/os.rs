@@ -298,6 +298,94 @@ pub fn primary_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     }
 }
 
+/// Windows shortcuts (`.lnk`) through the Shell's `IShellLinkW` COM object,
+/// with no shell process (ADR 0002 §6).
+pub mod shortcut {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::{FOLDERID_Startup, IShellLinkW, SHGetKnownFolderPath, ShellLink, KF_FLAG_DEFAULT};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Shortcut {
+        pub target: PathBuf,
+        pub arguments: String,
+        pub working_dir: PathBuf,
+    }
+
+    fn win(e: windows::core::Error) -> io::Error {
+        io::Error::other(e.message())
+    }
+
+    /// The signed-in user's Startup folder (`FOLDERID_Startup`).
+    pub fn startup_folder() -> io::Result<PathBuf> {
+        unsafe {
+            let path = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None).map_err(win)?;
+            let out = path.to_string();
+            CoTaskMemFree(Some(path.0 as *const _));
+            out.map(PathBuf::from).map_err(|e| io::Error::other(e.to_string()))
+        }
+    }
+
+    /// Runs `f` on a thread of its own with COM set up, so the caller's
+    /// thread (a Tokio worker, the UI thread) keeps its own COM state.
+    fn with_com<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
+        std::thread::spawn(move || {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.ok().map_err(win)?;
+            let out = f();
+            unsafe { CoUninitialize() };
+            out
+        })
+        .join()
+        .map_err(|_| io::Error::other("the shortcut thread stopped unexpectedly"))?
+    }
+
+    fn text(buf: &[u16]) -> String {
+        String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())])
+    }
+
+    /// Writes (or overwrites) the shortcut at `path`.
+    pub fn write(path: &Path, link: &Shortcut, description: &str) -> io::Result<()> {
+        let path = HSTRING::from(path.as_os_str());
+        let target = HSTRING::from(link.target.as_os_str());
+        let arguments = HSTRING::from(link.arguments.as_str());
+        let dir = HSTRING::from(link.working_dir.as_os_str());
+        let description = HSTRING::from(description);
+        with_com(move || unsafe {
+            let shell: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(win)?;
+            shell.SetPath(&target).map_err(win)?;
+            shell.SetArguments(&arguments).map_err(win)?;
+            shell.SetWorkingDirectory(&dir).map_err(win)?;
+            shell.SetDescription(&description).map_err(win)?;
+            shell.cast::<IPersistFile>().map_err(win)?.Save(&path, true).map_err(win)
+        })
+    }
+
+    /// Reads the shortcut at `path` without resolving it (no search for a
+    /// moved target). `None` when there is no file.
+    pub fn read(path: &Path) -> io::Result<Option<Shortcut>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let path = HSTRING::from(path.as_os_str());
+        with_com(move || unsafe {
+            let shell: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(win)?;
+            shell.cast::<IPersistFile>().map_err(win)?.Load(&path, STGM_READ).map_err(win)?;
+            let mut target = vec![0u16; 32_768];
+            shell.GetPath(&mut target, std::ptr::null_mut(), 0).map_err(win)?;
+            let mut arguments = vec![0u16; 4096];
+            shell.GetArguments(&mut arguments).map_err(win)?;
+            let mut dir = vec![0u16; 32_768];
+            shell.GetWorkingDirectory(&mut dir).map_err(win)?;
+            Ok(Some(Shortcut { target: PathBuf::from(text(&target)), arguments: text(&arguments), working_dir: PathBuf::from(text(&dir)) }))
+        })
+    }
+}
+
 pub mod eventlog {
     //! Read-only access to Windows event channels through `wevtapi`.
 

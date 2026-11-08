@@ -2,7 +2,7 @@
 // Rust engine enforces all gates, so this file only decides what to show.
 
 import './styles.css';
-import { api, asError, type AegisError, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
+import { api, asError, type AegisError, type AutostartView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { rawJson, renderValue, schemaForm } from './render';
@@ -1181,6 +1181,7 @@ function settingsTab(): HTMLElement {
       h('p', { class: 'hint' }, 'Clicks, typing, and entering your PIN count as use. Nothing an AI agent does counts. Running monitors keep going while locked.'),
     ),
     h('section', { class: 'stack' }, h('h3', {}, 'Plugins and components'), selector.element, h('div', { class: 'row end' }, savePlugins)),
+    autostartCard(),
     pinForm,
     h(
       'section',
@@ -1189,6 +1190,71 @@ function settingsTab(): HTMLElement {
       h('dl', { class: 'kv' }, h('dt', {}, 'Version'), h('dd', {}, status.version), h('dt', {}, 'Data folder'), h('dd', { class: 'mono' }, status.dataDir), h('dt', {}, 'Running as'), h('dd', {}, status.elevated ? 'administrator' : 'standard user')),
     ),
   );
+}
+
+/** The opt-in Startup shortcut (ADR 0002 §6). Turning it on needs the PIN; off does not. */
+function autostartCard(): HTMLElement {
+  const body = h('div', { class: 'stack' }, h('p', { class: 'hint' }, 'Checking…'));
+  const card = h(
+    'section',
+    { class: 'card', id: 'autostart' },
+    h('h3', {}, 'Start with Windows'),
+    body,
+    h(
+      'p',
+      { class: 'hint' },
+      'This only adds a shortcut named "AegisWin Monitor" to your Startup folder; nothing goes in the registry. If you delete or move this AegisWin folder, it cannot remove that shortcut: turn it off in Task Manager > Startup apps, or delete it from the Startup folder.',
+    ),
+  );
+  const show = (view: AutostartView): void => {
+    const message = h('div');
+    const fail = (e: unknown) => replace(message, errorNotice(asError(e)));
+    const enable = async (button: HTMLButtonElement): Promise<void> => {
+      const pin = await askPin('Start AegisWin when you sign in?', 'At sign-in AegisWin starts in the tray, locked, and resumes your running monitors.', 'Turn on');
+      if (!pin) return;
+      try {
+        show(await busy(button, () => api.enableAutostart(pin, false)));
+      } catch (e) {
+        const err = asError(e);
+        if (err.code !== 'CONFLICT') return fail(err);
+        if (!(await confirmDialog('Replace the other shortcut?', err.message, 'Replace'))) return;
+        try {
+          show(await busy(button, () => api.enableAutostart(pin, true)));
+        } catch (again) {
+          fail(again);
+        }
+      }
+    };
+    const remove = async (button: HTMLButtonElement): Promise<void> => {
+      try {
+        show(await busy(button, () => api.disableAutostart()));
+      } catch (e) {
+        fail(e);
+      }
+    };
+    const action = (label: string, run: (b: HTMLButtonElement) => Promise<void>, primary = false): HTMLButtonElement => {
+      const b = h('button', primary ? { class: 'primary' } : {}, label);
+      b.addEventListener('click', () => void run(b));
+      return b;
+    };
+    const parts: HTMLElement[] = [];
+    if (view.state === 'on') {
+      parts.push(h('p', {}, 'On: when you sign in, AegisWin starts in the tray, locked, and resumes your running monitors.'), h('div', { class: 'row' }, action('Turn off', remove)));
+    } else if (view.state === 'off') {
+      parts.push(h('p', {}, 'Off: monitors resume only when you start AegisWin yourself.'));
+      if (view.wanted) parts.push(h('div', { class: 'row' }, action('Turn on (PIN)', enable, true)));
+      else parts.push(h('p', { class: 'hint' }, 'Save a monitor on the Usage Monitor tab first.'));
+    } else {
+      const what = view.state === 'different' ? `It starts ${view.target}${view.arguments ? ` ${view.arguments}` : ''}, not this copy.` : `It could not be read (${view.reason}).`;
+      parts.push(
+        h('div', { class: 'notice error', role: 'alert' }, h('p', {}, h('strong', {}, 'A Startup shortcut named AegisWin Monitor points somewhere else.')), h('p', {}, what), h('p', { class: 'hint' }, 'This happens when the AegisWin folder moved, a USB drive got a new letter, or another copy set it up.')),
+        h('div', { class: 'row' }, ...(view.wanted ? [action('Update to this copy (PIN)', enable, true)] : []), action('Remove', remove)),
+      );
+    }
+    replace(body, ...parts, h('p', { class: 'hint mono' }, view.shortcut), message);
+  };
+  api.getAutostart().then(show, (e) => replace(body, errorNotice(asError(e))));
+  return card;
 }
 
 // ---- start ------------------------------------------------------------------

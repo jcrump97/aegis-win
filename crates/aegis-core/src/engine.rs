@@ -534,6 +534,18 @@ impl Engine {
         any
     }
 
+    /// Whether the Startup shortcut has anything to start: some installed
+    /// plugin has saved background work. `None` while locked or while a
+    /// plugin does not know yet; the shortcut is only removed on `Some(false)`.
+    pub fn autostart_wanted(&self) -> Option<bool> {
+        let installed = lock(&self.vault).as_ref().map(|v| v.state.installed_plugins.clone())?;
+        let mut wanted = false;
+        for plugin in installed.iter().filter_map(|id| self.registry.plugin(id)) {
+            wanted |= plugin.saved_background_work()?;
+        }
+        Some(wanted)
+    }
+
     /// The owner closed the banner about the gap before a resume.
     pub fn dismiss_resume_notice(&self, plugin_id: &str) {
         lock(&self.resume_notices).remove(plugin_id);

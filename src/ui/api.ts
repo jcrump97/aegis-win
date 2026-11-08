@@ -38,6 +38,14 @@ export interface ResumeNotice {
   label: string;
 }
 
+/** The Startup shortcut (`AegisWin Monitor.lnk`), app only. */
+export type AutostartView = { shortcut: string; wanted: boolean | null } & (
+  | { state: 'off' }
+  | { state: 'on' }
+  | { state: 'different'; target: string; arguments: string }
+  | { state: 'unreadable'; reason: string }
+);
+
 export interface RuntimeReview {
   pluginId: string;
   /** What differed, in words ("history key", "monitoring settings", ...). */
@@ -258,6 +266,9 @@ export const api = {
   revokeLlmTrust: (pluginId: string) => call<void>('revoke_llm_trust', { pluginId }),
   rewriteRuntime: (pluginId: string) => call<void>('rewrite_runtime', { pluginId }),
   dismissResumeNotice: (pluginId: string) => call<void>('dismiss_resume_notice', { pluginId }),
+  getAutostart: () => call<AutostartView>('get_autostart'),
+  enableAutostart: (pin: string, replace: boolean) => call<AutostartView>('enable_autostart', { pin, replace }),
+  disableAutostart: () => call<AutostartView>('disable_autostart'),
   runTool: (pluginId: string, toolId: string, args: unknown, pin: string | null) =>
     call<RunOutcome>('run_tool', { pluginId, toolId, args, pin }),
   listTickets: () => call<TicketView[]>('list_tickets'),

@@ -76,12 +76,25 @@ const finished = { ...base, ticketId: 'one-3', pluginId: 'windows-health', toolI
 const calls = [];
 let reviews = [];
 let notices = [];
+let autostart = { state: 'off', shortcut: 'C:\Startup\AegisWin Monitor.lnk', wanted: true };
+const autostartCalls = [];
 let app = null;
 function backend(cmd, args) {
   calls.push(cmd);
   switch (cmd) {
     case 'status':
       return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews, resumeNotices: notices };
+    case 'get_autostart':
+      return autostart;
+    case 'enable_autostart':
+      autostartCalls.push({ cmd, ...args });
+      if (!args.replace) throw { code: 'CONFLICT', message: 'A Startup shortcut from another AegisWin copy already exists. Replace it?' };
+      autostart = { ...autostart, state: 'on' };
+      return autostart;
+    case 'disable_autostart':
+      autostartCalls.push({ cmd });
+      autostart = { ...autostart, state: 'off' };
+      return autostart;
     case 'dismiss_resume_notice':
       assert.equal(args.pluginId, 'usage-monitor');
       notices = [];
@@ -217,4 +230,34 @@ test('after a resume at launch, a banner shows the gap until dismissed', async (
   await settle();
   assert.ok(calls.includes('dismiss_resume_notice'));
   assert.equal(banner().textContent, '', 'the banner goes once dismissed');
+});
+
+test('the Startup shortcut needs the PIN to turn on, asks before replacing another copy, and turns off without it', async () => {
+  const { document } = app;
+  nav(document, 'settings').click();
+  await settle();
+  const card = () => document.querySelectorAll('section').find((s) => s.id === 'autostart');
+  const button = (label) => card().querySelectorAll('button').find((b) => b.textContent === label);
+  assert.ok(card().textContent.includes('Off:'), 'starts off');
+
+  button('Turn on (PIN)').click();
+  await settle();
+  const dialog = () => document.querySelectorAll('dialog').find((d) => d.open);
+  const pin = dialog().querySelector('input');
+  pin.value = '246810';
+  dialog().querySelector('form').dispatchEvent({ type: 'submit', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  await settle();
+  assert.ok(dialog().textContent.includes('Replace the other shortcut?'), "another copy's shortcut: the owner is asked");
+  dialog().querySelectorAll('button').find((b) => b.textContent === 'Replace').click();
+  await settle();
+  assert.deepEqual(autostartCalls, [
+    { cmd: 'enable_autostart', pin: '246810', replace: false },
+    { cmd: 'enable_autostart', pin: '246810', replace: true },
+  ]);
+  assert.ok(card().textContent.includes('On:'), 'now on');
+
+  button('Turn off').click();
+  await settle();
+  assert.deepEqual(autostartCalls.at(-1), { cmd: 'disable_autostart' }, 'turning off sends no PIN');
+  assert.ok(card().textContent.includes('Off:'));
 });

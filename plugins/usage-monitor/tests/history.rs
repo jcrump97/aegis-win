@@ -347,6 +347,24 @@ async fn a_planted_file_for_an_uninstalled_plugin_stops_at_unlock() {
     assert_eq!(engine.status().runtime_reviews.len(), 1, "and sets the file aside");
 }
 
+#[tokio::test]
+async fn the_startup_shortcut_is_wanted_while_any_monitor_is_saved() {
+    let (engine, _dir) = engine().await;
+    assert_eq!(engine.autostart_wanted(), Some(false), "no monitor saved");
+    run(&engine, "activate_monitor", json!({ "rule": crash_rule() })).await.unwrap();
+    assert_eq!(engine.autostart_wanted(), Some(true));
+    run(&engine, "pause_monitor", json!({ "id": "m1" })).await.unwrap();
+    assert_eq!(engine.autostart_wanted(), Some(true), "a paused monitor still counts");
+    engine.lock().await;
+    assert_eq!(engine.autostart_wanted(), None, "unknown while locked, so the shortcut is kept");
+    engine.unlock(PIN.into()).await.unwrap();
+    assert_eq!(engine.autostart_wanted(), Some(true));
+    run(&engine, "delete_monitor", json!({ "id": "m1" })).await.unwrap();
+    assert_eq!(engine.autostart_wanted(), Some(false), "the last monitor deleted");
+    engine.set_installed(BTreeMap::new()).unwrap();
+    assert_eq!(engine.autostart_wanted(), Some(false), "uninstalled");
+}
+
 fn runtime_file_in(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("data").join("runtime").join(format!("{UM}.json"))
 }

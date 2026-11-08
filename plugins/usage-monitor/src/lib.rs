@@ -1032,6 +1032,12 @@ impl Plugin for UsageMonitorPlugin {
         !self.telemetry.lock().unwrap().monitors.active.is_empty()
     }
 
+    /// Any saved monitor keeps the Startup shortcut; deleting the last one
+    /// removes it (ADR 0002 §6).
+    fn saved_background_work(&self) -> Option<bool> {
+        self.telemetry.lock().unwrap().monitors.saved.map(|n| n > 0)
+    }
+
     fn on_lock(&self) {
         // Waits for a monitor change in progress, so it cannot restart the
         // sampler after this. Later changes fail: the vault is already locked.

@@ -121,6 +121,9 @@ pub struct MonitorRuntime {
     pub problems: Vec<(String, Vec<String>)>,
     /// Set when the saved record could not be read; nothing runs then.
     pub load_error: Option<String>,
+    /// How many monitors are saved, running or paused. `None` when built
+    /// from a runtime section (locked) or when the record could not be read.
+    pub saved: Option<usize>,
 }
 
 impl MonitorRuntime {
@@ -128,7 +131,7 @@ impl MonitorRuntime {
     /// rule whose component was turned off stops, with the reason, and runs
     /// again when the component is back.
     pub fn build(book: &MonitorBook, enabled_components: &[String]) -> Self {
-        let mut rt = Self::default();
+        let mut rt = Self { saved: Some(book.monitors.len()), ..Self::default() };
         for m in &book.monitors {
             match rules::validate(&m.rule, enabled_components) {
                 Ok(rule) if !m.paused => rt.active.push(ActiveMonitor { id: m.id.clone(), evaluator: Evaluator::new(rule) }),
