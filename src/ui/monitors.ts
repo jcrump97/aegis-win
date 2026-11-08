@@ -239,7 +239,7 @@ function historyCard(deps: MonitorDeps): { element: HTMLElement; showRetention(r
       h('h4', {}, `Events, newest first (${events.length})`),
       events.length === 0 ? h('p', {}, 'Nothing recorded in this period.') : null,
       events.length
-        ? h('table', {}, h('tbody', {}, ...events.map((e) => h('tr', {}, h('td', {}, when(e.at)), h('td', {}, KIND_LABELS[str(e.kind)] ?? str(e.kind)), h('td', {}, eventText(e))))))
+        ? h('table', {}, h('tbody', {}, ...events.map((e) => h('tr', {}, h('td', {}, when(e.at)), h('td', {}, KIND_LABELS[str(e.kind)] ?? str(e.kind)), h('td', {}, eventText(e), str(e.duringRepair) ? h('span', { class: 'hint' }, ` (during AegisWin repair: ${str(e.duringRepair)})`) : null)))))
         : null,
       omitted ? h('p', { class: 'hint' }, `${omitted} older event(s) not shown.`) : null,
     );

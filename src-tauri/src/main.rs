@@ -298,6 +298,19 @@ async fn disable_autostart(engine: EngineState<'_>) -> Cmd<AutostartView> {
     Ok(autostart_view(&engine, &autostart))
 }
 
+/// The durable approval record (ADR 0003 §7), newest first. Needs the PIN.
+/// App only: not a plugin tool, so no agent can read it.
+#[tauri::command]
+async fn read_approval_record(engine: EngineState<'_>, pin: String, days: u32) -> Cmd<Value> {
+    Ok(engine.approval_record(&pin, days).await?)
+}
+
+/// Deletes the approval record and replaces its key. Needs the PIN.
+#[tauri::command]
+async fn delete_approval_record(engine: EngineState<'_>, pin: String) -> Cmd<usize> {
+    Ok(engine.delete_approval_record(&pin).await?)
+}
+
 /// Closes the banner about the gap before a resume at launch.
 #[tauri::command]
 async fn dismiss_resume_notice(engine: EngineState<'_>, plugin_id: String) -> Cmd<()> {
@@ -462,6 +475,8 @@ fn main() {
             revoke_llm_trust,
             rewrite_runtime,
             dismiss_resume_notice,
+            read_approval_record,
+            delete_approval_record,
             get_autostart,
             enable_autostart,
             disable_autostart,

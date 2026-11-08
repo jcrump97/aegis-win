@@ -884,14 +884,16 @@ impl UsageMonitorPlugin {
         let now = Utc::now();
         let since = (now.date_naive() - chrono::Days::new(u64::from(days - 1))).and_hms_opt(0, 0, 0).expect("midnight exists").and_utc();
         let retention = history.retention()?;
-        let (read, events) = tokio::task::spawn_blocking(move || {
+        let (read, events, repairs) = tokio::task::spawn_blocking(move || {
             let read = history.read(Some(since.date_naive()));
             let events = eventlog::query(&timeline::evidence_query(days)).unwrap_or_default();
-            (read, events)
+            // A missing approval record only loses the labels.
+            let repairs = history.change_windows(since.date_naive()).unwrap_or_default();
+            (read, events, repairs)
         })
         .await
         .map_err(|e| AegisError::failed(e.to_string()))?;
-        let mut view = timeline::view(&read?, &events, since, now, limit);
+        let mut view = timeline::view(&read?, &events, &repairs, since, now, limit);
         view["days"] = json!(days);
         view["retention"] = json!(retention);
         view["note"] = json!("Gaps are worked out from the records; System log events are shown as evidence when they fall inside a gap. Values are never filled in across a gap.");

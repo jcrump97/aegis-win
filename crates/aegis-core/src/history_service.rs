@@ -39,6 +39,51 @@ pub fn default_retention(stream: &str) -> Retention {
     }
 }
 
+/// Longest a change counts as running when its `change_finished` record is
+/// missing (AegisWin quit or crashed mid-change).
+pub const OPEN_CHANGE_LIMIT: chrono::Duration = chrono::Duration::hours(2);
+
+/// A stretch of time in which AegisWin was changing the system.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeWindow {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    /// The tool's display name.
+    pub tool: String,
+}
+
+/// Pairs `change_started` with the next `change_finished`. Changes run one
+/// at a time, so a start without a finish lasts until the next start, at
+/// most [`OPEN_CHANGE_LIMIT`].
+pub fn change_windows(records: &[Value]) -> Vec<ChangeWindow> {
+    let at = |r: &Value| r.get("at").and_then(Value::as_str).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|t| t.with_timezone(&Utc));
+    let mut events: Vec<(DateTime<Utc>, &Value)> = records.iter().filter_map(|r| Some((at(r)?, r))).collect();
+    events.sort_by_key(|(t, _)| *t);
+    let mut out = Vec::new();
+    let mut open: Option<(DateTime<Utc>, String)> = None;
+    for (t, r) in events {
+        match r.get("event").and_then(Value::as_str) {
+            Some("change_started") => {
+                if let Some((from, tool)) = open.take() {
+                    out.push(ChangeWindow { from, to: t.min(from + OPEN_CHANGE_LIMIT), tool });
+                }
+                let tool = r.get("toolName").or_else(|| r.get("tool")).and_then(Value::as_str).unwrap_or("a repair").to_owned();
+                open = Some((t, tool));
+            }
+            Some("change_finished") => {
+                if let Some((from, tool)) = open.take() {
+                    out.push(ChangeWindow { from, to: t, tool });
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((from, tool)) = open {
+        out.push(ChangeWindow { from, to: from + OPEN_CHANGE_LIMIT, tool });
+    }
+    out
+}
+
 /// The plaintext runtime file. It reveals what is monitored, never what was
 /// recorded. Compared with the vault's copy on every unlock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -299,6 +344,13 @@ impl HistoryHandle {
     /// the vault and written to the runtime file.
     pub fn set_runtime(&self, plugin: Option<Value>) -> AegisResult<()> {
         self.engine()?.set_runtime(&self.stream, plugin)
+    }
+
+    /// When AegisWin itself was changing the system since `since`, from the
+    /// engine's approval record, so events can be labelled "during AegisWin
+    /// repair". Gives times and tool names only. Needs the vault unlocked.
+    pub fn change_windows(&self, since: NaiveDate) -> AegisResult<Vec<ChangeWindow>> {
+        self.engine()?.change_windows(since)
     }
 
 }

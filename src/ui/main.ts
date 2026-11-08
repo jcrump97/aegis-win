@@ -2,7 +2,7 @@
 // Rust engine enforces all gates, so this file only decides what to show.
 
 import './styles.css';
-import { api, asError, type AegisError, type AutostartView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
+import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { rawJson, renderValue, schemaForm } from './render';
@@ -93,6 +93,7 @@ function route(): void {
   shellParts = null;
   mainEl = null;
   forgetMonitorPanel();
+  recordCard = null;
   if (!status.unlocked) planDraft = [];
   if (!status.vaultExists) setupScreen();
   else if (!status.unlocked) unlockScreen();
@@ -704,7 +705,105 @@ function approvalsTab(): HTMLElement {
     ...active.map(ticketCard),
     done.length ? h('h3', {}, 'Earlier requests') : null,
     ...done.map(ticketCard),
+    approvalRecordCard(),
   );
+}
+
+/** Kept across re-renders of the tab (the list refreshes every 2 seconds); dropped on lock. */
+let recordCard: HTMLElement | null = null;
+
+const RECORD_LABELS: Record<string, string> = {
+  created: 'Requested',
+  decided: 'Decided',
+  change_started: 'Change started',
+  change_finished: 'Change finished',
+  finished: 'Ended',
+  cancelled: 'Cancelled',
+  cancel_requested: 'Stop asked',
+};
+
+const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v));
+
+function recordText(e: ApprovalRecordEvent): string {
+  const plan = e.plan as { title?: string; titleLabel?: string; hash?: string; steps?: unknown[] } | undefined;
+  switch (e.event) {
+    case 'created':
+      return plan
+        ? `${asText(e.toolName)} from ${asText(e.origin)}${plan.title ? `, titled "${plan.title}" (${asText(plan.titleLabel)})` : ''}, fingerprint ${asText(plan.hash).slice(0, 12)}`
+        : `${asText(e.toolName)} (${asText(e.tool)}) from ${asText(e.origin)}, arguments ${asText(e.args)}`;
+    case 'decided':
+      return `${e.lockedOut ? 'Locked after too many wrong PINs' : e.approved ? 'Approved' : 'Declined'} via ${asText(e.via)}${e.comment ? `. Note: ${asText(e.comment)}` : ''}`;
+    case 'change_started':
+      return `${asText(e.toolName)}${e.step ? ` (step ${asText(e.step)})` : ''}${e.origin ? ` from ${asText(e.origin)}` : ''}, arguments ${asText(e.args)}`;
+    case 'change_finished':
+      return `${asText(e.tool)}${e.step ? ` (step ${asText(e.step)})` : ''}: ${asText(e.outcome).replace('_', ' ')}${e.error ? `. ${asText(e.error)}` : ''}`;
+    case 'finished':
+      return `${asText(e.status).replace('_', ' ')}${e.reason ? `. ${asText(e.reason)}` : ''}`;
+    case 'cancelled':
+      return `from ${asText(e.from)}${e.reason ? `. ${asText(e.reason)}` : ''}`;
+    default:
+      return '';
+  }
+}
+
+/** The durable approval record (ADR 0003 §7): reading and deleting it need the PIN. App only. */
+function approvalRecordCard(): HTMLElement {
+  if (recordCard) return recordCard;
+  const result = h('div', { class: 'stack', 'aria-live': 'polite' });
+  const days = h('select', { id: 'record-days' }, ...[1, 7, 30, 90].map((d) => h('option', { value: d }, d === 1 ? 'the last day' : `the last ${d} days`)));
+  days.value = '7';
+  const show = h('button', { class: 'primary' }, 'Show record (PIN)');
+  show.addEventListener('click', async () => {
+    const pin = await askPin('Show the approval record?', 'The record of every request, decision and change is encrypted; your PIN opens it.', 'Show');
+    if (!pin) return;
+    try {
+      const v = await busy(show, () => api.readApprovalRecord(pin, Number(days.value)));
+      const problems = v.files.filter((f) => f.status !== 'ok');
+      replace(
+        result,
+        h('p', { class: 'hint' }, `The last ${v.days} day(s), newest first. Kept for ${v.retention.maxDays} days.`),
+        problems.length ? h('div', { class: 'notice error' }, `${problems.length} record file(s) could not be read fully: ${problems.map((f) => `${f.name} (${f.status})`).join(', ')}.`) : null,
+        v.events.length === 0 ? h('p', {}, 'Nothing recorded in this period.') : null,
+        v.events.length
+          ? h(
+              'table',
+              {},
+              h('tbody', {}, ...v.events.map((e) => h('tr', {}, h('td', {}, new Date(e.at).toLocaleString()), h('td', {}, RECORD_LABELS[e.event] ?? e.event), h('td', { class: 'mono' }, asText(e.ticketId).slice(0, 8)), h('td', {}, recordText(e))))),
+            )
+          : null,
+        v.omitted ? h('p', { class: 'hint' }, `${v.omitted} older event(s) not shown.`) : null,
+      );
+    } catch (e) {
+      replace(result, errorNotice(asError(e)));
+    }
+  });
+  const purge = h('button', { class: 'danger' }, 'Delete the record (PIN)');
+  purge.addEventListener('click', async () => {
+    if (!(await confirmDialog('Delete the approval record?', 'Every record file is deleted and the record gets a new key, so deleted files cannot be read even if recovered. This cannot be undone.', 'Delete'))) return;
+    const pin = await askPin('Delete the approval record?', 'Enter your PIN to delete it.', 'Delete');
+    if (!pin) return;
+    try {
+      const removed = await busy(purge, () => api.deleteApprovalRecord(pin));
+      replace(result, h('div', { class: 'notice ok' }, `Approval record deleted (${removed} file(s)).`));
+      toast('Approval record deleted.');
+    } catch (e) {
+      replace(result, errorNotice(asError(e)));
+    }
+  });
+  recordCard = h(
+    'section',
+    { class: 'card stack', id: 'approval-record' },
+    h('h3', {}, 'Approval record'),
+    h(
+      'p',
+      { class: 'hint' },
+      'AegisWin keeps an encrypted record of every request, your decision, and each change it made, with its outcome, even after a request is forgotten. Only your PIN can read it, and agents cannot. Requests that expire unanswered show only as requested.',
+    ),
+    h('div', { class: 'row' }, h('label', { for: 'record-days' }, 'Show'), days, show),
+    result,
+    h('div', { class: 'row' }, purge),
+  );
+  return recordCard;
 }
 
 /** Refreshes the list after a decision or cancel, so the card shows its new state. */

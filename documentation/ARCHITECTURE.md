@@ -158,6 +158,7 @@ At run time, next to the executable:
 data/
 ├── vault.enc.json              # Encrypted vault: settings, plugin data, history private keys
 ├── webview/                    # WebView2 profile
-├── history/<stream>/           # Encrypted, write-only history segments (seg-YYYYMMDD-NNN.bin), one folder per stream
+├── history/<stream>/           # Encrypted, write-only history segments (seg-YYYYMMDD-NNN.bin), one folder per stream;
+│                               #   `approvals` is the engine's own approval record (ADR 0003 §7)
 └── runtime/<plugin>.json       # Plaintext: what a plugin runs while locked, with its stream's public key (checked on unlock)
 ```

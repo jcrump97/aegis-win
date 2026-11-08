@@ -1,6 +1,6 @@
 # ADR 0003: Multi-step action plans
 
-- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phases 3-4 on `feat/plans-mcp`; see "As built" in §10. Phase 5 is not (it waits for ADR 0002 Phase 4).
+- **Status**: Accepted (2026-11-07). Phase 1 (the serial executor) is implemented on `feat/plan-executor`, Phase 2 (`planEligible`) on `feat/plan-eligible`, and Phases 3-4 on `feat/plans-mcp`; see "As built" in §10. Phase 5 (the durable approval record) is implemented on `feat/approvals-history`.
 - **Date**: 2026-11-07
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (shared encrypted history, reasoning panels), [SECURITY_MODEL §4](../SECURITY_MODEL.md)
 
@@ -158,8 +158,7 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
   - every step's outcome
   - cancellations
 - **Never recorded**: the PIN.
-- **Today**: kept in the in-memory approvals list.
-- **Persisted**: once the shared history service exists (ADR 0002 §5), to the encrypted `approvals` stream. It can be read only after unlocking, and can be purged only from the app with the PIN; there is no MCP tool for purging it.
+- **Persisted** to the engine's encrypted `approvals` stream (ADR 0002 §5); see "As built, Phase 5" in §10. It can be read only after unlocking, and can be purged only from the app with the PIN; there is no MCP tool for purging it.
 
 ## 8. Risks
 
@@ -209,7 +208,7 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 - **A step that runs but reports `"success": false` has failed**, like one that returns an error. The `windows-health` repairs report a failed command that way, so without this a plan would carry on after a failed repair. Its output is kept as the step's result.
 - **The plan's error names the step** ("Step 2 failed: …"); the step keeps the plain error.
 - **A plan holds the one slot for all its steps**, so nothing else starts between them. Before each step it stops if it was cancelled or if idle auto-lock is waiting (`cancelled`, with the reason).
-- **Lock forgets the plan** with every other ticket, as Lock does today, so an agent polling afterwards gets "ticket not found" rather than `cancelled`. The step that was running finishes; nothing after it runs. A lasting record waits for the approvals stream in Phase 5.
+- **Lock forgets the plan** with every other ticket, as Lock does today, so an agent polling afterwards gets "ticket not found" rather than `cancelled`. The step that was running finishes; nothing after it runs. Since Phase 5 the approval record keeps what happened (a `cancelled` record from `lock`, then the running step's outcome).
 - **The approval must name the plan hash.** A missing or wrong hash is refused with `CONFLICT` before the PIN is checked, so a stale page costs no attempt. The single-ticket call (`decide_ticket`) passes no hash, so it cannot approve a plan.
 - **A step's tool that is `appOnly` is reported to an agent as unknown**, as a direct call would be. (Phase 2 already makes such tools ineligible.)
 - **Cancel** of a running single-tool request is refused with `CONFLICT`: it is one step, already running, and stopping a repair halfway is unsafe.
@@ -226,6 +225,21 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 - **The draft panel** sits at the top of the plugin's tab: the steps in order with Remove, an optional title and "Notes for yourself", then "Review and run" and "Clear plan". A plan may mix plugins (§11.1), so the draft survives switching tabs.
 - **Labels follow the origin.** The supplied text is labelled "Written by you"; the card says "Your plan"; the browser page's heading says "Approve your action plan?". The fingerprint line ("if the agent told you one, it should match") is hidden for the owner's plans, and a new owner plan raises no "an agent is asking" notification.
 - **The owner's plans share the limit of five pending plans** with agents. An agent filling it delays the owner's plan until the owner declines one; giving the owner a separate allowance was not worth a second counter.
+
+**As built, Phase 5, the approval record** (decided 2026-11-08, during implementation):
+
+- **One record per event**, written by the engine to its own `approvals` stream (write-only, HPKE, like monitor history), each stamped `at` by the engine:
+  - `created`: ticket id, origin (`mcp`, `mcp plan`, `app plan`), tool name; for a single request the MCP tool name and arguments; for a plan the hash, the supplied title (cut to 300 characters) with its label, and each step's tool and arguments.
+  - `decided`: approved or not, where (`app` or `browser`), the owner's note, and `lockedOut` when wrong PINs locked the request.
+  - `change_started` / `change_finished`: every run of a tool that changes the system (`readOnly: false`, not a dry run), whatever started it: an approved request (with its ticket id and step number), an in-app run with the PIN, or an `auto` call over MCP (ticket id `null`, with the origin). The outcome is `succeeded`, `failed` (with the error, cut), or `reported_failure` (`"success": false`).
+  - `finished`: the final status and the stop reason or error. `cancelled` (from `pending`, `queued`, or `lock`) and `cancel_requested` (a running plan asked to stop).
+- **Lock** writes a `cancelled` record for every request it forgets, while the vault is still open. A change already running finishes, and its `change_finished` is written while locked (the public key is cached).
+- **Arguments larger than 4 KB** are recorded by size only. The PIN, right or wrong, the CSRF token, and tool results are never recorded.
+- **Not recorded: a request that expires unanswered.** Expiry happens lazily inside the ticket list, so such a request shows only `created`. Recording expiry needs a timer; not worth it for an outcome the record already implies.
+- **Best effort.** A record that cannot be written (disk full, no key yet while locked) never blocks a decision or a change.
+- **Reading and deleting are app only, with the PIN**: Tauri commands `read_approval_record(pin, days)` (1-90 days, newest first, at most 1000 events) and `delete_approval_record(pin)` (deletes every file and replaces the key). They are not plugin tools, so no agent can reach them, and no plugin can: the `approvals` id is reserved. The Approvals tab has an *Approval record* card for both.
+- **Retention**: 90 days by default (§11 Q2); there is no setting yet.
+- **"During AegisWin repair"** (§5): the `usage-monitor` history view asks the engine for the windows between each `change_started` and its `change_finished` (`HistoryHandle::change_windows`, times and tool names only; a start without a finish lasts until the next start, at most two hours) and labels monitor events inside one.
 
 ## 11. Open questions
 

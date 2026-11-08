@@ -6,6 +6,7 @@
 //! unexpected one). Values are never filled in across a gap.
 
 use aegis_core::history::{FileStatus, StreamRead};
+use aegis_core::history_service::ChangeWindow;
 use aegis_core::os::eventlog::{EventQuery, EventRecord};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -228,11 +229,23 @@ fn file_problem(name: &str, status: FileStatus) -> Option<String> {
 
 /// The history view: events (heartbeats left out), gaps with evidence,
 /// and any file problems. Keeps the newest `limit` events.
-pub fn view(read: &StreamRead, events: &[EventRecord], since: DateTime<Utc>, now: DateTime<Utc>, limit: usize) -> Value {
+/// `repairs`: when AegisWin itself was changing the system (from the
+/// engine's approval record); events inside one are labelled `duringRepair`.
+pub fn view(read: &StreamRead, events: &[EventRecord], repairs: &[ChangeWindow], since: DateTime<Utc>, now: DateTime<Utc>, limit: usize) -> Value {
     let ordered: Vec<(DateTime<Utc>, &Value)> = ordered(&read.records).into_iter().filter(|(t, _)| *t >= since).collect();
     let mut gaps = gaps(&ordered);
     attach_evidence(&mut gaps, events, now);
-    let shown: Vec<&Value> = ordered.iter().map(|(_, r)| *r).filter(|r| kind(r) != "heartbeat").collect();
+    let shown: Vec<Value> = ordered
+        .iter()
+        .filter(|(_, r)| kind(r) != "heartbeat")
+        .map(|(t, r)| {
+            let mut r = (*r).clone();
+            if let Some(w) = repairs.iter().find(|w| w.from <= *t && *t <= w.to) {
+                r["duringRepair"] = json!(w.tool);
+            }
+            r
+        })
+        .collect();
     let omitted = shown.len().saturating_sub(limit);
     json!({
         "from": stamp(since),
@@ -368,7 +381,7 @@ mod tests {
             records,
             files: vec![aegis_core::history::FileReport { name: "seg-20261108-001.bin".into(), status: FileStatus::Truncated, records: 10, bytes: 1 }],
         };
-        let v = view(&read, &[], t(0, 0), t(12, 0), 3);
+        let v = view(&read, &[], &[], t(0, 0), t(12, 0), 3);
         assert_eq!(v["events"].as_array().unwrap().iter().map(|e| e["at"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), [
             t(10, 7).to_rfc3339(),
             t(10, 8).to_rfc3339(),
@@ -376,7 +389,16 @@ mod tests {
         ]);
         assert_eq!(v["omitted"], 2);
         assert!(v["problems"][0].as_str().unwrap().contains("cut off"));
-        let later = view(&read, &[], t(10, 8), t(12, 0), 10);
+        let later = view(&read, &[], &[], t(10, 8), t(12, 0), 10);
         assert_eq!(later["events"].as_array().unwrap().len(), 2, "records before `since` are left out");
+    }
+
+    #[test]
+    fn events_during_an_aegiswin_repair_are_labelled() {
+        let read = StreamRead { records: vec![rec(10, 0, "spike"), rec(10, 5, "spike"), rec(10, 10, "monitor_hit")], files: vec![] };
+        let repairs = [ChangeWindow { from: t(10, 4), to: t(10, 10), tool: "Reset network".into() }];
+        let v = view(&read, &[], &repairs, t(0, 0), t(12, 0), 10);
+        let labels: Vec<Option<&str>> = v["events"].as_array().unwrap().iter().map(|e| e["duringRepair"].as_str()).collect();
+        assert_eq!(labels, [None, Some("Reset network"), Some("Reset network")], "inclusive at both ends");
     }
 }

@@ -78,6 +78,13 @@ let reviews = [];
 let notices = [];
 let autostart = { state: 'off', shortcut: 'C:\Startup\AegisWin Monitor.lnk', wanted: true };
 const autostartCalls = [];
+const recordCalls = [];
+let recordEvents = [
+  { at: '2026-11-08T10:05:00Z', event: 'finished', ticketId: 'one-3aaaaaaa', status: 'execution_failed', reason: 'Step 2 failed: broke' },
+  { at: '2026-11-08T10:04:00Z', event: 'change_finished', ticketId: 'one-3aaaaaaa', tool: 'windows-health__sfc_scan', outcome: 'succeeded', step: 1 },
+  { at: '2026-11-08T10:01:00Z', event: 'decided', ticketId: 'one-3aaaaaaa', approved: true, via: 'browser', comment: 'go', lockedOut: false },
+  { at: '2026-11-08T10:00:00Z', event: 'created', ticketId: 'one-3aaaaaaa', origin: 'mcp plan', toolName: 'Action plan (2 steps)', plan: { hash: 'cd'.repeat(32), title: 'Fix <b>it</b>', titleLabel: 'Supplied by the requesting agent', steps: [] } },
+];
 let app = null;
 function backend(cmd, args) {
   calls.push(cmd);
@@ -95,6 +102,13 @@ function backend(cmd, args) {
       autostartCalls.push({ cmd });
       autostart = { ...autostart, state: 'off' };
       return autostart;
+    case 'read_approval_record':
+      recordCalls.push({ cmd, ...args });
+      return { days: args.days, retention: { maxDays: 90, maxMb: 64 }, events: recordEvents, omitted: 0, files: [{ name: 'seg-1.bin', status: 'ok' }] };
+    case 'delete_approval_record':
+      recordCalls.push({ cmd, ...args });
+      recordEvents = [];
+      return 3;
     case 'dismiss_resume_notice':
       assert.equal(args.pluginId, 'usage-monitor');
       notices = [];
@@ -260,4 +274,42 @@ test('the Startup shortcut needs the PIN to turn on, asks before replacing anoth
   await settle();
   assert.deepEqual(autostartCalls.at(-1), { cmd: 'disable_autostart' }, 'turning off sends no PIN');
   assert.ok(card().textContent.includes('Off:'));
+});
+
+test('the approval record needs the PIN to show and to delete, and shows supplied text as text', async () => {
+  const { document } = app;
+  nav(document, 'approvals').click();
+  await settle();
+  const card = () => document.querySelectorAll('section').find((s) => s.id === 'approval-record');
+  assert.ok(card(), 'the record card is on the Approvals tab');
+  const button = (label) => card().querySelectorAll('button').find((b) => b.textContent === label);
+  const dialog = () => document.querySelectorAll('dialog').find((d) => d.open);
+  const submitPin = async (pin) => {
+    dialog().querySelector('input').value = pin;
+    dialog().querySelector('form').dispatchEvent({ type: 'submit', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+    await settle();
+  };
+
+  button('Show record (PIN)').click();
+  await settle();
+  await submitPin('246810');
+  assert.deepEqual(recordCalls, [{ cmd: 'read_approval_record', pin: '246810', days: 7 }]);
+  const text = card().textContent;
+  assert.ok(text.includes('Approved via browser. Note: go'), text);
+  assert.ok(text.includes('execution failed. Step 2 failed: broke'), text);
+  assert.ok(text.includes('titled "Fix <b>it</b>" (Supplied by the requesting agent)'), 'the supplied title is shown as text with its label');
+  assert.ok(!card().querySelectorAll('b').length, 'no markup from a record is rendered');
+
+  // Re-rendering the tab (the poll does this every 2 seconds) keeps what is shown.
+  nav(document, 'approvals').click();
+  await settle();
+  assert.ok(card().textContent.includes('Approved via browser'));
+
+  button('Delete the record (PIN)').click();
+  await settle();
+  dialog().querySelectorAll('button').find((b) => b.textContent === 'Delete').click();
+  await settle();
+  await submitPin('246810');
+  assert.deepEqual(recordCalls.at(-1), { cmd: 'delete_approval_record', pin: '246810' });
+  assert.ok(card().textContent.includes('Approval record deleted (3 file(s)).'));
 });

@@ -10,14 +10,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
 use crate::history::{Retention, StreamKey, StreamRead};
-use crate::history_service::{self, HistoryHandle, HistoryService, RuntimeFile, RuntimeReview, MAX_RUNTIME_BYTES, RUNTIME_VERSION};
+use crate::history_service::{self, ChangeWindow, HistoryHandle, HistoryService, RuntimeFile, RuntimeReview, APPROVALS_STREAM, MAX_RUNTIME_BYTES, RUNTIME_VERSION};
 use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
@@ -595,6 +595,16 @@ impl Engine {
 
     async fn lock_inner(&self, keep_locked_work: bool) -> Status {
         self.stop_mcp().await;
+        // Recorded while the vault is still open; the requests are forgotten below.
+        let open: Vec<String> = lock(&self.tickets).list(Instant::now()).into_iter().filter(|v| !v.status.is_final()).map(|v| v.ticket_id).collect();
+        for id in open {
+            self.record_approval(json!({
+                "event": "cancelled",
+                "ticketId": id,
+                "from": "lock",
+                "reason": "AegisWin locked. A change already running finishes; its outcome is recorded.",
+            }));
+        }
         let reviews: BTreeSet<String> = lock(&self.runtime_reviews).keys().cloned().collect();
         let taken = lock(&self.vault).take().map(|v| (v.state.installed_plugins.clone(), v.state.runtime.clone()));
         // Waiting changes never resume after unlock; a running one finishes.
@@ -1050,16 +1060,135 @@ impl Engine {
     /// Deletes the stream's files and replaces its keypair, so a deleted
     /// file recovered from the disk cannot be read with the vault later.
     pub(crate) fn history_purge(&self, stream: &str) -> AegisResult<usize> {
+        self.purge_stream(stream, true)
+    }
+
+    fn purge_stream(&self, stream: &str, plugin: bool) -> AegisResult<usize> {
         let (key, retention) = self.mutate(|s| {
-            self.require_installed(s, stream)?;
+            if plugin {
+                self.require_installed(s, stream)?;
+            }
             let key = StreamKey::generate();
             let public = key.public();
             s.history_keys.insert(stream.to_owned(), key);
             Ok((public, Self::retention_of(s, stream)))
         })?;
         let removed = self.history.purge(stream, key, retention)?;
-        self.rewrite_runtime(stream)?;
+        if plugin {
+            self.rewrite_runtime(stream)?;
+        }
         Ok(removed)
+    }
+
+    // ---- approval record (ADR 0003 §7) -------------------------------------
+
+    /// Appends to the engine's own `approvals` stream. Best effort: a full
+    /// disk or a locked vault must not block a decision or a repair. The
+    /// PIN is never part of a record.
+    fn record_approval(&self, record: Value) {
+        let _ = self.history_append(APPROVALS_STREAM, record);
+    }
+
+    fn record_created(&self, view: &TicketView, origin: &str) {
+        let mut record = json!({
+            "event": "created",
+            "ticketId": view.ticket_id,
+            "origin": origin,
+            "toolName": view.tool_name,
+            "requiresAdmin": view.requires_admin,
+        });
+        match &view.plan {
+            Some(plan) => {
+                record["plan"] = json!({
+                    "hash": plan.hash,
+                    "title": plan.title.as_deref().map(cut_text),
+                    "titleLabel": plan.supplied_label,
+                    "steps": view.steps.iter().map(|s| json!({ "tool": s.tool, "args": capped_args(&s.args) })).collect::<Vec<_>>(),
+                });
+            }
+            None => {
+                record["tool"] = json!(registry::mcp_tool_name(&view.plugin_id, &view.tool_id));
+                record["args"] = capped_args(&view.args);
+            }
+        }
+        self.record_approval(record);
+    }
+
+    fn record_decided(&self, id: &str, approved: bool, via: &str, comment: Option<&str>, locked_out: bool) {
+        self.record_approval(json!({ "event": "decided", "ticketId": id, "approved": approved, "via": via, "comment": comment, "lockedOut": locked_out }));
+    }
+
+    /// Records how a request ended, once it has. Call with the ticket store unlocked.
+    fn record_finished(&self, id: &str) {
+        let Some(view) = lock(&self.tickets).get(id, Instant::now()).map(|t| t.view()) else { return };
+        if !view.status.is_final() {
+            return;
+        }
+        let reason = view.plan.as_ref().and_then(|p| p.stop_reason.clone()).or_else(|| view.error.as_ref().map(|e| e.message.clone()));
+        self.record_approval(json!({ "event": "finished", "ticketId": id, "status": view.status, "reason": reason.as_deref().map(cut_text) }));
+    }
+
+    /// Runs a call. One that changes the system is bracketed by
+    /// `change_started` and `change_finished` records, so the record shows
+    /// every change AegisWin made and monitor events can be labelled as
+    /// happening during a repair (ADR 0003 §5, §7).
+    async fn call_recorded(&self, prepared: Prepared, by: Value) -> AegisResult<Value> {
+        if !changes_system(&prepared.tool, &prepared.args) {
+            return prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await;
+        }
+        let tool = registry::mcp_tool_name(&prepared.plugin.manifest().id, &prepared.tool.id);
+        let mut started = json!({ "event": "change_started", "tool": tool, "toolName": prepared.tool.name, "args": capped_args(&prepared.args) });
+        merge(&mut started, &by);
+        self.record_approval(started);
+        let result = prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await;
+        let outcome = match &result {
+            Ok(v) if v.get("success") == Some(&Value::Bool(false)) => "reported_failure",
+            Ok(_) => "succeeded",
+            Err(_) => "failed",
+        };
+        let mut finished = json!({ "event": "change_finished", "tool": tool, "outcome": outcome, "error": result.as_ref().err().map(|e| cut_text(&e.message)) });
+        merge(&mut finished, &by);
+        self.record_approval(finished);
+        result
+    }
+
+    /// The approval record, oldest first. App only, after the PIN; never MCP.
+    pub fn read_approvals(&self, since: Option<chrono::NaiveDate>) -> AegisResult<StreamRead> {
+        match self.with_state(|s| s.history_keys.get(APPROVALS_STREAM).cloned())? {
+            Some(key) => self.history.read(APPROVALS_STREAM, &key, since),
+            None => Ok(StreamRead::default()),
+        }
+    }
+
+    /// Deletes the approval record and replaces its key. App only, after the PIN.
+    pub fn purge_approvals(&self) -> AegisResult<usize> {
+        self.purge_stream(APPROVALS_STREAM, false)
+    }
+
+    /// The owner's view of the approval record: the last `days` days (1-90),
+    /// newest first. Needs the PIN. App only, never MCP.
+    pub async fn approval_record(&self, pin: &str, days: u32) -> AegisResult<Value> {
+        self.check_pin(pin).await?;
+        let days = days.clamp(1, APPROVAL_RECORD_MAX_DAYS);
+        let since = chrono::Utc::now().date_naive() - chrono::Days::new(u64::from(days - 1));
+        let retention = self.with_state(|s| Self::retention_of(s, APPROVALS_STREAM))?;
+        let read = self.read_approvals(Some(since))?;
+        let mut events: Vec<&Value> = read.records.iter().filter(|r| r.get("at").and_then(Value::as_str).is_some_and(|at| at >= since.to_string().as_str())).collect();
+        events.reverse();
+        let omitted = events.len().saturating_sub(APPROVAL_RECORD_LIMIT);
+        events.truncate(APPROVAL_RECORD_LIMIT);
+        Ok(json!({ "days": days, "retention": retention, "events": events, "omitted": omitted, "files": read.files }))
+    }
+
+    /// Deletes the whole approval record. Needs the PIN. App only, never MCP.
+    pub async fn delete_approval_record(&self, pin: &str) -> AegisResult<usize> {
+        self.check_pin(pin).await?;
+        self.purge_approvals()
+    }
+
+    /// When AegisWin itself was changing the system, from the approval record.
+    pub(crate) fn change_windows(&self, since: chrono::NaiveDate) -> AegisResult<Vec<ChangeWindow>> {
+        Ok(history_service::change_windows(&self.read_approvals(Some(since))?.records))
     }
 
     pub(crate) fn history_retention(&self, stream: &str) -> AegisResult<Retention> {
@@ -1266,9 +1395,10 @@ impl Engine {
             return Err(AegisError::new(ErrorCode::UnknownTool, format!("unknown tool {plugin_id}:{tool_id}")));
         }
         let prepared = self.prepare(plugin_id, tool_id, args)?;
+        let source = if matches!(origin, Origin::Mcp) { "mcp" } else { "app" };
         match prepared.gate {
             Gate::NeedsAdmin => Err(AegisError::requires_admin(&prepared.tool.name)),
-            Gate::Run => self.run_in_turn(epoch, prepared).await,
+            Gate::Run => self.run_in_turn(epoch, prepared, source).await,
             Gate::NeedsPin => match origin {
                 Origin::Ui { pin: None } => {
                     Err(AegisError::new(ErrorCode::PinRequired, format!("Enter your PIN to run {}.", prepared.tool.name)))
@@ -1276,7 +1406,7 @@ impl Engine {
                 Origin::Ui { pin: Some(pin) } => {
                     let pin = Zeroizing::new(pin);
                     self.check_pin(&pin).await?;
-                    self.run_in_turn(epoch, prepared).await
+                    self.run_in_turn(epoch, prepared, "app (PIN)").await
                 }
                 Origin::Mcp => {
                     let review = prepared.plugin.review_call(&prepared.tool.id, &prepared.args, &prepared.ctx.enabled_components);
@@ -1294,6 +1424,7 @@ impl Engine {
                         },
                         Instant::now(),
                     );
+                    self.record_created(&ticket, "mcp");
                     Ok(RunOutcome::PendingApproval { ticket: Box::new(ticket) })
                 }
             },
@@ -1301,7 +1432,7 @@ impl Engine {
     }
 
     /// Runs a call now if it cannot change the system, otherwise in its turn.
-    async fn run_in_turn(&self, epoch: u64, prepared: Prepared) -> AegisResult<RunOutcome> {
+    async fn run_in_turn(&self, epoch: u64, prepared: Prepared, source: &'static str) -> AegisResult<RunOutcome> {
         if !changes_system(&prepared.tool, &prepared.args) {
             return execute(prepared).await;
         }
@@ -1310,7 +1441,8 @@ impl Engine {
         // On its own task, so a caller that goes away cannot cut a change off halfway.
         tokio::spawn(async move {
             let _turn = engine.executor.turn(place, Instant::now() + QUEUE_TIMEOUT).await.map_err(stop_error)?;
-            execute(engine.recheck(&prepared)?).await
+            let result = engine.call_recorded(engine.recheck(&prepared)?, json!({ "ticketId": null, "origin": source })).await?;
+            Ok(RunOutcome::Completed { result })
         })
         .await
         .map_err(internal)?
@@ -1415,6 +1547,8 @@ impl Engine {
                 if left == 0 {
                     ticket.status = TicketStatus::LockedOut;
                     ticket.decided_via = Some(via);
+                    drop(store);
+                    self.record_decided(id, false, via, None, true);
                     return Err(AegisError::new(ErrorCode::PinLockedOut, "Too many wrong PINs for this request, so it was locked. The agent has to ask again."));
                 }
                 return Err(AegisError::new(ErrorCode::PinInvalid, format!("Incorrect PIN. {left} attempt(s) left for this request.")));
@@ -1423,10 +1557,13 @@ impl Engine {
         }
         let comment = comment.map(|c| c.trim().chars().take(MAX_COMMENT_CHARS).collect::<String>()).filter(|c| !c.is_empty());
         if !approve {
-            ticket.comment = comment;
+            ticket.comment = comment.clone();
             ticket.decided_via = Some(via);
             ticket.status = TicketStatus::Declined;
-            return Ok(ticket.view());
+            let view = ticket.view();
+            drop(store);
+            self.record_decided(id, false, via, comment.as_deref(), false);
+            return Ok(view);
         }
         let calls: Vec<(String, String, Value)> = if ticket.plan.is_some() {
             ticket.steps.iter().map(|s| (s.plugin_id.clone(), s.tool_id.clone(), s.args.clone())).collect()
@@ -1471,7 +1608,7 @@ impl Engine {
             }
             return Err(ticket_conflict(status));
         }
-        ticket.comment = comment;
+        ticket.comment = comment.clone();
         ticket.decided_via = Some(via);
         match prepared {
             Err(e) => {
@@ -1483,7 +1620,11 @@ impl Engine {
                 }
                 ticket.status = TicketStatus::ExecutionFailed;
                 ticket.error = Some(e);
-                Ok(ticket.view())
+                let view = ticket.view();
+                drop(store);
+                self.record_decided(id, true, via, comment.as_deref(), false);
+                self.record_finished(id);
+                Ok(view)
             }
             Ok(prepared) => {
                 // Shown as queued only when something is ahead of it.
@@ -1491,6 +1632,7 @@ impl Engine {
                 ticket.status = if waits { TicketStatus::Queued } else { TicketStatus::Running };
                 let view = ticket.view();
                 drop(store);
+                self.record_decided(id, true, via, comment.as_deref(), false);
                 let id = id.to_owned();
                 tokio::spawn(async move { engine.run_ticket(&id, place, prepared).await });
                 Ok(self.with_position(view))
@@ -1522,7 +1664,10 @@ impl Engine {
                         ticket.error = Some(e);
                     }
                 }
+            } else {
+                return;
             }
+            self.record_finished(id);
         };
         let failed = TicketStatus::ExecutionFailed;
         let _turn = match place {
@@ -1556,7 +1701,7 @@ impl Engine {
         if let Some(ticket) = lock(&self.tickets).get_mut(id, Instant::now()) {
             ticket.status = TicketStatus::Running;
         }
-        finish(prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await, failed);
+        finish(self.call_recorded(prepared, json!({ "ticketId": id })).await, failed);
     }
 
     /// Runs a plan's steps in order while holding the one slot. Before each
@@ -1584,6 +1729,7 @@ impl Engine {
                     plan.stop_reason = Some(reason.clone());
                 }
             });
+            self.record_finished(id);
         };
         for (i, step) in steps.iter().enumerate() {
             let n = i + 1;
@@ -1613,10 +1759,11 @@ impl Engine {
                 t.status = TicketStatus::Running;
                 t.steps[i].status = StepStatus::Running;
             });
-            let (output, outcome) = match fresh.plugin.call(&fresh.tool.id, fresh.args, fresh.ctx).await {
+            let tool_name = fresh.tool.name.clone();
+            let (output, outcome) = match self.call_recorded(fresh, json!({ "ticketId": id, "step": n })).await {
                 // A tool that ran but reports `"success": false` failed too; its output is kept.
                 Ok(value) if value.get("success") == Some(&Value::Bool(false)) => {
-                    (Some(value), Err(AegisError::new(ErrorCode::ExecutionFailed, format!("{} reported that it did not succeed.", fresh.tool.name))))
+                    (Some(value), Err(AegisError::new(ErrorCode::ExecutionFailed, format!("{tool_name} reported that it did not succeed."))))
                 }
                 Ok(value) => (Some(value), Ok(())),
                 Err(e) => (None, Err(e)),
@@ -1635,6 +1782,7 @@ impl Engine {
             }
         }
         update(&mut |t| t.status = TicketStatus::Approved);
+        self.record_finished(id);
     }
 
     /// Withdraws a pending or waiting request, or stops a running plan before
@@ -1658,11 +1806,15 @@ impl Engine {
                 if queued {
                     self.executor.withdraw_ticket(id);
                 }
+                self.record_approval(json!({ "event": "cancelled", "ticketId": id, "from": if queued { "queued" } else { "pending" } }));
                 Ok(view)
             }
             TicketStatus::Running if ticket.plan.is_some() => {
                 ticket.cancel_requested = true;
-                Ok(ticket.view())
+                let view = ticket.view();
+                drop(store);
+                self.record_approval(json!({ "event": "cancel_requested", "ticketId": id }));
+                Ok(view)
             }
             TicketStatus::Running => Err(AegisError::new(ErrorCode::Conflict, "This action is already running, and stopping a repair halfway is unsafe. It will finish on its own.")),
             status => Err(ticket_conflict(status)),
@@ -1761,7 +1913,7 @@ impl Engine {
         if store.pending_plans(Instant::now()) >= MAX_PENDING_PLANS {
             return Err(too_many_plans());
         }
-        Ok(store.create(
+        let view = store.create(
             NewTicket {
                 plugin_id: "aegis".into(),
                 tool_id: "plan".into(),
@@ -1776,7 +1928,10 @@ impl Engine {
                 steps: shown,
             },
             Instant::now(),
-        ))
+        );
+        drop(store);
+        self.record_created(&view, if origin == PlanOrigin::Agent { "mcp plan" } else { "app plan" });
+        Ok(view)
     }
 
     fn ticket_changes_system(&self, id: &str) -> bool {
@@ -1904,6 +2059,37 @@ fn ticket_not_found() -> AegisError {
 fn ticket_conflict(status: TicketStatus) -> AegisError {
     let label = serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
     AegisError::new(ErrorCode::Conflict, format!("This request is no longer pending ({}).", label.replace('_', " ")))
+}
+
+/// The approval record view covers at most this many days (its default retention).
+pub const APPROVAL_RECORD_MAX_DAYS: u32 = 90;
+/// Newest events shown at once.
+const APPROVAL_RECORD_LIMIT: usize = 1000;
+
+/// Longest text (titles, errors) kept in an approval record.
+const RECORD_TEXT_CHARS: usize = 300;
+/// Arguments larger than this are recorded by size only.
+const RECORD_ARGS_BYTES: usize = 4096;
+
+fn cut_text(text: &str) -> String {
+    text.chars().take(RECORD_TEXT_CHARS).collect()
+}
+
+fn capped_args(args: &Value) -> Value {
+    let size = serde_json::to_vec(args).map(|v| v.len()).unwrap_or(0);
+    if size > RECORD_ARGS_BYTES {
+        json!({ "omitted": format!("{size} bytes of arguments") })
+    } else {
+        args.clone()
+    }
+}
+
+fn merge(into: &mut Value, from: &Value) {
+    if let (Value::Object(into), Value::Object(from)) = (into, from) {
+        for (k, v) in from {
+            into.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 async fn execute(prepared: Prepared) -> AegisResult<RunOutcome> {

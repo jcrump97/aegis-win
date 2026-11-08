@@ -38,6 +38,22 @@ export interface ResumeNotice {
   label: string;
 }
 
+/** One event of the durable approval record (ADR 0003 §7); fields depend on `event`. */
+export interface ApprovalRecordEvent {
+  event: 'created' | 'decided' | 'change_started' | 'change_finished' | 'finished' | 'cancelled' | 'cancel_requested' | string;
+  at: string;
+  ticketId?: string | null;
+  [field: string]: unknown;
+}
+
+export interface ApprovalRecord {
+  days: number;
+  retention: { maxDays: number; maxMb: number };
+  events: ApprovalRecordEvent[];
+  omitted: number;
+  files: { name: string; status: string }[];
+}
+
 /** The Startup shortcut (`AegisWin Monitor.lnk`), app only. */
 export type AutostartView = { shortcut: string; wanted: boolean | null } & (
   | { state: 'off' }
@@ -266,6 +282,8 @@ export const api = {
   revokeLlmTrust: (pluginId: string) => call<void>('revoke_llm_trust', { pluginId }),
   rewriteRuntime: (pluginId: string) => call<void>('rewrite_runtime', { pluginId }),
   dismissResumeNotice: (pluginId: string) => call<void>('dismiss_resume_notice', { pluginId }),
+  readApprovalRecord: (pin: string, days: number) => call<ApprovalRecord>('read_approval_record', { pin, days }),
+  deleteApprovalRecord: (pin: string) => call<number>('delete_approval_record', { pin }),
   getAutostart: () => call<AutostartView>('get_autostart'),
   enableAutostart: (pin: string, replace: boolean) => call<AutostartView>('enable_autostart', { pin, replace }),
   disableAutostart: () => call<AutostartView>('disable_autostart'),
