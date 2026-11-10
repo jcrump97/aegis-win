@@ -20,6 +20,7 @@ use aegis_core::history_service::HistoryHandle;
 use aegis_core::llm::{LlmHandle, LlmOptions, LlmProgress};
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
+use aegis_core::sync::lock;
 use aegis_core::registry::{CallReview, ExitReason, Launch, LockedContext, Plugin, PluginManifest, ResumeNotice, ToolContext, UnlockContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
@@ -250,6 +251,100 @@ impl Telemetry {
 }
 
 /// Takes what the last tick queued for the history stream.
+/// The first restart of a failed sampler waits this long; each further one
+/// twice as long, up to `LAST_RESTART_AFTER`.
+const FIRST_RESTART_AFTER: Duration = Duration::from_secs(1);
+const LAST_RESTART_AFTER: Duration = Duration::from_secs(60);
+/// A sampler that ran this long before failing starts the backoff over.
+const HEALTHY_RUN: Duration = Duration::from_secs(600);
+
+/// Runs `body` until it returns. When it panics, waits (1 s, then twice as
+/// long each time, up to a minute; `stop` cuts the wait short and ends it),
+/// tells `restarted` when it stopped and why, and runs it again, so one bad
+/// tick never ends monitoring for the rest of the session.
+fn supervise(stop: &AtomicBool, first: Duration, mut body: impl FnMut(), mut restarted: impl FnMut(String, String)) {
+    let mut wait = first;
+    loop {
+        let began = Instant::now();
+        let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut body)) else { return };
+        let since = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let error: String = panic
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown error".into())
+            .chars()
+            .take(200)
+            .collect();
+        if began.elapsed() >= HEALTHY_RUN {
+            wait = first;
+        }
+        let mut waited = Duration::ZERO;
+        while waited < wait && !stop.load(Ordering::Relaxed) {
+            let step = Duration::from_millis(50).min(wait - waited);
+            std::thread::sleep(step);
+            waited += step;
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        restarted(since, error);
+        wait = (wait * 2).min(LAST_RESTART_AFTER);
+    }
+}
+
+/// The sampler's loop: every `SAMPLE_EVERY`, records usage, checks the
+/// monitors and writes what they queued, until `stop` is set.
+fn sample(stop: &AtomicBool, telemetry: &Mutex<Telemetry>) {
+    let mut sys = System::new();
+    refresh(&mut sys);
+    let mut events: Vec<rules::ObservedEvent> = Vec::new();
+    let mut last_poll: Option<Instant> = None;
+    let mut last_heartbeat = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let mut waited = Duration::ZERO;
+        while waited < SAMPLE_EVERY && !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(250));
+            waited += Duration::from_millis(250);
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        refresh(&mut sys);
+        let current = samples(&sys);
+        let fg = foreground_name(&sys);
+        if last_poll.is_none_or(|t| t.elapsed() >= EVENT_POLL_EVERY) {
+            last_poll = Some(Instant::now());
+            let needs = lock(&telemetry).event_needs();
+            events = if needs.is_empty() { Vec::new() } else { poll_events(&needs) };
+        }
+        let local = Local::now();
+        let mut t = lock(&telemetry);
+        if last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
+            last_heartbeat = Instant::now();
+            if t.history.is_some() {
+                t.outbox.push(json!({ "kind": "heartbeat" }));
+            }
+        }
+        t.record(&current, fg.clone(), local.time(), Instant::now());
+        t.evaluate_monitors(&rules::Tick {
+            now: Utc::now(),
+            local_time: local.time(),
+            local_weekday: local.weekday(),
+            processes: &current,
+            system_cpu_percent: f64::from(sys.global_cpu_usage()),
+            system_memory_percent: system_memory_percent(&sys),
+            foreground: fg.as_deref(),
+            events: &events,
+        });
+        let out = take_outbox(&mut t);
+        drop(t);
+        if let Some((history, records)) = out {
+            write_history(&history, records);
+        }
+    }
+}
+
 fn take_outbox(t: &mut Telemetry) -> Option<(HistoryHandle, Vec<Value>)> {
     if t.outbox.is_empty() {
         return None;
@@ -432,11 +527,11 @@ impl Default for UsageMonitorPlugin {
 
 impl UsageMonitorPlugin {
     pub fn is_sampling(&self) -> bool {
-        self.sampler.lock().unwrap().is_some()
+        lock(&self.sampler).is_some()
     }
 
     fn start_sampler(&self) {
-        let mut slot = self.sampler.lock().unwrap();
+        let mut slot = lock(&self.sampler);
         if slot.is_some() {
             return;
         }
@@ -444,7 +539,7 @@ impl UsageMonitorPlugin {
         let telemetry = Arc::clone(&self.telemetry);
         let flag = Arc::clone(&stop);
         let opened = {
-            let mut t = self.telemetry.lock().unwrap();
+            let mut t = lock(&self.telemetry);
             match t.history.clone() {
                 Some(history) if !t.session_open => {
                     t.session_open = true;
@@ -459,62 +554,22 @@ impl UsageMonitorPlugin {
         let thread = std::thread::Builder::new()
             .name("usage-monitor-sampler".into())
             .spawn(move || {
-                let mut sys = System::new();
-                refresh(&mut sys);
-                let mut events: Vec<rules::ObservedEvent> = Vec::new();
-                let mut last_poll: Option<Instant> = None;
-                let mut last_heartbeat = Instant::now();
-                while !flag.load(Ordering::Relaxed) {
-                    let mut waited = Duration::ZERO;
-                    while waited < SAMPLE_EVERY && !flag.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(250));
-                        waited += Duration::from_millis(250);
+                let restarts = Arc::clone(&telemetry);
+                supervise(&flag, FIRST_RESTART_AFTER, || sample(&flag, &telemetry), |since, error| {
+                    let mut t = lock(&restarts);
+                    if t.history.is_some() {
+                        t.outbox.push(json!({ "kind": "sampler_restarted", "since": since, "error": error }));
                     }
-                    if flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    refresh(&mut sys);
-                    let current = samples(&sys);
-                    let fg = foreground_name(&sys);
-                    if last_poll.is_none_or(|t| t.elapsed() >= EVENT_POLL_EVERY) {
-                        last_poll = Some(Instant::now());
-                        let needs = telemetry.lock().unwrap().event_needs();
-                        events = if needs.is_empty() { Vec::new() } else { poll_events(&needs) };
-                    }
-                    let local = Local::now();
-                    let mut t = telemetry.lock().unwrap();
-                    if last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
-                        last_heartbeat = Instant::now();
-                        if t.history.is_some() {
-                            t.outbox.push(json!({ "kind": "heartbeat" }));
-                        }
-                    }
-                    t.record(&current, fg.clone(), local.time(), Instant::now());
-                    t.evaluate_monitors(&rules::Tick {
-                        now: Utc::now(),
-                        local_time: local.time(),
-                        local_weekday: local.weekday(),
-                        processes: &current,
-                        system_cpu_percent: f64::from(sys.global_cpu_usage()),
-                        system_memory_percent: system_memory_percent(&sys),
-                        foreground: fg.as_deref(),
-                        events: &events,
-                    });
-                    let out = take_outbox(&mut t);
-                    drop(t);
-                    if let Some((history, records)) = out {
-                        write_history(&history, records);
-                    }
-                }
+                });
             })
             .expect("can spawn the sampler thread");
-        self.telemetry.lock().unwrap().sampling_since = Some(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        lock(&self.telemetry).sampling_since = Some(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         *slot = Some(Sampler { stop, thread });
     }
 
     /// Stops the sampler thread, if it runs.
     fn join_sampler(&self) {
-        if let Some(sampler) = self.sampler.lock().unwrap().take() {
+        if let Some(sampler) = lock(&self.sampler).take() {
             sampler.stop.store(true, Ordering::Relaxed);
             let _ = sampler.thread.join();
         }
@@ -526,7 +581,7 @@ impl UsageMonitorPlugin {
         self.join_sampler();
         let ends = marker["kind"] == "session_stop";
         let (history, records) = {
-            let mut t = self.telemetry.lock().unwrap();
+            let mut t = lock(&self.telemetry);
             let mut records = std::mem::take(&mut t.outbox);
             if t.session_open {
                 t.session_open = !ends;
@@ -547,9 +602,9 @@ impl UsageMonitorPlugin {
     /// What `on_lock` does, for callers that already hold `book`.
     fn stop_everything(&self) {
         self.chat_generation.fetch_add(1, Ordering::SeqCst);
-        *self.chat.lock().unwrap() = None;
+        *lock(&self.chat) = None;
         self.stop_sampler(timeline::STOP_LOCKED);
-        let mut t = self.telemetry.lock().unwrap();
+        let mut t = lock(&self.telemetry);
         t.clear();
         t.sampling_since = None;
         t.monitors = MonitorRuntime::default();
@@ -560,7 +615,7 @@ impl UsageMonitorPlugin {
     /// the components they need. Nothing running, nothing declared.
     fn sync_runtime(&self) {
         let (history, section) = {
-            let t = self.telemetry.lock().unwrap();
+            let t = lock(&self.telemetry);
             let monitors: Vec<Value> = t.monitors.active.iter().map(|m| json!({ "id": m.id, "rule": m.evaluator.rule() })).collect();
             let section = (!monitors.is_empty()).then(|| json!({ "monitors": monitors, "components": t.components }));
             (t.history.clone(), section)
@@ -571,7 +626,7 @@ impl UsageMonitorPlugin {
     }
 
     fn configure(&self, args: &Value) -> AegisResult<Value> {
-        let mut t = self.telemetry.lock().unwrap();
+        let mut t = lock(&self.telemetry);
         let mut watch = t.watch.clone();
         if let Some(s) = args.get("startTime").and_then(Value::as_str) {
             watch.start_time = s.trim().to_owned();
@@ -608,7 +663,7 @@ impl UsageMonitorPlugin {
                 Err(e) => MonitorRuntime::failed(e),
             },
         };
-        self.telemetry.lock().unwrap().monitors = runtime;
+        lock(&self.telemetry).monitors = runtime;
         self.sync_runtime();
         self.refresh_sampler();
     }
@@ -622,7 +677,7 @@ impl UsageMonitorPlugin {
     /// Starts the sampler when it is wanted and not paused from the tray.
     fn start_sampler_if_needed(&self) {
         let needed = {
-            let t = self.telemetry.lock().unwrap();
+            let t = lock(&self.telemetry);
             !t.paused && Self::sampler_wanted(&t)
         };
         if needed {
@@ -635,7 +690,7 @@ impl UsageMonitorPlugin {
     /// paused or deleted with no sampling component on).
     fn refresh_sampler(&self) {
         let unwanted = {
-            let t = self.telemetry.lock().unwrap();
+            let t = lock(&self.telemetry);
             !t.paused && !Self::sampler_wanted(&t)
         };
         if unwanted {
@@ -653,7 +708,7 @@ impl UsageMonitorPlugin {
         let mut book = MonitorBook::from_store(store.get(monitors::STORE_KEY)?).map_err(AegisError::failed)?;
         let out = change(&mut book).map_err(AegisError::invalid)?;
         store.set(monitors::STORE_KEY, book.to_value())?;
-        self.telemetry.lock().unwrap().monitors = MonitorRuntime::build(&book, &ctx.enabled_components);
+        lock(&self.telemetry).monitors = MonitorRuntime::build(&book, &ctx.enabled_components);
         self.sync_runtime();
         self.refresh_sampler();
         Ok(out)
@@ -675,7 +730,7 @@ impl UsageMonitorPlugin {
     /// How a rule that nothing has started is shown: the generated
     /// description and privacy flags, the replay, and the labelled reasoning.
     async fn review_proposal(&self, rule: &rules::Rule, reasoning: Option<(String, &'static str)>) -> Value {
-        let recent: Vec<RecordedTick> = self.telemetry.lock().unwrap().recent.iter().cloned().collect();
+        let recent: Vec<RecordedTick> = lock(&self.telemetry).recent.iter().cloned().collect();
         let needs = group_needs(rules::event_needs(rule));
         let events = if recent.is_empty() || needs.is_empty() {
             Vec::new()
@@ -702,7 +757,7 @@ impl UsageMonitorPlugin {
     fn chat_start(&self, args: &Value) -> AegisResult<()> {
         let generation = self.chat_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let session = chat::Session::new(generation, args["request"].as_str().unwrap_or_default()).map_err(AegisError::invalid)?;
-        *self.chat.lock().unwrap() = Some(session);
+        *lock(&self.chat) = Some(session);
         Ok(())
     }
 
@@ -711,7 +766,7 @@ impl UsageMonitorPlugin {
         let propose_now = args["proposeNow"].as_bool().unwrap_or(false);
         let share = args.get("shareRunningApps").and_then(Value::as_bool);
         let (generation, awaiting, mention_text) = {
-            let guard = self.chat.lock().unwrap();
+            let guard = lock(&self.chat);
             let s = guard.as_ref().ok_or_else(|| AegisError::invalid("There is no monitor conversation. Start one first."))?;
             (s.generation, s.awaiting, s.mention_text())
         };
@@ -724,7 +779,7 @@ impl UsageMonitorPlugin {
             },
             chat::Awaiting::Answers | chat::Awaiting::Turn => None,
         };
-        let mut guard = self.chat.lock().unwrap();
+        let mut guard = lock(&self.chat);
         let s = guard.as_mut().filter(|s| s.generation == generation).ok_or_else(chat_ended)?;
         match awaiting {
             chat::Awaiting::AppsConsent => s.running_apps = apps,
@@ -742,7 +797,7 @@ impl UsageMonitorPlugin {
     /// against the reply format, the conversation, and the rule language.
     async fn chat_turn(&self, ctx: &ToolContext, propose_now: bool) -> AegisResult<Value> {
         let llm = ctx.llm()?;
-        let session = self.chat.lock().unwrap().clone().ok_or_else(chat_ended)?;
+        let session = lock(&self.chat).clone().ok_or_else(chat_ended)?;
         let must = session.must_conclude(propose_now);
         let mut problem: Option<String> = None;
         let mut sent = Value::Null;
@@ -775,7 +830,7 @@ impl UsageMonitorPlugin {
             Checked::Proposal(rule, bullets) => Some(self.review_proposal(rule, Some((bullets.join("\n"), chat::REASONING_LABEL))).await),
             Checked::Other(_) => None,
         };
-        let mut guard = self.chat.lock().unwrap();
+        let mut guard = lock(&self.chat);
         let s = guard.as_mut().filter(|s| s.generation == generation).ok_or_else(chat_ended)?;
         // Two replies sent at once both run a turn; only the first result counts.
         if s.awaiting != chat::Awaiting::Turn {
@@ -821,7 +876,7 @@ impl UsageMonitorPlugin {
 
     fn list(&self, ctx: &ToolContext) -> AegisResult<Value> {
         let book = MonitorBook::from_store(ctx.store()?.get(monitors::STORE_KEY)?).map_err(AegisError::failed)?;
-        let t = self.telemetry.lock().unwrap();
+        let t = lock(&self.telemetry);
         let hits: Vec<MonitorHit> = t.hits.iter().cloned().collect();
         Ok(json!({
             "monitors": book.monitors.iter().map(|m| monitors::view(m, &t.monitors, &hits)).collect::<Vec<_>>(),
@@ -834,7 +889,7 @@ impl UsageMonitorPlugin {
 
     async fn snapshot(&self, label: String) -> AegisResult<Value> {
         let (watch, components, spikes, foreground, since, hits) = {
-            let t = self.telemetry.lock().unwrap();
+            let t = lock(&self.telemetry);
             (
                 t.watch.clone(),
                 t.components.clone(),
@@ -961,7 +1016,7 @@ impl Plugin for UsageMonitorPlugin {
     }
 
     async fn call(&self, tool: &str, args: Value, ctx: ToolContext) -> AegisResult<Value> {
-        self.telemetry.lock().unwrap().components = ctx.enabled_components.clone();
+        lock(&self.telemetry).components = ctx.enabled_components.clone();
         match tool {
             "configure_watch_window" => self.configure(&args),
             "propose_monitor" => self.propose(&args, &ctx).await,
@@ -978,7 +1033,7 @@ impl Plugin for UsageMonitorPlugin {
             "monitor_chat_progress" => Ok(serde_json::to_value(self.chat_progress.view()).unwrap_or(Value::Null)),
             "monitor_chat_cancel" => {
                 self.chat_generation.fetch_add(1, Ordering::SeqCst);
-                let had = self.chat.lock().unwrap().take().is_some();
+                let had = lock(&self.chat).take().is_some();
                 Ok(json!({ "cancelled": had }))
             }
             "activate_monitor" => self.activate(&args, &ctx),
@@ -1004,7 +1059,7 @@ impl Plugin for UsageMonitorPlugin {
             }
             "purge_telemetry_history" => {
                 let removed = {
-                    let mut t = self.telemetry.lock().unwrap();
+                    let mut t = lock(&self.telemetry);
                     let removed = t.spikes.len() + t.foreground.len() + t.hits.len() + t.recent.len();
                     t.clear();
                     removed
@@ -1028,7 +1083,7 @@ impl Plugin for UsageMonitorPlugin {
     fn on_unlock(&self, ctx: &UnlockContext) {
         let enabled_components = &ctx.enabled_components;
         {
-            let mut t = self.telemetry.lock().unwrap();
+            let mut t = lock(&self.telemetry);
             t.components = enabled_components.clone();
             t.history = ctx.history.clone();
             // A sampler still running from the locked state carries on, now unlocked.
@@ -1043,7 +1098,7 @@ impl Plugin for UsageMonitorPlugin {
     /// (ADR 0002 §6), so a large history does not hold up the unlock.
     fn resume_notice(&self) -> Option<ResumeNotice> {
         let history = {
-            let mut t = self.telemetry.lock().unwrap();
+            let mut t = lock(&self.telemetry);
             if !std::mem::take(&mut t.resumed_at_launch) {
                 return None;
             }
@@ -1056,13 +1111,13 @@ impl Plugin for UsageMonitorPlugin {
     }
 
     fn background_active(&self) -> bool {
-        !self.telemetry.lock().unwrap().monitors.active.is_empty()
+        !lock(&self.telemetry).monitors.active.is_empty()
     }
 
     /// Any saved monitor keeps the Startup shortcut; deleting the last one
     /// removes it (ADR 0002 §6).
     fn saved_background_work(&self) -> Option<bool> {
-        self.telemetry.lock().unwrap().monitors.saved.map(|n| n > 0)
+        lock(&self.telemetry).monitors.saved.map(|n| n > 0)
     }
 
     fn on_lock(&self) {
@@ -1084,9 +1139,9 @@ impl Plugin for UsageMonitorPlugin {
             return false;
         }
         self.chat_generation.fetch_add(1, Ordering::SeqCst);
-        *self.chat.lock().unwrap() = None;
+        *lock(&self.chat) = None;
         {
-            let mut t = self.telemetry.lock().unwrap();
+            let mut t = lock(&self.telemetry);
             t.clear();
             t.history = Some(ctx.history.clone());
             t.locked = true;
@@ -1115,7 +1170,7 @@ impl Plugin for UsageMonitorPlugin {
     fn set_paused(&self, paused: bool) {
         let _serial = self.book.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let mut t = self.telemetry.lock().unwrap();
+            let mut t = lock(&self.telemetry);
             if t.paused == paused {
                 return;
             }
@@ -1126,7 +1181,7 @@ impl Plugin for UsageMonitorPlugin {
             return;
         }
         let history = {
-            let t = self.telemetry.lock().unwrap();
+            let t = lock(&self.telemetry);
             t.session_open.then(|| t.history.clone()).flatten()
         };
         if let Some(history) = history {
@@ -1311,5 +1366,38 @@ mod tests {
         assert_eq!(out[0]["kind"], "crash");
         assert_eq!(out[0]["relatedSpikes"].as_array().unwrap().len(), 1);
         assert_eq!(out[0]["relatedSpikes"][0]["time"], "2026-01-01T12:05:00Z");
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_sampler_is_restarted_with_growing_waits_and_stop_ends_it() {
+        let stop = AtomicBool::new(false);
+        let mut runs = 0;
+        let mut restarts = Vec::new();
+        let began = Instant::now();
+        supervise(
+            &stop,
+            Duration::from_millis(20),
+            || {
+                runs += 1;
+                if runs < 3 {
+                    panic!("tick {runs} broke");
+                }
+            },
+            |since, error| restarts.push((since, error, began.elapsed())),
+        );
+        assert_eq!(runs, 3, "ran again after each failure, and stopped once it returned");
+        assert_eq!(restarts.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["tick 1 broke", "tick 2 broke"]);
+        assert!(restarts[0].2 >= Duration::from_millis(20) && restarts[1].2 >= Duration::from_millis(60), "waits 20 ms, then 40 ms: {restarts:?}");
+        assert!(DateTime::parse_from_rfc3339(&restarts[0].0).is_ok());
+
+        stop.store(true, Ordering::Relaxed);
+        let mut after_stop = 0;
+        supervise(&stop, Duration::from_secs(30), || panic!("broke while stopping"), |_, _| after_stop += 1);
+        assert_eq!(after_stop, 0, "a stopped sampler is not restarted, and its wait is cut short");
     }
 }

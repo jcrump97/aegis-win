@@ -345,6 +345,14 @@ The same results are written into the record as `integrity` events the next time
 - **Recorded too.** The approval record's `created` event keeps the commands shown, for single requests and for each plan step.
 - **The check runs after the turn comes**, with the plugin and component checks, for single requests and before each plan step; a plan stops there with "Step n could not start: The commands changed since you approved them".
 
+**As built (Phase 6, `security/robustness`).** Every Phase 6 item is done:
+- **Locks.** The poison-tolerant helper moved to `aegis_core::sync::lock`; the engine and `usage-monitor` use it, so no `lock().unwrap()` is left in the plugin.
+- **Sampler supervisor.** `supervise` runs the sampler loop under `catch_unwind`: after a panic it waits 1 s, then twice as long each time up to 60 s (back to 1 s after 10 minutes without one), cut short by a stop, and writes `sampler_restarted` with `since` and the panic message (200 characters at most). The timeline shows it as a `restarted` gap from `since` to the restart.
+- **Event-log test** checks record ids going down, not times.
+- **Single instance.** The names add a random 128-bit suffix from `data\instance-id` (created with `create_new`, so two first launches agree; a read-only folder keeps the path-only name), and both objects get `D:P(A;;GA;;;<user SID>)`.
+- **DLL planting.** `os::restrict_dll_search()` (System32 only) runs first in `main`; `build.rs` links the app with `/DEPENDENTLOADFLAG:0x800` (checked in the PE's load config). A debug build still starts WebView2.
+- **esbuild 0.25** needs Vite 6 (Vite 5 pins esbuild 0.21): Vite 6.4 and esbuild 0.25.12; the unused `vitest` was removed. `npm audit` reports nothing.
+
 ## 6. Phased fix plan
 
 Each phase is its own branch, stacked on this one, with a review and isolated CI before every commit. Nothing is pushed without the owner's OK.

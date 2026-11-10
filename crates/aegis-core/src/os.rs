@@ -24,6 +24,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, SW_SHOWNORMAL,
 };
 
+/// Makes later `LoadLibrary` calls without a full path look only in
+/// System32, never in the exe's folder or the current directory, so a DLL
+/// planted next to a portable exe (a Downloads folder, a USB stick) is not
+/// loaded. Call it first thing in `main`. The linker flag
+/// `/DEPENDENTLOADFLAG:0x800` does the same for the exe's own imports.
+pub fn restrict_dll_search() -> io::Result<()> {
+    use windows::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }.map_err(|e| io::Error::other(e.message()))
+}
+
 /// True when this process runs with an elevated (administrator) token.
 pub fn is_elevated() -> bool {
     unsafe {
@@ -248,7 +258,9 @@ pub enum Instance {
 pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) -> io::Result<Instance> {
     let mutex_name = HSTRING::from(format!(r"Local\AegisWin-{key}-instance"));
     let event_name = HSTRING::from(format!(r"Local\AegisWin-{key}-show"));
-    let mutex = match unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) } {
+    // Only this user may open either object (ADR 0004 Phase 6).
+    let only_user = Attributes::from_sddl(&user_only_sddl()?)?;
+    let mutex = match unsafe { CreateMutexW(Some(&only_user.attributes), false, PCWSTR(mutex_name.as_ptr())) } {
         Ok(handle) => handle,
         // Created by an elevated copy: this copy may not even open it.
         Err(e) if e.code() == E_ACCESSDENIED => return Ok(Instance::AlreadyRunning),
@@ -264,7 +276,7 @@ pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) 
     }
     let guard = SingleInstance { mutex: mutex.0 as isize };
     // Auto-reset: one wake-up per second launch. The handle lives as long as the process.
-    let event = unsafe { CreateEventW(None, false, false, PCWSTR(event_name.as_ptr())) }.map_err(|e| io::Error::other(e.message()))?.0 as isize;
+    let event = unsafe { CreateEventW(Some(&only_user.attributes), false, false, PCWSTR(event_name.as_ptr())) }.map_err(|e| io::Error::other(e.message()))?.0 as isize;
     std::thread::Builder::new().name("aegis-single-instance".into()).spawn(move || loop {
         if unsafe { WaitForSingleObject(HANDLE(event as *mut _), INFINITE) } != WAIT_OBJECT_0 {
             return;
@@ -356,7 +368,88 @@ pub fn dpapi_unprotect(blob: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
 /// A short, stable name for an install: FNV-1a of its folder, case-insensitive.
 pub fn install_key(dir: &std::path::Path) -> String {
     let hash = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-    format!("{hash:016x}")
+    match instance_suffix(dir) {
+        Some(suffix) => format!("{hash:016x}-{suffix}"),
+        None => format!("{hash:016x}"),
+    }
+}
+
+/// The file in the data folder that holds this install's random suffix.
+pub const INSTANCE_ID_FILE: &str = "instance-id";
+
+/// 16 random bytes, hex, kept in `dir\instance-id` (made at the first
+/// launch), so other programs cannot guess the single-instance names and
+/// take them first. `None` when the folder cannot be written (a read-only
+/// copy), which leaves the path-only name.
+fn instance_suffix(dir: &std::path::Path) -> Option<String> {
+    let path = dir.join(INSTANCE_ID_FILE);
+    let valid = |s: &str| (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase());
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        return valid(existing.trim());
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let suffix = hex::encode(bytes);
+    std::fs::create_dir_all(dir).ok()?;
+    // `create_new`: when two copies start at once, the second one reads the first one's.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(suffix.as_bytes()).ok()?;
+            Some(suffix)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => valid(std::fs::read_to_string(&path).ok()?.trim()),
+        Err(_) => None,
+    }
+}
+
+/// An SDDL security descriptor that lets only this process's user open an
+/// object: `D:P(A;;GA;;;<user SID>)`, protected so nothing is inherited.
+pub fn user_only_sddl() -> io::Result<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{TokenUser, TOKEN_USER};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|e| io::Error::other(e.message()))?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buffer = vec![0u64; (len as usize).div_ceil(8)];
+        let got = GetTokenInformation(token, TokenUser, Some(buffer.as_mut_ptr().cast()), len, &mut len);
+        let _ = CloseHandle(token);
+        got.map_err(|e| io::Error::other(e.message()))?;
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut sid = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut sid).map_err(|e| io::Error::other(e.message()))?;
+        let text = sid.to_string();
+        let _ = LocalFree(Some(HLOCAL(sid.0.cast())));
+        Ok(format!("D:P(A;;GA;;;{})", text.map_err(|e| io::Error::other(e.to_string()))?))
+    }
+}
+
+/// `SECURITY_ATTRIBUTES` built from an SDDL string; frees the descriptor on drop.
+struct Attributes {
+    attributes: windows::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+impl Attributes {
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
+        use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+        use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+        let text = HSTRING::from(sddl);
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(text.as_ptr()), SDDL_REVISION_1, &mut descriptor, None) }
+            .map_err(|e| io::Error::other(e.message()))?;
+        Ok(Self { attributes: SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor.0, bInheritHandle: false.into() } })
+    }
+}
+
+impl Drop for Attributes {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.attributes.lpSecurityDescriptor))) };
+    }
 }
 
 /// The private IPv4 address this PC uses to reach other networks, if any.
@@ -734,8 +827,10 @@ pub mod eventlog {
                 assert!(e.time_created.ends_with('Z'), "{}", e.time_created);
                 assert!(!e.provider.is_empty());
             }
-            // Newest first.
-            assert!(events.windows(2).all(|w| w[0].time_created >= w[1].time_created));
+            // Newest first, in the order Windows wrote them: record ids go
+            // down. Times need not, since a provider can stamp an event with
+            // a time earlier than one written before it.
+            assert!(events.windows(2).all(|w| w[0].record_id > w[1].record_id), "{:?}", events.iter().map(|e| e.record_id).collect::<Vec<_>>());
         }
 
         #[test]
@@ -770,10 +865,12 @@ mod tests {
 
     #[test]
     fn a_second_copy_of_an_install_wakes_the_first_and_steps_aside() {
-        let dir = |s: &str| install_key(std::path::Path::new(s));
-        let key = format!("test-{}-{}", std::process::id(), dir(r"C:\Some\Dir"));
-        assert_eq!(dir(r"C:\Some\Dir"), dir(r"c:\some\dir"));
-        assert_ne!(dir(r"C:\Some\Dir"), dir(r"D:\Some\Dir"));
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let upper = data.to_string_lossy().to_uppercase();
+        assert_eq!(install_key(&data), install_key(std::path::Path::new(&upper)), "the same folder, however it is spelled");
+        assert_ne!(install_key(&data), install_key(&temp.path().join("other")));
+        let key = format!("test-{}-{}", std::process::id(), install_key(&data));
         let (tx, rx) = std::sync::mpsc::channel();
         let Instance::First(guard) = single_instance(&key, move || tx.send(()).unwrap()).unwrap() else { panic!("first copy") };
         assert!(matches!(single_instance(&key, || {}).unwrap(), Instance::AlreadyRunning));
@@ -783,6 +880,28 @@ mod tests {
         // Once the first copy lets go (elevated restart), a new copy can start.
         drop(guard);
         assert!(matches!(single_instance(&key, || {}).unwrap(), Instance::First(_)));
+    }
+
+    #[test]
+    fn the_instance_names_carry_a_random_suffix_kept_in_the_data_folder() {
+        let a = tempfile::tempdir().unwrap();
+        let data = a.path().join("data");
+        let key = install_key(&data);
+        let (path_part, suffix) = key.split_once('-').expect("a suffix");
+        assert_eq!((path_part.len(), suffix.len()), (16, 32), "{key}");
+        assert_eq!(std::fs::read_to_string(data.join(INSTANCE_ID_FILE)).unwrap(), suffix);
+        assert_eq!(install_key(&data), key, "stable across launches");
+        let b = tempfile::tempdir().unwrap();
+        assert_ne!(install_key(b.path()).split_once('-').unwrap().1, suffix, "each install has its own");
+        std::fs::write(data.join(INSTANCE_ID_FILE), "not hex").unwrap();
+        assert_eq!(install_key(&data), path_part, "a damaged file falls back to the path-only name");
+    }
+
+    #[test]
+    fn the_instance_objects_are_for_this_user_only() {
+        let sddl = user_only_sddl().unwrap();
+        assert!(sddl.starts_with("D:P(A;;GA;;;S-1-5-") && sddl.ends_with(')'), "{sddl}");
+        assert!(Attributes::from_sddl(&sddl).is_ok());
     }
 
     #[test]

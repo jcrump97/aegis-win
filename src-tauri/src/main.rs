@@ -500,6 +500,8 @@ async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim:
 }
 
 fn main() {
+    // Before anything loads a DLL: System32 only (ADR 0004 Phase 6).
+    let _ = os::restrict_dll_search();
     // One copy per install: a second launch shows the running one and exits.
     let claim = match claim_instance() {
         Ok(Instance::First(guard)) => Some(guard),

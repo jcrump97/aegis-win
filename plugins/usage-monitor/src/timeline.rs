@@ -39,6 +39,8 @@ pub enum GapKind {
     Unexpected,
     /// `paused` until `resumed` (or until now).
     Paused,
+    /// The sampler failed and was restarted (`sampler_restarted`).
+    Restarted,
 }
 
 impl GapKind {
@@ -48,7 +50,7 @@ impl GapKind {
             Self::Sleep => &[("Kernel-Power", 42), ("Kernel-Power", 107)],
             Self::Stopped => &[("User32", 1074)],
             Self::Unexpected => &[("Kernel-Power", 41), ("EventLog", 6008)],
-            Self::Paused => &[],
+            Self::Paused | Self::Restarted => &[],
         }
     }
 }
@@ -140,6 +142,10 @@ pub fn gaps(records: &[(DateTime<Utc>, &Value)]) -> Vec<Gap> {
                         stopped = Some((t, reason));
                     }
                     "paused" if paused.is_none() => paused = Some(t),
+                    "sampler_restarted" => {
+                        let since = record.get("since").and_then(Value::as_str).and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map_or(t, |s| s.with_timezone(&Utc));
+                        out.push(gap(GapKind::Restarted, since.min(t), Some(t), "Not monitoring: monitoring failed and was restarted.".into()));
+                    }
                     "resumed" => {
                         if let Some(p) = paused.take() {
                             out.push(gap(GapKind::Paused, p, Some(t), "Paused by you.".into()));
@@ -294,6 +300,18 @@ mod tests {
 
         let crashed = [rec(8, 0, "session_start"), rec(8, 1, "heartbeat"), rec(9, 0, "session_start")];
         assert_eq!(gap_before_last_start(&ordered(&crashed)).unwrap().kind, GapKind::Unexpected);
+    }
+
+    #[test]
+    fn a_restarted_sampler_leaves_a_gap_from_its_failure() {
+        let mut restarted = rec(10, 3, "sampler_restarted");
+        restarted["since"] = json!(t(10, 2).to_rfc3339());
+        let records = [rec(10, 0, "session_start"), rec(10, 1, "heartbeat"), restarted, rec(10, 4, "heartbeat")];
+        let gaps = gaps(&ordered(&records));
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(matches!(gaps[0].kind, GapKind::Restarted));
+        assert_eq!((gaps[0].from.as_str(), gaps[0].to.as_deref()), (stamp(t(10, 2)).as_str(), Some(stamp(t(10, 3)).as_str())));
+        assert!(gaps[0].label.contains("restarted"));
     }
 
     #[test]

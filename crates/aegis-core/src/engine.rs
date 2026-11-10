@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ use crate::registry::{self, CommandLine, ExitReason, Gate, GatePolicy, Launch, L
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
+use crate::sync::lock;
 use crate::tls::{self, Choice, TlsMaterial};
 use crate::tickets::{NewTicket, PlanMeta, PlanStep, StepStatus, TicketStatus, TicketStore, TicketView, STRIKES_PER_TICKET};
 use crate::vault::{self, KdfParams, NewKey, PinGuard, UnlockedVault, VaultError};
@@ -312,9 +313,6 @@ impl Prepared {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 fn vault_err(e: VaultError) -> AegisError {
     match e {

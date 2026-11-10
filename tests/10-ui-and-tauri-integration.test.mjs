@@ -100,8 +100,9 @@ test('UI: the monitor screen starts monitors only through the PIN-gated tool, an
 });
 
 test('Lifecycle: one copy per install, close-to-tray only while monitors run, and the UI notices a lock', () => {
-  // The single-instance claim comes before anything else starts.
-  assert.match(mainRs, /fn main\(\) \{\s*\/\/[^\n]*\n\s*let claim = match claim_instance\(\) \{[\s\S]*?Ok\(Instance::AlreadyRunning\) => return,/);
+  // DLL search is restricted first (ADR 0004 Phase 6); the single-instance claim comes before anything else starts.
+  assert.match(mainRs, /fn main\(\) \{\s*\/\/[^\n]*\n\s*let _ = os::restrict_dll_search\(\);\s*\/\/[^\n]*\n\s*let claim = match claim_instance\(\) \{[\s\S]*?Ok\(Instance::AlreadyRunning\) => return,/);
+  assert.match(fs.readFileSync('src-tauri/build.rs', 'utf8'), /rustc-link-arg-bins=\/DEPENDENTLOADFLAG:0x800/);
   // Closing hides the window only when a plugin is working in the background.
   assert.match(mainRs, /CloseRequested \{ api, \.\. \} = event \{\s*if window\.state::<Arc<Engine>>\(\)\.background_active\(\) \{\s*api\.prevent_close\(\);/);
   // The elevated restart releases the claim so the elevated copy can start.

@@ -20,6 +20,7 @@ pub mod registry;
 pub mod schema;
 pub mod secret;
 pub mod state;
+pub mod sync;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 pub mod tickets;
