@@ -345,6 +345,16 @@ impl TicketStore {
         self.tickets.values().filter(|t| t.plan.is_some() && t.status == TicketStatus::PendingApproval).count()
     }
 
+    /// Requests from agents still waiting for the owner (the owner's own
+    /// plans are not counted).
+    pub fn pending_from_agents(&mut self, now: Instant) -> usize {
+        self.expire(now);
+        self.tickets
+            .values()
+            .filter(|t| t.status == TicketStatus::PendingApproval && t.plan.as_ref().is_none_or(|p| p.origin == crate::plan::PlanOrigin::Agent))
+            .count()
+    }
+
     pub fn clear(&mut self) {
         self.tickets.clear();
     }

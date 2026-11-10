@@ -79,7 +79,14 @@ pub struct Engine {
     device_misses: Mutex<VecDeque<Instant>>,
     /// Device approval was turned off by too many wrong codes.
     device_tripped: AtomicBool,
+    /// When agents last asked for approval, newest last (ADR 0004 §1.3).
+    agent_requests: Mutex<VecDeque<Instant>>,
 }
+
+/// Agent requests that may wait for the owner at once (plans included).
+pub const MAX_AGENT_PENDING: usize = 10;
+/// Agent requests for approval allowed per hour, refused ones included.
+pub const AGENT_REQUESTS_PER_HOUR: usize = 30;
 
 /// Wrong device codes allowed in an hour before device approval turns off.
 pub const DEVICE_MISSES_PER_HOUR: usize = 10;
@@ -313,6 +320,7 @@ impl Engine {
             device_approval: AtomicBool::new(false),
             device_misses: Mutex::new(VecDeque::new()),
             device_tripped: AtomicBool::new(false),
+            agent_requests: Mutex::new(VecDeque::new()),
             data_dir,
             registry,
             vault: Mutex::new(None),
@@ -1473,8 +1481,13 @@ impl Engine {
                     self.run_in_turn(epoch, prepared, "app (PIN)").await
                 }
                 Origin::Mcp => {
+                    self.count_agent_request()?;
                     let review = prepared.plugin.review_call(&prepared.tool.id, &prepared.args, &prepared.ctx.enabled_components);
-                    let ticket = lock(&self.tickets).create(
+                    let mut store = lock(&self.tickets);
+                    if store.pending_from_agents(Instant::now()) >= MAX_AGENT_PENDING {
+                        return Err(too_many_pending());
+                    }
+                    let ticket = store.create(
                         NewTicket {
                             plugin_id: plugin_id.to_owned(),
                             tool_id: prepared.tool.id.clone(),
@@ -1488,6 +1501,7 @@ impl Engine {
                         },
                         Instant::now(),
                     );
+                    drop(store);
                     self.record_created(&ticket, "mcp");
                     Ok(RunOutcome::PendingApproval { ticket: Box::new(ticket) })
                 }
@@ -1804,7 +1818,11 @@ impl Engine {
             Some(place) => match self.executor.turn(place, Instant::now() + QUEUE_TIMEOUT).await {
                 Ok(turn) => Some(turn),
                 Err(stop) => {
-                    let status = if stop == Stop::Expired { TicketStatus::Expired } else { failed };
+                    let status = match stop {
+                        Stop::Expired => TicketStatus::Expired,
+                        Stop::Cancelled => TicketStatus::Cancelled,
+                        Stop::Locked => failed,
+                    };
                     return finish(Err(stop_error(stop)), status);
                 }
             },
@@ -1956,6 +1974,9 @@ impl Engine {
     /// in, and dry-run now, so the review shows the exact commands. Nothing
     /// runs until the owner approves with the PIN.
     pub async fn propose_plan(&self, origin: PlanOrigin, request: Value) -> AegisResult<TicketView> {
+        if origin == PlanOrigin::Agent {
+            self.count_agent_request()?;
+        }
         let request = PlanRequest::parse(request).map_err(AegisError::invalid)?;
         let at = |n: usize, e: AegisError| AegisError { message: format!("Step {n}: {}", e.message), ..e };
         let unknown = |n: usize, name: &str| AegisError::new(ErrorCode::UnknownTool, format!("Step {n}: unknown tool {name}"));
@@ -2041,6 +2062,9 @@ impl Engine {
         let mut store = lock(&self.tickets);
         if store.pending_plans(Instant::now()) >= MAX_PENDING_PLANS {
             return Err(too_many_plans());
+        }
+        if origin == PlanOrigin::Agent && store.pending_from_agents(Instant::now()) >= MAX_AGENT_PENDING {
+            return Err(too_many_pending());
         }
         let view = store.create(
             NewTicket {
@@ -2131,6 +2155,28 @@ impl Engine {
         let expires_at = chrono::Utc::now() + chrono::Duration::from_std(expires.saturating_duration_since(now)).unwrap_or_default();
         let qr = crate::qr::encode(&url).ok_or_else(|| AegisError::failed("The QR code could not be drawn."))?;
         Ok(DeviceCodeView { code, expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), url, qr })
+    }
+
+    /// Counts an agent's request for approval, refusing it past the hourly
+    /// limit. Refused requests count too, so a flood stays refused.
+    fn count_agent_request(&self) -> AegisResult<()> {
+        let now = Instant::now();
+        let mut log = lock(&self.agent_requests);
+        while log.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(3600)) {
+            log.pop_front();
+        }
+        log.push_back(now);
+        // Only whether the limit is passed matters, so the newest few are enough.
+        while log.len() > AGENT_REQUESTS_PER_HOUR + 1 {
+            log.pop_front();
+        }
+        if log.len() > AGENT_REQUESTS_PER_HOUR {
+            return Err(AegisError::new(
+                ErrorCode::Conflict,
+                format!("More than {AGENT_REQUESTS_PER_HOUR} approval requests in the last hour, so this one was refused. Wait, and ask only for what the owner needs."),
+            ));
+        }
+        Ok(())
     }
 
     /// Notes a wrong device code. Too many in an hour turn the feature off.
@@ -2239,7 +2285,12 @@ fn stop_error(stop: Stop) -> AegisError {
     match stop {
         Stop::Locked => AegisError::new(ErrorCode::VaultLocked, "AegisWin locked before this change could start, so it was cancelled."),
         Stop::Expired => AegisError::new(ErrorCode::ExecutionFailed, "This change waited more than 30 minutes behind others, so it was cancelled. Ask again if it is still needed."),
+        Stop::Cancelled => AegisError::new(ErrorCode::Conflict, "This change was cancelled before it started."),
     }
+}
+
+fn too_many_pending() -> AegisError {
+    AegisError::new(ErrorCode::Conflict, format!("{MAX_AGENT_PENDING} requests are already waiting for the owner. Wait for those to be decided or to expire."))
 }
 
 fn too_many_plans() -> AegisError {

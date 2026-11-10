@@ -105,6 +105,8 @@ Rules for the code:
 - **The link is per ticket, not a list.** The app's code, link and QR code point at `/approve/{ticketId}`, so the device page never lists requests to whoever can reach the port. The ticket ID is 128 bits; the code is still what approves.
 - **The setting lives in memory only.** It is off at every start and turned off at every lock, which meets "never turns on by itself" and "a restored backup starts off" without a stored flag.
 
+§1.3 is done on `security/request-limits`, with `Stop::Cancelled`: a place given up while it waited is told apart from a lock by the executor's epoch.
+
 ### 1.3 Limits on how many requests agents can make
 
 Today there is one MCP bearer token per install. The limits apply per token, so they still work if more tokens are added later.

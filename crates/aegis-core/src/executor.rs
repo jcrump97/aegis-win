@@ -24,6 +24,8 @@ pub enum Stop {
     Locked,
     /// It waited longer than [`QUEUE_TIMEOUT`].
     Expired,
+    /// Its place was given up (the request was cancelled while it waited).
+    Cancelled,
 }
 
 /// What the app shows in its "change in progress" bar.
@@ -59,7 +61,7 @@ pub struct Executor {
 
 /// A place in the queue. Wait for it with [`Executor::turn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Place(u64);
+pub struct Place(u64, u64);
 
 /// Holding this is holding the slot; dropping it lets the next item start.
 pub struct Turn<'a> {
@@ -106,7 +108,7 @@ impl Executor {
         inner.next_id += 1;
         let id = inner.next_id;
         inner.queue.push_back(Waiting { id, label: label.to_owned(), ticket: ticket.map(str::to_owned) });
-        Ok(Place(id))
+        Ok(Place(id, epoch))
     }
 
     /// Waits until `place` is at the front, nothing is running, and no
@@ -129,7 +131,8 @@ impl Executor {
             {
                 let mut inner = self.lock();
                 let Some(index) = inner.queue.iter().position(|w| w.id == place.0) else {
-                    return Err(Stop::Locked);
+                    // A lock moves the epoch on; otherwise the place was withdrawn.
+                    return Err(if inner.epoch == place.1 { Stop::Cancelled } else { Stop::Locked });
                 };
                 if index == 0 && inner.running.is_none() && !inner.hold {
                     let label = inner.queue.pop_front().map(|w| w.label).unwrap_or_default();
@@ -169,7 +172,9 @@ impl Executor {
 
     /// Gives up the place of an approval ticket, if it is waiting.
     pub fn withdraw_ticket(&self, ticket: &str) {
-        let place = self.lock().queue.iter().find(|w| w.ticket.as_deref() == Some(ticket)).map(|w| Place(w.id));
+        let inner = self.lock();
+        let place = inner.queue.iter().find(|w| w.ticket.as_deref() == Some(ticket)).map(|w| Place(w.id, inner.epoch));
+        drop(inner);
         if let Some(place) = place {
             self.withdraw(place);
         }
@@ -345,6 +350,22 @@ mod tests {
         assert_eq!(ex.turn(b, Instant::now() + Duration::from_millis(30)).await.err(), Some(Stop::Expired));
         assert_eq!(ex.position("t"), None);
         assert_eq!(ex.view().queued, 0);
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_place_is_cancelled_not_locked() {
+        let ex = Arc::new(Executor::default());
+        let e = ex.epoch();
+        let a = ex.enqueue(e, "a", None).unwrap();
+        let b = ex.enqueue(e, "b", Some("t")).unwrap();
+        let _turn_a = ex.turn(a, later()).await.unwrap();
+        let waiting = {
+            let ex = ex.clone();
+            tokio::spawn(async move { ex.turn(b, later()).await.err() })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ex.withdraw_ticket("t");
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap(), Some(Stop::Cancelled));
     }
 
     #[tokio::test]

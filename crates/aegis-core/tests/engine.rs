@@ -323,3 +323,35 @@ async fn idle_auto_lock_counts_only_the_owner() {
     assert!(!f.engine.status().unlocked);
     assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(60)).await, "already locked");
 }
+
+#[tokio::test]
+async fn agents_can_keep_only_ten_requests_waiting_and_thirty_an_hour() {
+    use aegis_core::engine::{AGENT_REQUESTS_PER_HOUR, MAX_AGENT_PENDING};
+    let f = ready().await;
+    let ask = || f.engine.run_tool(Origin::Mcp, "demo", "fix", json!({ "note": "x" }));
+    let mut ids = Vec::new();
+    for _ in 0..MAX_AGENT_PENDING {
+        let RunOutcome::PendingApproval { ticket } = ask().await.unwrap() else { panic!() };
+        ids.push(ticket.ticket_id);
+    }
+    let err = ask().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(err.message.contains("already waiting for the owner"), "{}", err.message);
+    // The owner's own plans are not agent requests.
+    let own = f.engine.propose_plan(aegis_core::plan::PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "mine" } }] })).await;
+    assert!(own.is_ok(), "{own:?}");
+
+    // Withdrawn requests free their place, but every request counts toward the hour.
+    for id in &ids {
+        f.engine.cancel_ticket(id).unwrap();
+    }
+    let used = MAX_AGENT_PENDING + 1;
+    for _ in used..AGENT_REQUESTS_PER_HOUR {
+        let RunOutcome::PendingApproval { ticket } = ask().await.unwrap() else { panic!() };
+        f.engine.cancel_ticket(&ticket.ticket_id).unwrap();
+    }
+    let err = ask().await.unwrap_err();
+    assert!(err.message.contains("in the last hour"), "{}", err.message);
+    let plan = f.engine.propose_plan(aegis_core::plan::PlanOrigin::Agent, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "p" } }] })).await.unwrap_err();
+    assert!(plan.message.contains("in the last hour"), "plans count too: {}", plan.message);
+}
