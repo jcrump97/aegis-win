@@ -17,6 +17,16 @@ use crate::secret::Secret;
 
 const MAX_PROMPT_CHARS: usize = 48_000;
 
+/// The context window assumed until the owner changes it. Ollama's own
+/// default (2048-4096) is too small for the monitor creator.
+pub const DEFAULT_CONTEXT_TOKENS: u32 = 8192;
+pub const MIN_CONTEXT_TOKENS: u32 = 2048;
+pub const MAX_CONTEXT_TOKENS: u32 = 131_072;
+
+fn default_context_tokens() -> u32 {
+    DEFAULT_CONTEXT_TOKENS
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmConfig {
@@ -24,12 +34,16 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<Secret>,
+    /// How many tokens the model reads at once. AegisWin sets it on Ollama and
+    /// keeps every request inside it.
+    #[serde(default = "default_context_tokens")]
+    pub context_tokens: u32,
 }
 
 impl Default for LlmConfig {
     fn default() -> Self {
         // Ollama's OpenAI-compatible endpoint.
-        Self { base_url: "http://127.0.0.1:11434/v1".into(), model: "llama3.2:latest".into(), api_key: None }
+        Self { base_url: "http://127.0.0.1:11434/v1".into(), model: "llama3.2:latest".into(), api_key: None, context_tokens: DEFAULT_CONTEXT_TOKENS }
     }
 }
 
@@ -209,6 +223,8 @@ pub struct LlmAnswer {
     pub endpoint_host: String,
     pub off_lan: bool,
     pub scrubbed: bool,
+    /// Prompt tokens as the server counted them, when it says.
+    pub prompt_tokens: Option<u64>,
 }
 
 /// The only way a plugin reaches an LLM. Bound to one plugin per call.
@@ -266,7 +282,7 @@ impl LlmHandle {
         self.complete_with(system_prompt, payload, LlmOptions::default()).await
     }
 
-    /// Like [`complete`](Self::complete), with a cap on the reply length.
+    /// Like [`complete`](Self::complete), with per-call options.
     pub async fn complete_with(&self, system_prompt: &str, mut payload: Value, options: LlmOptions) -> AegisResult<LlmAnswer> {
         let endpoint = self.preflight()?;
         let off_lan = !endpoint.stays_on_lan();
@@ -274,45 +290,57 @@ impl LlmHandle {
             scrub_value(&mut payload, crate::os::username().as_deref(), crate::os::hostname().as_deref());
         }
         // Compact JSON: indentation costs tokens a small local model can't spare.
-        let mut user = match payload {
+        let user = match payload {
             Value::String(s) => s,
             other => serde_json::to_string(&other).unwrap_or_default(),
         };
-        if user.chars().count() > MAX_PROMPT_CHARS {
-            user = user.chars().take(MAX_PROMPT_CHARS).collect::<String>() + "\n…(truncated)";
-        }
-        let body = json!({
-            "model": self.config.model,
-            "temperature": 0.2,
-            "max_tokens": options.max_tokens,
-            "stream": false,
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user },
-            ],
-        });
-        let mut request = self.client.post(api_url(&self.config.base_url, "chat/completions")).json(&body);
-        if let Some(key) = self.config.api_key.as_ref().filter(|k| !k.is_empty()) {
-            request = request.bearer_auth(key.expose());
-        }
-        let response = request.send().await.map_err(|e| llm_failed(&endpoint, &e.to_string()))?;
-        let status = response.status();
-        let raw = response.text().await.map_err(|e| llm_failed(&endpoint, &format!("HTTP {status}: {e}")))?;
-        let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-        if !status.is_success() {
-            let detail = value
-                .pointer("/error/message")
-                .or_else(|| value.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("request rejected");
-            return Err(self.rejected(&endpoint, status, detail));
-        }
-        let text = value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| llm_failed(&endpoint, "response has no choices[0].message.content"))?;
-        let cut_off = value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length");
-        let text = strip_thinking(text).filter(|_| !cut_off).ok_or_else(|| {
+        let user = self.fit(system_prompt, user, options)?;
+        let ollama = match ollama_root(&self.config.base_url).filter(|_| endpoint.is_lan) {
+            Some(root) if is_ollama(&self.client, &root).await => Some(root),
+            _ => None,
+        };
+        let messages = json!([
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user },
+        ]);
+        let reply = match &ollama {
+            // Ollama's OpenAI endpoint ignores the context size, so a long
+            // prompt would be cut silently. Its own API takes it.
+            Some(root) => {
+                let mut body = json!({
+                    "model": self.config.model,
+                    "stream": false,
+                    "messages": messages,
+                    "options": { "temperature": 0.2, "num_ctx": self.config.context_tokens, "num_predict": options.max_tokens },
+                });
+                if options.json {
+                    body["format"] = json!("json");
+                }
+                let value = self.post(&endpoint, format!("{root}/api/chat"), &body).await?;
+                Reply {
+                    text: value.pointer("/message/content").and_then(Value::as_str).map(str::to_owned),
+                    cut_off: value.get("done_reason").and_then(Value::as_str) == Some("length"),
+                    prompt_tokens: value.get("prompt_eval_count").and_then(Value::as_u64),
+                }
+            }
+            None => {
+                let body = json!({
+                    "model": self.config.model,
+                    "temperature": 0.2,
+                    "max_tokens": options.max_tokens,
+                    "stream": false,
+                    "messages": messages,
+                });
+                let value = self.post(&endpoint, api_url(&self.config.base_url, "chat/completions"), &body).await?;
+                Reply {
+                    text: value.pointer("/choices/0/message/content").and_then(Value::as_str).map(str::to_owned),
+                    cut_off: value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length"),
+                    prompt_tokens: value.pointer("/usage/prompt_tokens").and_then(Value::as_u64),
+                }
+            }
+        };
+        let text = reply.text.ok_or_else(|| llm_failed(&endpoint, "the response has no answer text"))?;
+        let text = strip_thinking(&text).filter(|_| !reply.cut_off).ok_or_else(|| {
             llm_failed(
                 &endpoint,
                 &format!(
@@ -321,14 +349,146 @@ impl LlmHandle {
                 ),
             )
         })?;
+        // A prompt that filled the whole window was most likely cut at the
+        // start, which is where the instructions are.
+        if options.must_fit && reply.prompt_tokens.is_some_and(|n| n + 16 >= u64::from(self.config.context_tokens)) {
+            return Err(llm_failed(
+                &endpoint,
+                &format!(
+                    "the prompt filled the model's whole {}-token context window, so the model probably did not see all of it. Raise Context window on the LLM tab, or start a new conversation.",
+                    self.config.context_tokens
+                ),
+            ));
+        }
         Ok(LlmAnswer {
             text,
             model: self.config.model.clone(),
             endpoint_host: endpoint.host,
             off_lan,
             scrubbed: off_lan,
+            prompt_tokens: reply.prompt_tokens,
         })
     }
+
+    /// Keeps the request inside the context window: the system prompt, the
+    /// user message and room for the answer, with a 10% margin. Shortens the
+    /// user message, or refuses when it must be sent whole.
+    fn fit(&self, system_prompt: &str, user: String, options: LlmOptions) -> AegisResult<String> {
+        let context = self.config.context_tokens;
+        let usable = u64::from(context) * 9 / 10;
+        let fixed = estimate_tokens(system_prompt) + u64::from(options.max_tokens);
+        let room = usable.saturating_sub(fixed);
+        let needed = estimate_tokens(&user);
+        if needed <= room && user.chars().count() <= MAX_PROMPT_CHARS {
+            return Ok(user);
+        }
+        if options.must_fit || room < 256 {
+            return Err(AegisError::new(
+                ErrorCode::LlmFailed,
+                format!(
+                    "This request needs about {} tokens, more than the {context}-token context window set on the LLM tab. Raise it there if your model supports more, or start a new conversation.",
+                    needed + fixed
+                ),
+            ));
+        }
+        let keep = usize::try_from(room * CHARS_PER_TOKEN).unwrap_or(usize::MAX).min(MAX_PROMPT_CHARS);
+        Ok(user.chars().take(keep).collect::<String>() + "\n…(truncated)")
+    }
+
+    async fn post(&self, endpoint: &Endpoint, url: String, body: &Value) -> AegisResult<Value> {
+        let mut request = self.client.post(url).json(body);
+        if let Some(key) = self.config.api_key.as_ref().filter(|k| !k.is_empty()) {
+            request = request.bearer_auth(key.expose());
+        }
+        let response = request.send().await.map_err(|e| llm_failed(endpoint, &e.to_string()))?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|e| llm_failed(endpoint, &format!("HTTP {status}: {e}")))?;
+        let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        if !status.is_success() {
+            let detail = value
+                .pointer("/error/message")
+                .or_else(|| value.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("request rejected");
+            return Err(self.rejected(endpoint, status, detail));
+        }
+        Ok(value)
+    }
+}
+
+struct Reply {
+    text: Option<String>,
+    cut_off: bool,
+    prompt_tokens: Option<u64>,
+}
+
+/// A deliberately low estimate of characters per token, so requests err on
+/// the side of fitting: English runs about 4, JSON and names nearer 3.
+const CHARS_PER_TOKEN: u64 = 3;
+
+fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(CHARS_PER_TOKEN)
+}
+
+/// Ollama's server root for a base URL ending in `/v1`.
+fn ollama_root(base_url: &str) -> Option<String> {
+    base_url.trim().trim_end_matches('/').strip_suffix("/v1").map(str::to_owned)
+}
+
+/// Whether the server is Ollama (`GET /api/version`). Sends no prompt data.
+async fn is_ollama(client: &reqwest::Client, root: &str) -> bool {
+    let Ok(response) = client.get(format!("{root}/api/version")).timeout(Duration::from_secs(5)).send().await else {
+        return false;
+    };
+    response.status().is_success() && response.json::<Value>().await.is_ok_and(|v| v.get("version").is_some_and(Value::is_string))
+}
+
+/// What Test connection learns beyond the model list.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    pub ollama: bool,
+    /// The model's largest context window, when the server says (Ollama).
+    pub model_context_limit: Option<u32>,
+    /// Advice about the context window setting.
+    pub warnings: Vec<String>,
+}
+
+/// Checks the context window setting against the server. Sends only the
+/// model name, and only to a LAN endpoint.
+pub async fn server_info(client: &reqwest::Client, config: &LlmConfig) -> ServerInfo {
+    let mut info = ServerInfo::default();
+    let lan = classify_endpoint(&config.base_url).is_ok_and(|e| e.is_lan);
+    if let Some(root) = ollama_root(&config.base_url).filter(|_| lan) {
+        if is_ollama(client, &root).await {
+            info.ollama = true;
+            let show = client.post(format!("{root}/api/show")).timeout(Duration::from_secs(10)).json(&json!({ "model": config.model.trim() })).send().await;
+            if let Ok(response) = show.and_then(reqwest::Response::error_for_status) {
+                info.model_context_limit = response.json::<Value>().await.ok().as_ref().and_then(context_limit);
+            }
+        }
+    }
+    let wanted = config.context_tokens;
+    match (info.ollama, info.model_context_limit) {
+        (true, Some(limit)) if limit < wanted => {
+            info.warnings.push(format!("{} reads at most {limit} tokens at once. Set Context window to {limit} or less.", config.model.trim()));
+        }
+        (true, _) => {}
+        (false, _) => info.warnings.push(format!(
+            "AegisWin can set the context window only on Ollama. On this server, load the model with at least {wanted} tokens (LM Studio: Context Length), or set Context window to what it uses."
+        )),
+    }
+    info
+}
+
+/// `model_info["<architecture>.context_length"]` from Ollama's `/api/show`.
+fn context_limit(show: &Value) -> Option<u32> {
+    show.get("model_info")?
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, v)| v.as_u64())
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 /// Per-call request options.
@@ -337,11 +497,16 @@ pub struct LlmOptions {
     /// The most tokens the model may write. Without a cap a looping model runs
     /// until the request times out.
     pub max_tokens: u32,
+    /// Ask for a JSON object (Ollama's `format: "json"`).
+    pub json: bool,
+    /// Refuse rather than shorten a request that does not fit the context
+    /// window: a cut conversation is worse than a clear error.
+    pub must_fit: bool,
 }
 
 impl Default for LlmOptions {
     fn default() -> Self {
-        Self { max_tokens: 2048 }
+        Self { max_tokens: 2048, json: false, must_fit: false }
     }
 }
 
@@ -487,7 +652,7 @@ mod tests {
     }
 
     fn handle(base: &str, trusted: bool) -> LlmHandle {
-        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: "m".into(), api_key: None }, "event-logs", trusted)
+        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: "m".into(), ..LlmConfig::default() }, "event-logs", trusted)
     }
 
     #[test]
@@ -535,7 +700,7 @@ mod tests {
         let (base, server) = crate::testing::mock_llm("<think>hmm
 long</think>
 {\"ok\":true}").await;
-        let answer = handle(&base, false).complete_with("sys", json!({}), LlmOptions { max_tokens: 1024 }).await.unwrap();
+        let answer = handle(&base, false).complete_with("sys", json!({}), LlmOptions { max_tokens: 1024, ..LlmOptions::default() }).await.unwrap();
         assert_eq!(answer.text, "{\"ok\":true}");
         assert!(server.await.unwrap().contains("\"max_tokens\":1024"));
     }
@@ -553,5 +718,66 @@ long</think>
         assert_eq!(strip_thinking("  plain  ").as_deref(), Some("plain"));
         assert_eq!(strip_thinking("<think>a</think>x<think>b</think> y").as_deref(), Some("x y"));
         assert_eq!(strip_thinking("<think>still going"), None);
+    }
+
+    fn sized(base: &str, context_tokens: u32) -> LlmHandle {
+        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: "m".into(), api_key: None, context_tokens }, "event-logs", false)
+    }
+
+    #[tokio::test]
+    async fn ollama_gets_its_native_api_with_the_context_size() {
+        let (base, server) = crate::testing::mock_ollama(&["{\"ok\":1}"], 32768).await;
+        let options = LlmOptions { max_tokens: 1024, json: true, must_fit: true };
+        let answer = sized(&base, 16384).complete_with("sys", json!({ "q": 1 }), options).await.unwrap();
+        assert_eq!(answer.text, "{\"ok\":1}");
+        assert_eq!(answer.prompt_tokens, Some(100));
+        let request = server.await.unwrap().remove(0);
+        assert!(request.starts_with("POST /api/chat "), "{request}");
+        let body: Value = serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["options"], json!({ "temperature": 0.2, "num_ctx": 16384, "num_predict": 1024 }));
+        assert_eq!(body["format"], "json");
+        assert_eq!(body["stream"], false);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_must_fit_is_refused_and_others_are_shortened() {
+        let long = "x".repeat(30_000); // about 10k tokens
+        let options = LlmOptions { max_tokens: 1024, json: false, must_fit: true };
+        let err = sized("http://127.0.0.1:9/v1", 8192).complete_with("sys", json!(long), options).await.unwrap_err();
+        assert!(err.message.contains("more than the 8192-token context window"), "{}", err.message);
+
+        let (base, server) = crate::testing::mock_llm("fine").await;
+        sized(&base, 8192).complete_with("sys", json!(long), LlmOptions { must_fit: false, ..options }).await.unwrap();
+        let request = server.await.unwrap();
+        let body: Value = serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        let sent = body["messages"][1]["content"].as_str().unwrap();
+        // 90% of 8192, less the system prompt and the reply, at 3 characters a token.
+        assert_eq!(sent.chars().count(), (8192 * 9 / 10 - 1 - 1024) * 3 + "\n…(truncated)".chars().count());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_filled_the_window_is_reported() {
+        let body = json!({ "choices": [{ "message": { "content": "ok" } }], "usage": { "prompt_tokens": 4090 } }).to_string();
+        let (base, _server) = crate::testing::mock_http("200 OK", body).await;
+        let options = LlmOptions { max_tokens: 256, json: false, must_fit: true };
+        let err = sized(&base, 4096).complete_with("sys", json!({}), options).await.unwrap_err();
+        assert!(err.message.contains("filled the model's whole 4096-token context window"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn test_connection_checks_the_context_window() {
+        let config = |base: &str, context_tokens| LlmConfig { base_url: base.into(), model: "m".into(), api_key: None, context_tokens };
+        let (base, _server) = crate::testing::mock_ollama(&["unused"], 8192).await;
+        let info = server_info(&http_client(), &config(&base, 16384)).await;
+        assert!(info.ollama);
+        assert_eq!(info.model_context_limit, Some(8192));
+        assert_eq!(info.warnings, ["m reads at most 8192 tokens at once. Set Context window to 8192 or less."]);
+        let info = server_info(&http_client(), &config(&base, 8192)).await;
+        assert!(info.warnings.is_empty(), "{:?}", info.warnings);
+
+        let (base, _server) = crate::testing::mock_llm_replies(&["unused"]).await;
+        let info = server_info(&http_client(), &config(&base, 8192)).await;
+        assert!(!info.ollama);
+        assert!(info.warnings[0].starts_with("AegisWin can set the context window only on Ollama."));
     }
 }

@@ -85,6 +85,8 @@ flowchart TD
     I --> E
 ```
 
+Every request is first fitted to the owner's context window setting (default 8192 tokens): the payload is sent as compact JSON, a diagnostic payload is shortened to fit, and a monitor chat turn that does not fit is refused. On Ollama (detected with `GET /api/version` on a LAN `/v1` base URL) the request goes to the native `/api/chat` with `num_ctx`, because Ollama's OpenAI endpoint ignores it; other servers get `/v1/chat/completions` with `max_tokens`. See SECURITY_MODEL §6.
+
 ### 2.3 Long-Running Approved Tools (`sfc /scannow`)
 An approved ticket moves to `running` (or `queued` while another change runs) and the tool runs on a background task, so the approval page and the app return at once. The agent polls `aegis__check_ticket` until the status is final: `approved` (with the result), `execution_failed`, `declined`, `locked_out`, `expired`, or `cancelled`. There is no progress percentage; `sfc /scannow` reports only its final result.
 

@@ -121,6 +121,7 @@ pub struct LlmSettingsView {
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
+    pub context_tokens: u32,
     pub endpoint: Option<Endpoint>,
     pub endpoint_error: Option<String>,
 }
@@ -154,6 +155,7 @@ pub struct SettingsUpdate {
     pub auto_lock_minutes: Option<u32>,
     pub llm_base_url: Option<String>,
     pub llm_model: Option<String>,
+    pub llm_context_tokens: Option<u32>,
     pub mcp_enabled: Option<bool>,
     pub mcp_host: Option<String>,
     pub mcp_port: Option<u16>,
@@ -210,6 +212,8 @@ pub struct PluginView {
 pub struct LlmTest {
     pub endpoint: Endpoint,
     pub models: Vec<String>,
+    #[serde(flatten)]
+    pub server: crate::llm::ServerInfo,
 }
 
 /// A tool an MCP client may see (installed plugin, component enabled).
@@ -698,6 +702,7 @@ impl Engine {
                     base_url: s.llm.base_url.clone(),
                     model: s.llm.model.clone(),
                     has_api_key: s.llm.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+                    context_tokens: s.llm.context_tokens,
                     endpoint,
                     endpoint_error,
                 },
@@ -743,6 +748,16 @@ impl Engine {
                     return Err(AegisError::invalid("Model name must be 1-200 characters."));
                 }
                 s.llm.model = model.to_owned();
+            }
+            if let Some(tokens) = update.llm_context_tokens {
+                if !(crate::llm::MIN_CONTEXT_TOKENS..=crate::llm::MAX_CONTEXT_TOKENS).contains(&tokens) {
+                    return Err(AegisError::invalid(format!(
+                        "Context window must be between {} and {} tokens.",
+                        crate::llm::MIN_CONTEXT_TOKENS,
+                        crate::llm::MAX_CONTEXT_TOKENS
+                    )));
+                }
+                s.llm.context_tokens = tokens;
             }
             // Trust is granted for a destination: a different host, or moving
             // between a local and an Ollama cloud model, needs a new grant.
@@ -796,7 +811,8 @@ impl Engine {
         let config = self.with_state(|s| s.llm.clone())?;
         let endpoint = classify(&config.base_url, &config.model)?;
         let models = crate::llm::list_models(&self.http, &config).await?;
-        Ok(LlmTest { endpoint, models })
+        let server = crate::llm::server_info(&self.http, &config).await;
+        Ok(LlmTest { endpoint, models, server })
     }
 
     // ---- plugins ---------------------------------------------------------

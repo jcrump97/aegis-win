@@ -370,7 +370,8 @@ fn running_app_names(mention_text: &str) -> Vec<String> {
 
 /// A chat reply is one small JSON object; 1024 tokens leaves room for a short
 /// thinking phase and stops a looping model long before the request times out.
-const CHAT_REPLY: LlmOptions = LlmOptions { max_tokens: 1024 };
+/// The conversation is sent whole or not at all: a cut one loses the rules.
+const CHAT_REPLY: LlmOptions = LlmOptions { max_tokens: 1024, json: true, must_fit: true };
 
 /// Where the next LLM request would go, without sending anything.
 fn destination(llm: &LlmHandle) -> Value {

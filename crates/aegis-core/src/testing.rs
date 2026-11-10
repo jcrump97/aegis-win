@@ -30,13 +30,52 @@ pub async fn mock_http(status: &'static str, body: String) -> (String, JoinHandl
 }
 
 async fn serve(responses: Vec<(&'static str, String)>) -> (String, JoinHandle<Vec<String>>) {
+    serve_as(None, responses).await
+}
+
+/// Like [`mock_llm_replies`], but the server says it is Ollama (version
+/// `0.12.0`) and answers `/api/chat` with Ollama's native reply shape.
+/// `/api/show` reports `context_length` for the model.
+pub async fn mock_ollama(answers: &[&str], context_length: u64) -> (String, JoinHandle<Vec<String>>) {
+    let show = serde_json::json!({ "model_info": { "general.architecture": "llama", "llama.context_length": context_length } }).to_string();
+    let replies = answers
+        .iter()
+        .map(|a| ("200 OK", serde_json::json!({ "message": { "role": "assistant", "content": a }, "done": true, "done_reason": "stop", "prompt_eval_count": 100 }).to_string()))
+        .collect();
+    serve_as(Some(show), replies).await
+}
+
+/// Serves `responses` in order. `GET /api/version` (the Ollama check) and
+/// `POST /api/show` are answered on the side without using a response: with
+/// 404 normally, or as Ollama when `ollama_show` is set.
+async fn serve_as(ollama_show: Option<String>, responses: Vec<(&'static str, String)>) -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
     let handle = tokio::spawn(async move {
         let mut requests = Vec::new();
-        for (status, body) in responses {
+        let mut responses = responses.into_iter();
+        let mut next = responses.next();
+        while let Some((status, body)) = next.take() {
             let (mut sock, _) = listener.accept().await.unwrap();
-            requests.push(read_request(&mut sock).await);
+            let request = read_request(&mut sock).await;
+            let side = if request.starts_with("GET /api/version ") {
+                Some(ollama_show.as_ref().map(|_| ("200 OK", r#"{"version":"0.12.0"}"#.to_owned())).unwrap_or(("404 Not Found", "404 page not found".to_owned())))
+            } else if request.starts_with("POST /api/show ") {
+                Some(ollama_show.clone().map(|s| ("200 OK", s)).unwrap_or(("404 Not Found", "404 page not found".to_owned())))
+            } else {
+                None
+            };
+            let (status, body) = match side {
+                Some(reply) => {
+                    next = Some((status, body));
+                    reply
+                }
+                None => {
+                    requests.push(request);
+                    next = responses.next();
+                    (status, body)
+                }
+            };
             let resp = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
@@ -72,5 +111,5 @@ async fn read_request(sock: &mut TcpStream) -> String {
 }
 
 pub fn llm_handle(base_url: &str, plugin_id: &str) -> LlmHandle {
-    LlmHandle::new(http_client(), LlmConfig { base_url: base_url.into(), model: "test-model".into(), api_key: None }, plugin_id, false)
+    LlmHandle::new(http_client(), LlmConfig { base_url: base_url.into(), model: "test-model".into(), ..LlmConfig::default() }, plugin_id, false)
 }

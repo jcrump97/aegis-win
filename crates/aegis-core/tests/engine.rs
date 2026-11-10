@@ -211,6 +211,13 @@ async fn settings_are_validated_and_hold_no_secrets() {
     assert_eq!(err.code, ErrorCode::InvalidArguments, "off-LAN must be https");
     let err = f.engine.update_settings(SettingsUpdate { ui_scale: Some(300), ..Default::default() }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArguments);
+    for bad in [1024, 200_000] {
+        let err = f.engine.update_settings(SettingsUpdate { llm_context_tokens: Some(bad), ..Default::default() }).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArguments, "{bad}");
+    }
+    assert_eq!(f.engine.settings().await.unwrap().llm.context_tokens, 8192, "the default");
+    let view = f.engine.update_settings(SettingsUpdate { llm_context_tokens: Some(32768), ..Default::default() }).await.unwrap();
+    assert_eq!(view.llm.context_tokens, 32768);
 
     f.engine.set_llm_api_key("sk-secret-value".into()).unwrap();
     let view = f.engine.update_settings(SettingsUpdate { ui_scale: Some(125), mcp_host: Some("192.168.1.20".into()), ..Default::default() }).await.unwrap();

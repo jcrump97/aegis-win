@@ -225,7 +225,7 @@ export interface McpStatus {
 export interface SettingsView {
   uiScale: number;
   autoLockMinutes: number;
-  llm: { baseUrl: string; model: string; hasApiKey: boolean; endpoint: Endpoint | null; endpointError: string | null };
+  llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; endpoint: Endpoint | null; endpointError: string | null };
   mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; status: McpStatus; suggestedLanHost: string | null };
 }
 
@@ -234,6 +234,7 @@ export interface SettingsUpdate {
   autoLockMinutes?: number;
   llmBaseUrl?: string;
   llmModel?: string;
+  llmContextTokens?: number;
   mcpEnabled?: boolean;
   mcpHost?: string;
   mcpPort?: number;
@@ -243,6 +244,9 @@ export interface SettingsUpdate {
 export interface LlmTest {
   endpoint: Endpoint;
   models: string[];
+  ollama: boolean;
+  modelContextLimit: number | null;
+  warnings: string[];
 }
 
 export function isAegisError(e: unknown): e is AegisError {

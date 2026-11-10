@@ -1107,6 +1107,7 @@ function llmTab(): HTMLElement {
   const llm = settings.llm;
   const baseUrl = h('input', { type: 'text', id: 'llm-url', value: llm.baseUrl, spellcheck: 'false' });
   const model = h('input', { type: 'text', id: 'llm-model', value: llm.model, spellcheck: 'false' });
+  const context = h('input', { type: 'number', id: 'llm-context', min: '2048', max: '131072', step: '1024', value: String(llm.contextTokens) });
   const classification = h('div');
   const showClass = () => {
     const s = settings!.llm;
@@ -1124,7 +1125,7 @@ function llmTab(): HTMLElement {
   const save = h('button', { class: 'primary' }, 'Save');
   save.addEventListener('click', async () => {
     try {
-      settings = await busy(save, () => api.updateSettings({ llmBaseUrl: baseUrl.value, llmModel: model.value }));
+      settings = await busy(save, () => api.updateSettings({ llmBaseUrl: baseUrl.value, llmModel: model.value, llmContextTokens: Number(context.value) }));
       plugins = await api.listPlugins();
       showClass();
       renderTrust();
@@ -1143,6 +1144,7 @@ function llmTab(): HTMLElement {
       replace(
         models,
         out.models.length && !installed ? h('div', { class: 'badge warn' }, `The saved model "${saved}" is not on this server. Pick one below, then Save.`) : null,
+        ...out.warnings.map((w) => h('div', { class: 'badge warn' }, w)),
         out.models.length ? h('span', { class: 'hint' }, 'Models (click to use):') : h('span', { class: 'hint' }, 'Connected, but the server listed no models.'),
         ...out.models.map((m) => h('button', { class: 'badge accent', onclick: () => (model.value = m) }, m)),
       );
@@ -1200,7 +1202,7 @@ function llmTab(): HTMLElement {
     'div',
     { class: 'stack' },
     h('div', {}, h('h2', {}, 'LLM'), h('p', { class: 'hint' }, 'Plugins can ask an LLM to explain logs and command output. Use a local server such as Ollama or LM Studio, or any OpenAI-compatible endpoint.')),
-    h('section', { class: 'card' }, h('h3', {}, 'Endpoint'), h('label', { for: 'llm-url' }, 'Base URL'), baseUrl, h('div', { class: 'hint' }, 'Ollama: http://127.0.0.1:11434/v1 · LM Studio: http://127.0.0.1:1234/v1'), h('label', { for: 'llm-model' }, 'Model'), model, h('div', { style: 'margin-top:0.6rem' }, classification), h('div', { class: 'row', style: 'margin-top:0.8rem' }, save, test), models),
+    h('section', { class: 'card' }, h('h3', {}, 'Endpoint'), h('label', { for: 'llm-url' }, 'Base URL'), baseUrl, h('div', { class: 'hint' }, 'Ollama: http://127.0.0.1:11434/v1 · LM Studio: http://127.0.0.1:1234/v1'), h('label', { for: 'llm-model' }, 'Model'), model, h('label', { for: 'llm-context' }, 'Context window (tokens)'), context, h('div', { class: 'hint' }, 'How much the model reads at once. 8192 suits most local models; raise it for long monitor chats if your model allows. AegisWin sets it on Ollama; on other servers, match what the model is loaded with.'), h('div', { style: 'margin-top:0.6rem' }, classification), h('div', { class: 'row', style: 'margin-top:0.8rem' }, save, test), models),
     h('section', { class: 'card' }, h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'API key'), keyState), h('p', { class: 'hint' }, 'Stored encrypted in the vault and never shown again. Local servers usually need none.'), key, h('div', { class: 'row', style: 'margin-top:0.6rem' }, saveKey, clearKey)),
     h('section', { class: 'card' }, h('h3', {}, 'Off-LAN permission'), h('p', { class: 'hint' }, 'An endpoint outside your network only receives data from plugins you allow, after personal details are scrubbed. Changing the endpoint to a different host clears these permissions.'), trustBody),
   );

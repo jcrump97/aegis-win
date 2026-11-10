@@ -123,7 +123,7 @@ function backend(cmd, args) {
       return {
         uiScale: 100,
         autoLockMinutes: 15,
-        llm: { baseUrl: 'http://127.0.0.1:11434', model: 'm', hasApiKey: false, endpoint: null, endpointError: null },
+        llm: { baseUrl: 'http://127.0.0.1:11434', model: 'm', hasApiKey: false, contextTokens: 8192, endpoint: null, endpointError: null },
         mcp: { enabled: false, host: '127.0.0.1', port: 47821, openFirewall: true, status: { running: false, url: null, localUrl: null, firewallRule: false, note: null }, suggestedLanHost: null },
       };
     case 'list_tickets':
