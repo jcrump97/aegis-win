@@ -309,6 +309,50 @@ pub fn tray_balloon(tray_window: isize, title: &str, text: &str) -> bool {
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool()
 }
 
+/// Extra input mixed into every DPAPI blob, so a blob made for another
+/// program as this user is not accepted as AegisWin's.
+const DPAPI_ENTROPY: &[u8] = b"aegis-win-thispc";
+
+/// Runs one DPAPI call (current user, no UI) and copies out the result.
+fn dpapi(data: &[u8], protect: bool) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB};
+
+    let input = CRYPT_INTEGER_BLOB { cbData: u32::try_from(data.len()).ok()?, pbData: data.as_ptr().cast_mut() };
+    let entropy = CRYPT_INTEGER_BLOB { cbData: DPAPI_ENTROPY.len() as u32, pbData: DPAPI_ENTROPY.as_ptr().cast_mut() };
+    let mut out = CRYPT_INTEGER_BLOB::default();
+    let result = unsafe {
+        if protect {
+            CryptProtectData(&input, PCWSTR::null(), Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        } else {
+            CryptUnprotectData(&input, None, Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        }
+    };
+    if result.is_err() || out.pbData.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+    unsafe {
+        // Clear the plaintext copy Windows made before handing it back.
+        if !protect {
+            std::ptr::write_bytes(out.pbData, 0, out.cbData as usize);
+        }
+        LocalFree(Some(HLOCAL(out.pbData.cast())));
+    }
+    Some(zeroize::Zeroizing::new(bytes))
+}
+
+/// Encrypts `data` so only this Windows account on this PC can read it
+/// (DPAPI, current user). ADR 0004 §3.3.
+pub fn dpapi_protect(data: &[u8]) -> Option<Vec<u8>> {
+    dpapi(data, true).map(|b| b.to_vec())
+}
+
+/// Reverses [`dpapi_protect`]; `None` on another PC or account, or if damaged.
+pub fn dpapi_unprotect(blob: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    dpapi(blob, false)
+}
+
 /// A short, stable name for an install: FNV-1a of its folder, case-insensitive.
 pub fn install_key(dir: &std::path::Path) -> String {
     let hash = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
@@ -705,6 +749,18 @@ pub mod eventlog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpapi_round_trips_and_rejects_damaged_blobs() {
+        let blob = dpapi_protect(b"wrapped key").unwrap();
+        assert!(!blob.windows(11).any(|w| w == b"wrapped key"));
+        assert_eq!(dpapi_unprotect(&blob).unwrap().as_slice(), b"wrapped key");
+        let mut bad = blob.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(dpapi_unprotect(&bad).is_none());
+        assert!(dpapi_unprotect(b"not a blob").is_none());
+    }
 
     #[test]
     fn a_balloon_needs_an_icon_of_its_own_window() {

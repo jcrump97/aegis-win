@@ -40,12 +40,14 @@ url = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json"] }
 # QR code for the device page link (ADR 0004 §1.2). MIT, no dependencies.
 qrcodegen = "=1.8.0"
+zxcvbn = { version = "=3.1.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Security",
+  "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_EventLog",

@@ -10,7 +10,7 @@ use aegis_core::{AegisResult, ErrorCode};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-const PIN: &str = "135790";
+const PIN: &str = "one-three-five-seven";
 
 struct Chatty(PluginManifest);
 

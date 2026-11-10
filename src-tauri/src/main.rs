@@ -240,9 +240,28 @@ async fn note_activity(engine: EngineState<'_>) -> Cmd<()> {
     Ok(())
 }
 
+/// Sets a new passphrase (ADR 0004 §3.2); `pc_pin` keeps a short PIN on this PC.
 #[tauri::command]
-async fn change_pin(engine: EngineState<'_>, current: String, next: String) -> Cmd<()> {
-    engine.change_pin(current, next).await
+async fn change_passphrase(engine: EngineState<'_>, current: String, next: String, pc_pin: Option<String>) -> Cmd<Status> {
+    engine.change_passphrase(current, next, pc_pin).await
+}
+
+/// Sets or replaces the short PIN for this PC (ADR 0004 §3.3).
+#[tauri::command]
+async fn set_this_pc_pin(engine: EngineState<'_>, current: String, pin: String) -> Cmd<Status> {
+    engine.set_this_pc_pin(current, pin).await
+}
+
+/// Deletes the short PIN for this PC; needs no PIN and works while locked.
+#[tauri::command]
+async fn forget_this_pc(engine: EngineState<'_>) -> Cmd<Status> {
+    engine.forget_this_pc()
+}
+
+/// A strength guide for a passphrase being typed; returns no secret.
+#[tauri::command]
+async fn passphrase_strength(text: String) -> Cmd<aegis_core::passphrase::Strength> {
+    Ok(aegis_core::passphrase::strength(aegis_core::secret::Secret::new(text).expose()))
 }
 
 #[tauri::command]
@@ -516,7 +535,10 @@ fn main() {
             unlock_vault,
             lock_vault,
             note_activity,
-            change_pin,
+            change_passphrase,
+            set_this_pc_pin,
+            forget_this_pc,
+            passphrase_strength,
             get_settings,
             update_settings,
             set_llm_api_key,

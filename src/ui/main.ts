@@ -5,6 +5,7 @@ import './styles.css';
 import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
+import { generatePassphrase } from './passphrase';
 import { rawJson, renderValue, schemaForm } from './render';
 
 const root = document.getElementById('app')!;
@@ -23,6 +24,9 @@ let planDraft: Array<{ tool: string; name: string; args: Record<string, unknown>
 const MAX_PLAN_STEPS = 5;
 
 const PIN_MIN = 6;
+const PASSPHRASE_MIN = 14;
+/** Set by the passphrase banner's second button: preselects keeping the old PIN on this PC. */
+let keyChoice: 'passphrase' | 'pc' | null = null;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -69,16 +73,129 @@ async function restartAsAdmin(): Promise<void> {
   }
 }
 
-function pinPair(): { element: HTMLElement; read(): string | { error: string } } {
-  const a = h('input', { type: 'password', autocomplete: 'new-password', id: 'pin-new', minlength: PIN_MIN, required: true });
-  const b = h('input', { type: 'password', autocomplete: 'new-password', id: 'pin-confirm', required: true });
+function pinPair(prefix = 'pin', label = 'New PIN'): { element: HTMLElement; read(): string | { error: string } } {
+  const a = h('input', { type: 'password', autocomplete: 'new-password', id: `${prefix}-new`, minlength: PIN_MIN });
+  const b = h('input', { type: 'password', autocomplete: 'new-password', id: `${prefix}-confirm` });
   return {
-    element: h('div', {}, h('label', { for: 'pin-new' }, 'New PIN'), a, h('div', { class: 'hint' }, `At least ${PIN_MIN} characters. Letters are allowed and make it stronger.`), h('label', { for: 'pin-confirm' }, 'Confirm PIN'), b),
+    element: h('div', {}, h('label', { for: `${prefix}-new` }, label), a, h('div', { class: 'hint' }, `At least ${PIN_MIN} characters.`), h('label', { for: `${prefix}-confirm` }, 'Confirm PIN'), b),
     read() {
-      if (a.value.length < PIN_MIN) return { error: `The PIN must be at least ${PIN_MIN} characters.` };
+      if ([...a.value].length < PIN_MIN) return { error: `The PIN must be at least ${PIN_MIN} characters.` };
       if (a.value !== b.value) return { error: 'The two PINs do not match.' };
       return a.value;
     },
+  };
+}
+
+const SCORE_TEXT = ['very weak', 'weak', 'fair', 'strong', 'very strong'];
+
+/**
+ * Chooses the vault passphrase (ADR 0004 §3.2): five generated words by
+ * default, or the owner's own of 14+ characters with a strength guide.
+ * Generated words are made in this window and never sent back by the app.
+ */
+function passphraseChooser(): { element: HTMLElement; read(): string | { error: string } } {
+  let words = generatePassphrase();
+  const generated = h('input', { type: 'radio', name: 'pp-mode', id: 'pp-generated', checked: true });
+  const own = h('input', { type: 'radio', name: 'pp-mode', id: 'pp-own' });
+
+  const shown = h('code', { class: 'passphrase' }, words);
+  const hide = h('button', { type: 'button' }, 'Hide');
+  const again = h('button', { type: 'button' }, 'New words');
+  const written = h('input', { type: 'checkbox', id: 'pp-written' });
+  hide.addEventListener('click', () => {
+    const hidden = shown.classList.toggle('concealed');
+    hide.textContent = hidden ? 'Show again' : 'Hide';
+  });
+  again.addEventListener('click', () => {
+    words = generatePassphrase();
+    shown.textContent = words;
+    shown.classList.remove('concealed');
+    hide.textContent = 'Hide';
+    written.checked = false;
+  });
+  const generatedArea = h(
+    'div',
+    { class: 'stack' },
+    shown,
+    h('div', { class: 'row' }, again, hide),
+    h('p', { class: 'hint' }, 'Five random words from the EFF wordlist (about 64 bits). Write them down and keep them somewhere safe: they cannot be recovered, and they are the only way to open your AegisWin folder on another PC.'),
+    h('label', { class: 'inline', for: 'pp-written' }, written, 'I’ve written it down'),
+  );
+
+  const a = h('input', { type: 'password', autocomplete: 'new-password', id: 'pp-new' });
+  const b = h('input', { type: 'password', autocomplete: 'new-password', id: 'pp-confirm' });
+  const meter = h('div', { class: 'hint', 'aria-live': 'polite' });
+  let timer: number | undefined;
+  a.addEventListener('input', () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(async () => {
+      if (!a.value) return replace(meter);
+      try {
+        const s = await api.passphraseStrength(a.value);
+        replace(
+          meter,
+          h('meter', { min: 0, max: 4, low: 2, high: 3, optimum: 4, value: s.score, 'aria-label': 'Passphrase strength' }),
+          ` ${SCORE_TEXT[s.score] ?? ''}, about ${s.bits} bits. `,
+          s.longEnough ? '' : `Needs at least ${PASSPHRASE_MIN} characters. `,
+          s.warning ? `${s.warning} ` : '',
+          s.suggestions.join(' '),
+        );
+      } catch {
+        replace(meter);
+      }
+    }, 250);
+  });
+  const ownArea = h(
+    'div',
+    { class: 'stack', hidden: true },
+    h('label', { for: 'pp-new' }, 'Passphrase'),
+    a,
+    meter,
+    h('label', { for: 'pp-confirm' }, 'Confirm passphrase'),
+    b,
+    h('p', { class: 'hint' }, `At least ${PASSPHRASE_MIN} characters. Several unrelated words are easier to remember than symbols. Aim for “very strong”.`),
+  );
+  const sync = () => {
+    generatedArea.hidden = !generated.checked;
+    ownArea.hidden = generated.checked;
+  };
+  generated.addEventListener('change', sync);
+  own.addEventListener('change', sync);
+
+  return {
+    element: h(
+      'div',
+      { class: 'stack' },
+      h('div', { class: 'row' }, h('label', { class: 'inline', for: 'pp-generated' }, generated, 'Generate words for me (recommended)'), h('label', { class: 'inline', for: 'pp-own' }, own, 'Choose my own')),
+      generatedArea,
+      ownArea,
+    ),
+    read() {
+      if (generated.checked) {
+        if (!written.checked) return { error: 'Write the passphrase down, then tick “I’ve written it down”.' };
+        return words;
+      }
+      if ([...a.value].length < PASSPHRASE_MIN) return { error: `The passphrase must be at least ${PASSPHRASE_MIN} characters.` };
+      if (a.value !== b.value) return { error: 'The two passphrases do not match.' };
+      return a.value;
+    },
+  };
+}
+
+const PC_PIN_LIMITS =
+  'The PIN works only on this PC and this Windows account; a copy of the folder cannot be opened with it elsewhere. It does not stop programs running as you, which can try PINs quickly, or someone who also knows your Windows password. Your passphrase still works everywhere.';
+
+/** Opt-in short PIN for this PC (ADR 0004 §3.3). `read` gives the PIN, or null when not chosen. */
+function pcPinOption(checked: boolean, hint?: string): { element: HTMLElement; read(): string | null | { error: string } } {
+  const box = h('input', { type: 'checkbox', id: 'pc-pin-on', checked });
+  const pins = pinPair('pc-pin', 'PIN for this PC');
+  const area = h('div', { class: 'stack' }, hint ? h('p', { class: 'hint' }, hint) : null, pins.element);
+  const sync = () => (area.hidden = !box.checked);
+  box.addEventListener('change', sync);
+  sync();
+  return {
+    element: h('div', { class: 'stack' }, h('label', { class: 'inline', for: 'pc-pin-on' }, box, 'Also keep a short PIN on this PC'), h('p', { class: 'hint' }, PC_PIN_LIMITS), area),
+    read: () => (box.checked ? pins.read() : null),
   };
 }
 
@@ -102,26 +219,32 @@ function route(): void {
 }
 
 function setupScreen(): void {
-  const pins = pinPair();
+  const chooser = passphraseChooser();
+  const pcPin = pcPinOption(false);
   const message = h('div');
-  const submit = h('button', { type: 'submit', class: 'primary' }, 'Create PIN and continue');
+  const submit = h('button', { type: 'submit', class: 'primary' }, 'Create and continue');
   const form = h(
     'form',
     { class: 'card narrow stack' },
     brand(),
-    h('h2', {}, 'Welcome. Choose a PIN.'),
-    h('p', {}, 'Your PIN encrypts everything AegisWin stores and approves every repair an AI agent asks for. It is never saved anywhere, never shown to an agent, and cannot be recovered.'),
+    h('h2', {}, 'Welcome. Choose a passphrase.'),
+    h('p', {}, 'Your passphrase encrypts everything AegisWin stores and approves every repair an AI agent asks for. It is never saved anywhere, never shown to an agent, and cannot be recovered.'),
     h('p', { class: 'hint' }, `Data folder: ${status.dataDir}`),
-    pins.element,
+    chooser.element,
+    pcPin.element,
     message,
     submit,
   );
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const pin = pins.read();
-    if (typeof pin !== 'string') return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: pin.error }));
+    const passphrase = chooser.read();
+    if (typeof passphrase !== 'string') return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: passphrase.error }));
+    const pin = pcPin.read();
+    if (pin !== null && typeof pin !== 'string') return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: pin.error }));
+    if (pin === passphrase) return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: 'Use a different PIN for this PC than the passphrase.' }));
     try {
-      status = await busy(submit, () => api.setupVault(pin));
+      status = await busy(submit, () => api.setupVault(passphrase));
+      if (pin !== null) status = await busy(submit, () => api.setThisPcPin(passphrase, pin));
       route();
     } catch (err) {
       replace(message, errorNotice(asError(err)));
@@ -133,6 +256,17 @@ function setupScreen(): void {
 function unlockScreen(): void {
   const input = h('input', { type: 'password', id: 'unlock-pin', autocomplete: 'current-password', required: true });
   const message = h('div');
+  const forget = h('button', { type: 'button' }, 'Forget this PC');
+  forget.addEventListener('click', async () => {
+    const ok = await confirmDialog('Forget this PC?', 'This deletes the short PIN for this PC. Only your passphrase will open AegisWin until you set a PIN again. Nothing else changes.', 'Forget this PC');
+    if (!ok) return;
+    try {
+      status = await busy(forget, () => api.forgetThisPc());
+      unlockScreen();
+    } catch (err) {
+      replace(message, errorNotice(asError(err)));
+    }
+  });
   const submit = h('button', { type: 'submit', class: 'primary' }, 'Unlock');
   const showLockout = (seconds: number) => {
     if (seconds > 0) replace(message, h('div', { class: 'notice error', role: 'alert' }, `Too many wrong PINs. Try again in ${seconds} seconds.`));
@@ -144,10 +278,11 @@ function unlockScreen(): void {
     brand(),
     h('h2', {}, 'Unlock AegisWin'),
     status.elevated ? h('span', { class: 'badge warn' }, 'Running as administrator') : null,
-    h('label', { for: 'unlock-pin' }, 'PIN'),
+    h('label', { for: 'unlock-pin' }, status.thisPcPin ? 'Passphrase, or your PIN for this PC' : 'Passphrase (or your PIN, if you set AegisWin up before passphrases)'),
     input,
     message,
     submit,
+    status.thisPcPin ? h('div', { class: 'row end' }, forget) : null,
   );
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -328,13 +463,28 @@ function updateRuntimeReviews(host: HTMLElement): void {
   const reviews = status.runtimeReviews ?? [];
   const notices = status.resumeNotices ?? [];
   const signature = [
+    status.needsPassphrase ? 'needs-passphrase' : '',
     ...reviews.map((r) => `${r.pluginId}:${r.differences.join(',')}`),
     ...notices.map((n) => `gap:${n.pluginId}:${n.from ?? ''}:${n.to}`),
   ].join('|');
   if (signature === reviewSignature) return;
   reviewSignature = signature;
+  const choose = (choice: 'passphrase' | 'pc') => {
+    keyChoice = choice;
+    selectTab('settings');
+    document.getElementById('vault-key')?.scrollIntoView({ block: 'start' });
+  };
   replace(
     host,
+    status.needsPassphrase
+      ? h(
+          'div',
+          { class: 'notice error', role: 'alert' },
+          h('p', {}, h('strong', {}, 'Your PIN can be guessed in hours if someone copies your AegisWin folder.')),
+          h('p', { class: 'hint' }, 'Choose a passphrase to protect the folder. You can keep typing your current PIN on this PC if you like. Everything keeps working until you choose.'),
+          h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => choose('passphrase') }, 'Set a passphrase'), h('button', { onclick: () => choose('pc') }, 'Keep a short PIN on this PC only')),
+        )
+      : null,
     ...notices.map((n) => {
       const name = plugins.find((p) => p.id === n.pluginId)?.name ?? n.pluginId;
       const when = (iso: string): string => new Date(iso).toLocaleString();
@@ -1295,6 +1445,95 @@ function llmTab(): HTMLElement {
 
 // ---- settings ---------------------------------------------------------------
 
+/** Sets a new passphrase (ADR 0004 §3.2), optionally keeping a short PIN on this PC. */
+function vaultKeyCard(): HTMLElement {
+  const choice = keyChoice;
+  keyChoice = null;
+  const card = h('div');
+  const current = h('input', { type: 'password', id: 'key-current', autocomplete: 'current-password' });
+  const chooser = passphraseChooser();
+  const pcPin = pcPinOption(
+    choice === 'pc' || status.thisPcPin,
+    choice === 'pc' ? 'To keep typing your current PIN on this PC, enter it here too.' : status.thisPcPin ? 'A new passphrase replaces the PIN for this PC; enter it again to keep it.' : undefined,
+  );
+  const message = h('div');
+  const submit = h('button', { class: 'primary', type: 'submit' }, 'Set passphrase');
+  const form = h(
+    'form',
+    { class: 'card stack', id: 'vault-key' },
+    h('h3', {}, status.needsPassphrase ? 'Choose a passphrase' : 'Change passphrase'),
+    h('label', { for: 'key-current' }, status.needsPassphrase ? 'Current PIN' : 'Current passphrase or PIN for this PC'),
+    current,
+    chooser.element,
+    pcPin.element,
+    message,
+    h('div', { class: 'row end' }, submit),
+  );
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const next = chooser.read();
+    if (typeof next !== 'string') return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: next.error }));
+    const pin = pcPin.read();
+    if (pin !== null && typeof pin !== 'string') return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: pin.error }));
+    try {
+      status = await busy(submit, () => api.changePassphrase(current.value, next, pin));
+      current.value = '';
+      toast('Passphrase set. Your AegisWin folder is now encrypted with a new key.');
+      updateShellBadges();
+      selectTab('settings');
+    } catch (err) {
+      current.value = '';
+      replace(message, errorNotice(asError(err)));
+    }
+  });
+  replace(card, form);
+  return card;
+}
+
+/** The short PIN for this PC (ADR 0004 §3.3): set, change, or forget. */
+function thisPcCard(): HTMLElement {
+  const card = h('section', { class: 'card stack' });
+  const render = () => {
+    const current = h('input', { type: 'password', id: 'pc-current', autocomplete: 'current-password' });
+    const pins = pinPair('pc-set', status.thisPcPin ? 'New PIN for this PC' : 'PIN for this PC');
+    const message = h('div');
+    const save = h('button', { class: 'primary', type: 'submit' }, status.thisPcPin ? 'Change PIN' : 'Set PIN');
+    const form = h('form', { class: 'stack' }, h('label', { for: 'pc-current' }, 'Current passphrase or PIN'), current, pins.element, message, h('div', { class: 'row end' }, save));
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pin = pins.read();
+      if (typeof pin !== 'string') return replace(message, errorNotice({ code: 'PIN_TOO_WEAK', message: pin.error }));
+      try {
+        status = await busy(save, () => api.setThisPcPin(current.value, pin));
+        toast('PIN for this PC saved.');
+        render();
+      } catch (err) {
+        current.value = '';
+        replace(message, errorNotice(asError(err)));
+      }
+    });
+    const forget = h('button', { type: 'button' }, 'Forget this PC');
+    forget.addEventListener('click', async () => {
+      const ok = await confirmDialog('Forget this PC?', 'This deletes the short PIN for this PC. Only your passphrase will open AegisWin until you set a PIN again.', 'Forget this PC');
+      if (!ok) return;
+      try {
+        status = await busy(forget, () => api.forgetThisPc());
+        render();
+      } catch (err) {
+        replace(message, errorNotice(asError(err)));
+      }
+    });
+    replace(
+      card,
+      h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'Short PIN on this PC'), h('span', { class: `badge ${status.thisPcPin ? 'ok' : ''}` }, status.thisPcPin ? 'on' : 'off'), status.thisPcPin ? forget : null),
+      h('p', { class: 'hint' }, PC_PIN_LIMITS),
+      status.needsPassphrase ? h('p', { class: 'hint' }, 'Choose a passphrase first.') : form,
+    );
+  };
+  render();
+  return card;
+}
+
 function settingsTab(): HTMLElement {
   const scale = h('input', { type: 'range', id: 'ui-scale', min: 80, max: 150, step: 5, value: settings?.uiScale ?? 100 });
   const scaleLabel = h('span', { class: 'mono' }, `${scale.value}%`);
@@ -1334,24 +1573,8 @@ function settingsTab(): HTMLElement {
     }
   });
 
-  const current = h('input', { type: 'password', id: 'pin-current', autocomplete: 'current-password' });
-  const pins = pinPair();
-  const pinMessage = h('div');
-  const changePin = h('button', { class: 'primary', type: 'submit' }, 'Change PIN');
-  const pinForm = h('form', { class: 'card' }, h('h3', {}, 'Change PIN'), h('label', { for: 'pin-current' }, 'Current PIN'), current, pins.element, pinMessage, h('div', { class: 'row end', style: 'margin-top:0.8rem' }, changePin));
-  pinForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const next = pins.read();
-    if (typeof next !== 'string') return replace(pinMessage, errorNotice({ code: 'PIN_TOO_WEAK', message: next.error }));
-    try {
-      await busy(changePin, () => api.changePin(current.value, next));
-      pinForm.reset();
-      replace(pinMessage, h('div', { class: 'notice ok' }, 'PIN changed.'));
-    } catch (err) {
-      current.value = '';
-      replace(pinMessage, errorNotice(asError(err)));
-    }
-  });
+  const keyCard = vaultKeyCard();
+  const pcCard = thisPcCard();
 
   return h(
     'div',
@@ -1368,7 +1591,8 @@ function settingsTab(): HTMLElement {
     ),
     h('section', { class: 'stack' }, h('h3', {}, 'Plugins and components'), selector.element, h('div', { class: 'row end' }, savePlugins)),
     autostartCard(),
-    pinForm,
+    keyCard,
+    pcCard,
     h(
       'section',
       { class: 'card' },

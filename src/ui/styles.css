@@ -183,3 +183,8 @@ dialog::backdrop { background: rgba(3, 6, 12, 0.7); }
 button.chip { padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.88rem; }
 .device-code-value code { font-size: 1.6rem; letter-spacing: 0.15em; }
 .device-code svg { flex: none; border-radius: 6px; }
+
+/* Generated passphrase (ADR 0004 §3.2): large, selectable, can be hidden. */
+.passphrase { display: block; font-size: 1.25rem; padding: 0.6rem 0.8rem; border-radius: 6px; background: var(--surface-2, rgba(127, 127, 127, 0.12)); user-select: all; overflow-wrap: anywhere; }
+.passphrase.concealed { filter: blur(7px); user-select: none; }
+meter { width: 6rem; vertical-align: middle; }

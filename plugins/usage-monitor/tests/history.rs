@@ -12,7 +12,7 @@ use aegis_core::ErrorCode;
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES};
 use serde_json::{json, Value};
 
-const PIN: &str = "246810";
+const PIN: &str = "two-four-six-eight";
 const UM: &str = "usage-monitor";
 
 async fn engine() -> (Arc<Engine>, tempfile::TempDir) {

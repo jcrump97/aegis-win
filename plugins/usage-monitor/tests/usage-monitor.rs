@@ -10,7 +10,7 @@ use aegis_core::{schema, ErrorCode};
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES, COMPONENT_FOREGROUND, COMPONENT_SPIKES};
 use serde_json::{json, Value};
 
-const PIN: &str = "246810";
+const PIN: &str = "two-four-six-eight";
 
 fn all_components() -> Vec<String> {
     vec![COMPONENT_SPIKES.into(), COMPONENT_CRASHES.into(), COMPONENT_FOREGROUND.into()]

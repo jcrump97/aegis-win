@@ -11,6 +11,7 @@ pub mod llm;
 pub mod notify;
 pub mod mcp;
 pub mod os;
+pub mod passphrase;
 pub mod plan;
 pub mod plugin_data;
 pub mod qr;

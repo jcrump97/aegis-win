@@ -12,7 +12,7 @@ use aegis_core::ErrorCode;
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES, COMPONENT_SPIKES};
 use serde_json::{json, Value};
 
-const PIN: &str = "246810";
+const PIN: &str = "two-four-six-eight";
 const UM: &str = "usage-monitor";
 
 /// Only the crash correlator is on, so no sampler thread runs in these tests.

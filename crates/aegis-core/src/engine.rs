@@ -134,6 +134,11 @@ pub struct Status {
     pub runtime_reviews: Vec<RuntimeReview>,
     /// Gaps before a resume at launch, by plugin. Empty while locked.
     pub resume_notices: Vec<ResumeNoticeView>,
+    /// The vault key is a short PIN from before passphrases (ADR 0004 §3.2):
+    /// the app asks the owner to choose (decision D2). False while locked.
+    pub needs_passphrase: bool,
+    /// A short PIN on this PC can unlock (ADR 0004 §3.3). Known while locked.
+    pub this_pc_pin: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,9 +280,11 @@ fn vault_err(e: VaultError) -> AegisError {
     match e {
         VaultError::AlreadyExists => AegisError::new(ErrorCode::VaultExists, "AegisWin is already set up in this folder."),
         VaultError::NotFound => AegisError::new(ErrorCode::VaultMissing, "AegisWin has not been set up yet."),
-        VaultError::WrongPin => AegisError::new(ErrorCode::PinInvalid, "Incorrect PIN."),
-        VaultError::PinTooShort | VaultError::PinTooLong => AegisError::new(ErrorCode::PinTooWeak, e.to_string()),
-        VaultError::Corrupt(_) | VaultError::Io(_) => AegisError::new(ErrorCode::Internal, e.to_string()),
+        VaultError::WrongPin => AegisError::new(ErrorCode::PinInvalid, "Incorrect passphrase or PIN."),
+        VaultError::PinTooShort => AegisError::new(ErrorCode::PinTooWeak, "The PIN for this PC must be at least 6 characters."),
+        VaultError::PassphraseTooShort => AegisError::new(ErrorCode::PinTooWeak, "The passphrase must be at least 14 characters."),
+        VaultError::PinTooLong => AegisError::new(ErrorCode::PinTooWeak, "That is too long: at most 128 characters."),
+        VaultError::ThisPc | VaultError::Corrupt(_) | VaultError::Io(_) => AegisError::new(ErrorCode::Internal, e.to_string()),
     }
 }
 
@@ -402,14 +409,17 @@ impl Engine {
             change: self.executor.view(),
             runtime_reviews: if state.is_some() { reviews } else { Vec::new() },
             resume_notices: if state.is_some() { notices } else { Vec::new() },
+            needs_passphrase: guard.as_ref().is_some_and(|v| !v.meets_passphrase_rule()),
+            this_pc_pin: guard.as_ref().map_or_else(|| vault::this_pc_exists(&self.vault_path()), |v| v.has_this_pc()),
         }
     }
 
-    /// Creates the vault. Plugins marked `optionalInstallDefault` start
-    /// installed with every component on; the wizard can change that.
+    /// Creates the vault, keyed by a passphrase (ADR 0004 §3.2). Plugins
+    /// marked `optionalInstallDefault` start installed with every component
+    /// on; the wizard can change that.
     pub async fn setup(&self, pin: String) -> AegisResult<Status> {
         let pin = Zeroizing::new(pin);
-        vault::validate_new_pin(&pin).map_err(vault_err)?;
+        vault::validate_new_passphrase(&pin).map_err(vault_err)?;
         let mut state = VaultState::default();
         for plugin in self.registry.plugins() {
             let m = plugin.manifest();
@@ -698,10 +708,7 @@ impl Engine {
     /// Caller must hold `pin_check`.
     async fn verify_pin_serialized(&self, pin: &str) -> AegisResult<()> {
         self.guard_check()?;
-        let verifier = {
-            let guard = lock(&self.vault);
-            guard.as_ref().ok_or_else(locked)?.verifier()
-        };
+        let verifier = self.verifier()?;
         let pin = Zeroizing::new(pin.to_owned());
         let ok = tokio::task::spawn_blocking(move || verifier.verify(&pin)).await.map_err(internal)?;
         lock(&self.guard).record(ok, Instant::now());
@@ -714,17 +721,68 @@ impl Engine {
         }
     }
 
-    pub async fn change_pin(&self, current: String, new_pin: String) -> AegisResult<()> {
-        let new_pin = Zeroizing::new(new_pin);
-        vault::validate_new_pin(&new_pin).map_err(vault_err)?;
+    /// Sets a new passphrase under a new data key (ADR 0004 §3.2). The short
+    /// PIN for this PC is set to `pc_pin` if given; otherwise it is removed,
+    /// because it opened the old data key.
+    pub async fn change_passphrase(&self, current: String, passphrase: String, pc_pin: Option<String>) -> AegisResult<Status> {
+        let (current, passphrase, pc_pin) = (Zeroizing::new(current), Zeroizing::new(passphrase), pc_pin.map(Zeroizing::new));
+        vault::validate_new_passphrase(&passphrase).map_err(vault_err)?;
+        if let Some(pin) = &pc_pin {
+            vault::validate_new_pin(pin).map_err(vault_err)?;
+            if pin.as_str() == passphrase.as_str() {
+                return Err(AegisError::new(ErrorCode::PinTooWeak, "Use a different PIN for this PC than the passphrase."));
+            }
+        }
         self.check_pin(&current).await?;
-        let params = {
-            let guard = lock(&self.vault);
-            guard.as_ref().ok_or_else(locked)?.params()
-        };
-        let key = tokio::task::spawn_blocking(move || NewKey::derive(&new_pin, params)).await.map_err(internal)?.map_err(vault_err)?;
-        let mut guard = lock(&self.vault);
-        guard.as_mut().ok_or_else(locked)?.install_key(key).map_err(vault_err)
+        let kdf = self.kdf;
+        let (pass_key, pc_key) = tokio::task::spawn_blocking(move || -> Result<_, VaultError> {
+            Ok((NewKey::derive(&passphrase, kdf)?, pc_pin.map(|p| NewKey::derive(&p, kdf)).transpose()?))
+        })
+        .await
+        .map_err(internal)?
+        .map_err(vault_err)?;
+        {
+            let mut guard = lock(&self.vault);
+            guard.as_mut().ok_or_else(locked)?.install_passphrase(pass_key, pc_key).map_err(vault_err)?;
+        }
+        Ok(self.status())
+    }
+
+    /// Sets or replaces the short PIN for this PC (ADR 0004 §3.3). Needs the
+    /// passphrase or the current PIN.
+    pub async fn set_this_pc_pin(&self, current: String, pin: String) -> AegisResult<Status> {
+        let (current, pin) = (Zeroizing::new(current), Zeroizing::new(pin));
+        vault::validate_new_pin(&pin).map_err(vault_err)?;
+        if vault::meets_passphrase_rule(&current) && pin.as_str() == current.as_str() {
+            return Err(AegisError::new(ErrorCode::PinTooWeak, "Use a different PIN for this PC than the passphrase."));
+        }
+        self.check_pin(&current).await?;
+        let kdf = self.kdf;
+        let key = tokio::task::spawn_blocking(move || NewKey::derive(&pin, kdf)).await.map_err(internal)?.map_err(vault_err)?;
+        {
+            let mut guard = lock(&self.vault);
+            guard.as_mut().ok_or_else(locked)?.set_this_pc(key).map_err(vault_err)?;
+        }
+        Ok(self.status())
+    }
+
+    /// Deletes the short PIN for this PC. Needs no PIN, works while locked:
+    /// it only removes a way in (ADR 0004 §3.3).
+    pub fn forget_this_pc(&self) -> AegisResult<Status> {
+        {
+            let mut guard = lock(&self.vault);
+            match guard.as_mut() {
+                Some(v) => v.forget_this_pc(),
+                None => vault::forget_this_pc(&self.vault_path()),
+            }
+            .map_err(vault_err)?;
+        }
+        Ok(self.status())
+    }
+
+    fn verifier(&self) -> AegisResult<vault::PinVerifier> {
+        let guard = lock(&self.vault);
+        Ok(guard.as_ref().ok_or_else(locked)?.verifier())
     }
 
     // ---- settings --------------------------------------------------------

@@ -199,3 +199,19 @@ test('UI: the monitor chat polls only the progress tool, quietly and without a P
   assert.equal(progressText({ phase: 'thinking', elapsedSecs: 3 }), 'The model is thinking (3 s).');
   assert.match(progressText({ phase: 'answering', elapsedSecs: 9, chars: 120 }), /120 characters so far \(9 s\)/);
 });
+
+test('UI: generated passphrases use the EFF large wordlist as published, made in the window', async () => {
+  const { createHash } = await import('node:crypto');
+  const list = fs.readFileSync('src/ui/assets/eff_large_wordlist.txt');
+  assert.equal(createHash('sha256').update(list).digest('hex'), 'addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e', 'byte for byte as EFF publishes it');
+  const words = list.toString('utf8').split('\n').map((l) => l.split('\t')[1]).filter(Boolean);
+  assert.equal(words.length, 7776);
+  assert.equal(new Set(words).size, 7776);
+  const ts = fs.readFileSync('src/ui/passphrase.ts', 'utf8');
+  assert.match(ts, /import list from '\.\/assets\/eff_large_wordlist\.txt\?raw'/);
+  assert.match(ts, /crypto\.getRandomValues/, 'words come from the browser cryptographic generator');
+  assert.doesNotMatch(ts, /Math\.random/);
+  // The app never sends a new passphrase back: no command returns one.
+  assert.doesNotMatch(apiTs, /generate_passphrase/);
+  assert.match(fs.readFileSync('README.md', 'utf8'), /EFF/, 'the README credits the EFF wordlist (CC BY 3.0)');
+});

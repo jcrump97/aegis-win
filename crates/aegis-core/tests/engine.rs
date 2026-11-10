@@ -21,6 +21,8 @@ async fn setup_lock_and_unlock() {
     let status = f.engine.status();
     assert!(!status.vault_exists && !status.unlocked);
     assert_eq!(f.engine.setup("123".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    // A six-digit PIN is no longer a vault key (ADR 0004 §3.2).
+    assert_eq!(f.engine.setup("135790".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
 
     let status = f.engine.setup(PIN.into()).await.unwrap();
     assert!(status.vault_exists && status.unlocked && !status.first_run_completed);
@@ -240,14 +242,47 @@ async fn settings_are_validated_and_hold_no_secrets() {
 }
 
 #[tokio::test]
-async fn changing_the_pin_re_keys_the_vault() {
+async fn changing_the_passphrase_re_keys_the_vault() {
     let f = ready().await;
-    assert_eq!(f.engine.change_pin("000000".into(), "135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
-    assert_eq!(f.engine.change_pin(PIN.into(), "1".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
-    f.engine.change_pin(PIN.into(), "135791".into()).await.unwrap();
+    let next = "next-passphrase-1";
+    assert_eq!(f.engine.change_passphrase("000000".into(), next.into(), None).await.unwrap_err().code, ErrorCode::PinInvalid);
+    // A new key must meet the passphrase rule (ADR 0004 §3.2).
+    assert_eq!(f.engine.change_passphrase(PIN.into(), "135791".into(), None).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert_eq!(f.engine.change_passphrase(PIN.into(), next.into(), Some("12345".into())).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert_eq!(f.engine.change_passphrase(PIN.into(), next.into(), Some(next.into())).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    let status = f.engine.change_passphrase(PIN.into(), next.into(), None).await.unwrap();
+    assert!(!status.needs_passphrase && !status.this_pc_pin);
     f.engine.lock().await;
     assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    f.engine.unlock(next.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_short_pin_on_this_pc_unlocks_and_approves_until_forgotten() {
+    let f = ready().await;
+    assert!(!f.engine.status().this_pc_pin);
+    assert_eq!(f.engine.set_this_pc_pin("000000".into(), "135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    assert_eq!(f.engine.set_this_pc_pin(PIN.into(), "1357".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert_eq!(f.engine.set_this_pc_pin(PIN.into(), PIN.into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert!(f.engine.set_this_pc_pin(PIN.into(), "135791".into()).await.unwrap().this_pc_pin);
+    // Either secret works for approvals.
+    f.engine.check_pin("135791").await.unwrap();
+    f.engine.check_pin(PIN).await.unwrap();
+    f.engine.lock().await;
+    assert!(f.engine.status().this_pc_pin, "known while locked, for the unlock screen");
     f.engine.unlock("135791".into()).await.unwrap();
+    f.engine.lock().await;
+    // Forgetting needs no PIN and works while locked.
+    assert!(!f.engine.forget_this_pc().unwrap().this_pc_pin);
+    assert_eq!(f.engine.unlock("135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    f.engine.unlock(PIN.into()).await.unwrap();
+    // A new passphrase keeps the PC PIN only if it is set again.
+    f.engine.set_this_pc_pin(PIN.into(), "135791".into()).await.unwrap();
+    let status = f.engine.change_passphrase("135791".into(), "next-passphrase-1".into(), Some("975310".into())).await.unwrap();
+    assert!(status.this_pc_pin);
+    f.engine.lock().await;
+    assert_eq!(f.engine.unlock("135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    f.engine.unlock("975310".into()).await.unwrap();
 }
 
 #[tokio::test]

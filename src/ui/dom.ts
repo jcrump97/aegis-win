@@ -82,13 +82,13 @@ export function modal<T>(build: (close: (value: T | null) => void) => Node): Pro
 /** Asks for the PIN. The value is handed straight to one command and not kept. */
 export function askPin(title: string, detail?: string, confirmLabel = 'Confirm'): Promise<string | null> {
   return modal<string>((close) => {
-    const input = h('input', { type: 'password', autocomplete: 'off', 'aria-label': 'PIN', required: true });
+    const input = h('input', { type: 'password', autocomplete: 'off', 'aria-label': 'Passphrase or PIN', required: true });
     const form = h(
       'form',
       { class: 'stack' },
       h('h2', {}, title),
       detail ? h('p', { class: 'hint' }, detail) : null,
-      h('label', {}, 'PIN'),
+      h('label', {}, 'Passphrase, or your PIN for this PC'),
       input,
       h('div', { class: 'row end' }, h('button', { type: 'button', onclick: () => close(null) }, 'Cancel'), h('button', { type: 'submit', class: 'primary' }, confirmLabel)),
     );

@@ -36,6 +36,19 @@ export interface Status {
   runtimeReviews: RuntimeReview[];
   /** Shown after unlock: monitoring was not running before this launch resumed it. */
   resumeNotices: ResumeNotice[];
+  /** The vault key is a short PIN from before passphrases; the owner must choose (ADR 0004 D2). */
+  needsPassphrase: boolean;
+  /** A short PIN on this PC can unlock (ADR 0004 §3.3). Known while locked. */
+  thisPcPin: boolean;
+}
+
+/** A guide for a passphrase being typed; the rule enforced is the length. */
+export interface PassphraseStrength {
+  score: number;
+  bits: number;
+  longEnough: boolean;
+  warning: string | null;
+  suggestions: string[];
 }
 
 export interface ResumeNotice {
@@ -284,7 +297,10 @@ export const api = {
   unlockVault: (pin: string) => call<Status>('unlock_vault', { pin }),
   lockVault: () => call<Status>('lock_vault'),
   noteActivity: () => call<void>('note_activity'),
-  changePin: (current: string, next: string) => call<void>('change_pin', { current, next }),
+  changePassphrase: (current: string, next: string, pcPin: string | null) => call<Status>('change_passphrase', { current, next, pcPin }),
+  setThisPcPin: (current: string, pin: string) => call<Status>('set_this_pc_pin', { current, pin }),
+  forgetThisPc: () => call<Status>('forget_this_pc'),
+  passphraseStrength: (text: string) => call<PassphraseStrength>('passphrase_strength', { text }),
   getSettings: () => call<SettingsView>('get_settings'),
   updateSettings: (update: SettingsUpdate) => call<SettingsView>('update_settings', { update }),
   setLlmApiKey: (key: string) => call<void>('set_llm_api_key', { key }),

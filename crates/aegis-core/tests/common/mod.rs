@@ -13,7 +13,7 @@ use aegis_core::AegisResult;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-pub const PIN: &str = "246810";
+pub const PIN: &str = "two-four-six-eight";
 
 pub struct DemoPlugin {
     manifest: PluginManifest,

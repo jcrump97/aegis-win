@@ -226,6 +226,15 @@ Everything below protects against **someone who copies the data folder** (offlin
 - **A stronger option, deferred.** Wrapping with a TPM-backed key (the Microsoft Platform Crypto Provider through NCrypt) gives a PIN that hardware limits against guessing, which would also slow same-user code. It keeps state in the user's key storage profile and needs a TPM. It is noted for later, not in this plan.
 - **The agent rule doesn't change.** The vault PIN and the passphrase never reach logs, LLM payloads, MCP responses, or `invoke` responses (CLAUDE.md). The device code (§1.2) is not a vault credential.
 
+**As built (Phase 2, `security/vault-key`).** §3.2 and §3.3 are done. Choices made while building:
+- **Words are generated in the window, not in Rust.** A new passphrase would otherwise travel in an `invoke` response, which CLAUDE.md forbids for vault secrets. The UI draws words with `crypto.getRandomValues` and rejection sampling. The EFF file is kept byte for byte (its SHA-256 is checked in a test); the 4 hyphenated words are left out when picking, so a passphrase splits back into words: 7,772 words, still about 64.6 bits for five.
+- **"Keep a short PIN on this PC only" still sets a passphrase.** The portable wrap must always be a passphrase (§3.3), so the banner's second button opens the same form with "Also keep a short PIN on this PC" ticked, for the owner to enter their current PIN there.
+- **A new passphrase means a new data key**, so copies taken under the old key cannot open later saves. The PC PIN wraps the old key, so it is set again in the same step or removed.
+- **Format 1 vaults are rewritten at first unlock** with a new data key wrapped under the same PIN key (flag "meets the rule" false), so a PC PIN can be added safely afterwards. A format 1 secret of 14+ characters still counts as not meeting the rule, because its Argon2 parameters were 64 MiB.
+- **Tuning is measured once per run**: one 256 MiB derivation; over 1.5 s drops to the 128 MiB floor.
+- **Either secret approves.** Checks try the passphrase first, or the PC PIN first for input under 14 characters, so a wrong entry costs at most two derivations. Both go through `PinGuard`.
+- **`vault.thispc.bin`** is ignored when it is from another account or damaged, fails as a wrong PIN when it wraps an old data key, and is deleted when a new vault is created in the folder.
+
 ## 4. A tamper-evident approval record
 
 This applies to the `approvals` stream first. Plugin streams (`usage-monitor`) get the same format later; it is optional for them (decision D4).

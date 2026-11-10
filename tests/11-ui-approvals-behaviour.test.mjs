@@ -76,6 +76,9 @@ const finished = { ...base, ticketId: 'one-3', pluginId: 'windows-health', toolI
 const calls = [];
 let reviews = [];
 let notices = [];
+let needsPassphrase = false;
+let thisPcPin = false;
+const keyCalls = [];
 let autostart = { state: 'off', shortcut: 'C:\Startup\AegisWin Monitor.lnk', wanted: true };
 const autostartCalls = [];
 const recordCalls = [];
@@ -90,7 +93,14 @@ function backend(cmd, args) {
   calls.push(cmd);
   switch (cmd) {
     case 'status':
-      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews, resumeNotices: notices };
+      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews, resumeNotices: notices, needsPassphrase, thisPcPin };
+    case 'change_passphrase':
+      keyCalls.push({ cmd, ...args });
+      needsPassphrase = false;
+      thisPcPin = args.pcPin !== null;
+      return backend('status');
+    case 'passphrase_strength':
+      return { score: 1, bits: 20, longEnough: false, warning: 'This is a commonly used password.', suggestions: [] };
     case 'get_autostart':
       return autostart;
     case 'enable_autostart':
@@ -136,6 +146,15 @@ function backend(cmd, args) {
   }
 }
 
+/** Vite's `?raw` imports (the EFF wordlist), as esbuild text. */
+const rawImports = {
+  name: 'raw',
+  setup(b) {
+    b.onResolve({ filter: /\?raw$/ }, (a) => ({ path: path.resolve(a.resolveDir, a.path.replace(/\?raw$/, '')), namespace: 'raw' }));
+    b.onLoad({ filter: /.*/, namespace: 'raw' }, (a) => ({ contents: fs.readFileSync(a.path, 'utf8'), loader: 'text' }));
+  },
+};
+
 async function settle() {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
 }
@@ -165,6 +184,7 @@ test('a running plan stays under "In progress" after switching to the Monitor ta
     format: 'esm',
     platform: 'browser',
     loader: { '.css': 'empty' },
+    plugins: [rawImports],
     logLevel: 'silent',
   });
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-ui-')), 'main.mjs');
@@ -312,4 +332,41 @@ test('the approval record needs the PIN to show and to delete, and shows supplie
   await submitPin('246810');
   assert.deepEqual(recordCalls.at(-1), { cmd: 'delete_approval_record', pin: '246810' });
   assert.ok(card().textContent.includes('Approval record deleted (3 file(s)).'));
+});
+
+test('a vault with a short PIN gets a banner until a passphrase is chosen, and can keep the PIN on this PC', async () => {
+  const { document, intervals } = app;
+  const banner = () => document.querySelector('main').childNodes[0];
+  needsPassphrase = true;
+  for (const poll of intervals) await poll();
+  await settle();
+  assert.ok(banner().textContent.includes('Your PIN can be guessed in hours if someone copies your AegisWin folder.'), banner().textContent);
+  assert.ok(!banner().querySelectorAll('button').some((b) => b.textContent === 'Dismiss'), 'the choice cannot be dismissed (D2)');
+
+  banner().querySelectorAll('button').find((b) => b.textContent === 'Keep a short PIN on this PC only').click();
+  await settle();
+  const form = document.getElementById('vault-key');
+  assert.ok(form, 'the passphrase form is shown');
+  assert.ok(form.textContent.includes('Choose a passphrase'));
+  const byId = (id) => form.querySelectorAll('input').find((i) => i.id === id);
+  assert.equal(byId('pc-pin-on').checked, true, 'keeping the PIN on this PC is preselected');
+
+  const words = form.querySelectorAll('code').find((c) => c.className.includes('passphrase')).textContent;
+  assert.equal(words.split('-').length, 5, `five generated words (${words})`);
+  const submit = () => form.dispatchEvent({ type: 'submit', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  byId('key-current').value = '135790';
+  byId('pc-pin-new').value = '135790';
+  byId('pc-pin-confirm').value = '135790';
+  submit();
+  await settle();
+  assert.equal(keyCalls.length, 0, 'nothing is sent until the owner ticks that it is written down');
+  assert.ok(form.textContent.includes('I’ve written it down'));
+
+  byId('pp-written').checked = true;
+  submit();
+  await settle();
+  assert.deepEqual(keyCalls, [{ cmd: 'change_passphrase', current: '135790', next: words, pcPin: '135790' }]);
+  for (const poll of intervals) await poll();
+  await settle();
+  assert.ok(!banner().textContent.includes('can be guessed'), 'the banner goes once a passphrase is set');
 });
