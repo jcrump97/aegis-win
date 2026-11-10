@@ -163,6 +163,33 @@ impl ToolContext {
     }
 }
 
+/// One system command a call runs: an absolute executable path and its
+/// argument vector, never a shell line (ADR 0004 §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandLine {
+    pub exe: String,
+    pub args: Vec<String>,
+}
+
+impl CommandLine {
+    pub fn new(exe: impl Into<String>, args: &[&str]) -> Self {
+        Self { exe: exe.into(), args: args.iter().map(|a| a.to_string()).collect() }
+    }
+
+    /// As shown to the owner: arguments with spaces or quotes are quoted, so
+    /// where one argument ends is never ambiguous.
+    pub fn display(&self) -> String {
+        std::iter::once(&self.exe).chain(&self.args).map(|a| quoted(a)).collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn quoted(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    format!("\"{}\"", arg.replace('"', "\\\""))
+}
+
 /// What a call would do, written by the plugin's own code from the arguments
 /// (never from AI- or agent-supplied text). Shown with an approval request,
 /// next to the raw arguments.
@@ -269,6 +296,19 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// The exact commands a call would run, from a pure function of its
+    /// validated arguments (ADR 0004 §5). Whether it returns `Some` must
+    /// depend on the tool only. For a tool that returns `Some`:
+    /// - AegisWin answers `dryRun: true` itself, and never calls [`Plugin::call`] for it;
+    /// - the commands are shown with an approval request and covered by a plan's hash;
+    /// - AegisWin asks again just before the call runs, and refuses it if the answer changed.
+    ///
+    /// A tool that returns `None` (the default) gets no free dry run: `dryRun: true`
+    /// goes through the gate like any other call.
+    fn describe(&self, _tool: &str, _args: &Value) -> Option<AegisResult<Vec<CommandLine>>> {
+        None
+    }
+
     /// True while the plugin is doing work the owner asked to keep running
     /// in the background (for example an active monitor). Closing the window
     /// then hides AegisWin to the tray instead of quitting.
@@ -361,7 +401,7 @@ pub fn effective_policy(plugin_id: &str, tool: &ToolManifest, overrides: &BTreeM
     overrides.get(&policy_key(plugin_id, &tool.id)).copied().unwrap_or(tool.default_gate_policy)
 }
 
-/// A dry run only describes what would happen, so it skips the PIN and admin gates.
+/// The call asks for a dry run (`dryRun: true`, on a tool that declares it).
 pub fn is_dry_run(tool: &ToolManifest, args: &Value) -> bool {
     tool.input_schema.pointer("/properties/dryRun").is_some() && args.get("dryRun") == Some(&Value::Bool(true))
 }
@@ -373,9 +413,12 @@ pub enum Gate {
     NeedsAdmin,
 }
 
-/// Admin is checked before the PIN: approving something that cannot run would waste the approval.
-pub fn gate(tool: &ToolManifest, policy: GatePolicy, args: &Value, elevated: bool) -> Gate {
-    if is_dry_run(tool, args) {
+/// Admin is checked before the PIN: approving something that cannot run would
+/// waste the approval. A dry run skips both only when the plugin `describes`
+/// the tool, since AegisWin then answers it without calling the plugin
+/// (ADR 0004 §5).
+pub fn gate(tool: &ToolManifest, policy: GatePolicy, args: &Value, elevated: bool, describes: bool) -> Gate {
+    if describes && is_dry_run(tool, args) {
         Gate::Run
     } else if tool.requires_admin && !elevated {
         Gate::NeedsAdmin
@@ -471,12 +514,20 @@ mod tests {
         let m = manifest();
         let fix = m.tool("fix_it").unwrap();
         let read = m.tool("read_it").unwrap();
-        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({ "dryRun": true }), false), Gate::Run);
-        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), false), Gate::NeedsAdmin);
-        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), true), Gate::NeedsPin);
-        assert_eq!(gate(read, GatePolicy::Auto, &json!({}), false), Gate::Run);
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({ "dryRun": true }), false, true), Gate::Run);
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), false, true), Gate::NeedsAdmin);
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), true, true), Gate::NeedsPin);
+        assert_eq!(gate(read, GatePolicy::Auto, &json!({}), false, false), Gate::Run);
         // dryRun only counts for tools that declare it.
-        assert_eq!(gate(read, GatePolicy::PinRequired, &json!({ "dryRun": true }), false), Gate::NeedsPin);
+        assert_eq!(gate(read, GatePolicy::PinRequired, &json!({ "dryRun": true }), false, true), Gate::NeedsPin);
+        // And only when the plugin describes the tool, so AegisWin answers it.
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({ "dryRun": true }), true, false), Gate::NeedsPin);
+    }
+
+    #[test]
+    fn command_lines_show_where_each_argument_ends() {
+        let c = CommandLine::new(r"C:\Windows\System32\ipconfig.exe", &["/release", "Wi-Fi 2", "", "a\"b"]);
+        assert_eq!(c.display(), r#"C:\Windows\System32\ipconfig.exe /release "Wi-Fi 2" "" "a\"b""#);
     }
 
     #[test]

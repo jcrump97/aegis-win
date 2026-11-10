@@ -23,7 +23,7 @@ use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
 use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
-use crate::registry::{self, ExitReason, Gate, GatePolicy, Launch, LockedContext, Plugin, Registry, ResumeNotice, ToolContext, ToolManifest, UnlockContext};
+use crate::registry::{self, CommandLine, ExitReason, Gate, GatePolicy, Launch, LockedContext, Plugin, Registry, ResumeNotice, ToolContext, ToolManifest, UnlockContext};
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
@@ -287,6 +287,8 @@ pub struct ExposedTool {
     pub plugin_id: String,
     pub tool: ToolManifest,
     pub policy: GatePolicy,
+    /// Its plugin describes its commands, so AegisWin answers its dry runs (ADR 0004 §5).
+    pub described: bool,
 }
 
 /// A call that passed every check except the gate.
@@ -295,7 +297,16 @@ struct Prepared {
     tool: ToolManifest,
     args: Value,
     gate: Gate,
+    /// The commands it runs, when the plugin describes them (ADR 0004 §5).
+    commands: Option<Vec<CommandLine>>,
     ctx: ToolContext,
+}
+
+impl Prepared {
+    /// A dry run AegisWin answers itself, without calling the plugin.
+    fn answered_dry_run(&self) -> bool {
+        self.commands.is_some() && registry::is_dry_run(&self.tool, &self.args)
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1389,12 +1400,15 @@ impl Engine {
                     "hash": plan.hash,
                     "title": plan.title.as_deref().map(cut_text),
                     "titleLabel": plan.supplied_label,
-                    "steps": view.steps.iter().map(|s| json!({ "tool": s.tool, "args": capped_args(&s.args) })).collect::<Vec<_>>(),
+                    "steps": view.steps.iter().map(|s| json!({ "tool": s.tool, "args": capped_args(&s.args), "commands": s.commands })).collect::<Vec<_>>(),
                 });
             }
             None => {
                 record["tool"] = json!(registry::mcp_tool_name(&view.plugin_id, &view.tool_id));
                 record["args"] = capped_args(&view.args);
+                if !view.commands.is_empty() {
+                    record["commands"] = json!(view.commands);
+                }
             }
         }
         let refused = self.record_required(record, origin.starts_with("mcp"), false, "the request was refused");
@@ -1434,7 +1448,7 @@ impl Engine {
     /// every change AegisWin made and monitor events can be labelled as
     /// happening during a repair (ADR 0003 §5, §7).
     async fn call_recorded(&self, prepared: Prepared, by: Value) -> AegisResult<Value> {
-        if !changes_system(&prepared.tool, &prepared.args) {
+        if !changes_system(&prepared.tool) {
             return prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await;
         }
         let tool = registry::mcp_tool_name(&prepared.plugin.manifest().id, &prepared.tool.id);
@@ -1727,6 +1741,8 @@ impl Engine {
                             plugin_id: m.id.clone(),
                             tool: tool.clone(),
                             policy: registry::effective_policy(&m.id, tool, &s.tool_gate_overrides),
+                            // Whether it returns Some depends on the tool only (Plugin::describe).
+                            described: plugin.describe(&tool.id, &json!({})).is_some(),
                         });
                     }
                 }
@@ -1752,8 +1768,12 @@ impl Engine {
             }
         }
         let args = schema::validate(&tool.input_schema, args).map_err(AegisError::invalid)?;
+        let commands = match plugin.describe(&tool.id, &args) {
+            None => None,
+            Some(described) => Some(absolute_commands(&plugin.manifest().name, described?)?),
+        };
         let policy = registry::effective_policy(plugin_id, tool, &state.tool_gate_overrides);
-        let gate = registry::gate(tool, policy, &args, self.elevated);
+        let gate = registry::gate(tool, policy, &args, self.elevated, commands.is_some());
         let llm = plugin
             .manifest()
             .uses_llm
@@ -1763,6 +1783,7 @@ impl Engine {
             tool: tool.clone(),
             args,
             gate,
+            commands,
             ctx: ToolContext {
                 elevated: self.elevated,
                 enabled_components: components,
@@ -1781,6 +1802,10 @@ impl Engine {
             return Err(AegisError::new(ErrorCode::UnknownTool, format!("unknown tool {plugin_id}:{tool_id}")));
         }
         let prepared = self.prepare(plugin_id, tool_id, args)?;
+        // Safe by construction: the plugin is never called for it (ADR 0004 §5).
+        if prepared.answered_dry_run() {
+            return Ok(RunOutcome::Completed { result: dry_run_answer(&prepared) });
+        }
         let source = if matches!(origin, Origin::Mcp) { "mcp" } else { "app" };
         match prepared.gate {
             Gate::NeedsAdmin => Err(AegisError::requires_admin(&prepared.tool.name)),
@@ -1810,6 +1835,7 @@ impl Engine {
                             requires_admin: prepared.tool.requires_admin,
                             args: prepared.args,
                             review,
+                            commands: prepared.commands,
                             plan: None,
                             steps: Vec::new(),
                         },
@@ -1825,7 +1851,7 @@ impl Engine {
 
     /// Runs a call now if it cannot change the system, otherwise in its turn.
     async fn run_in_turn(&self, epoch: u64, prepared: Prepared, source: &'static str) -> AegisResult<RunOutcome> {
-        if !changes_system(&prepared.tool, &prepared.args) {
+        if !changes_system(&prepared.tool) {
             return execute(prepared).await;
         }
         let engine = self.self_arc()?;
@@ -2044,7 +2070,7 @@ impl Engine {
             .collect();
         // Taken before the ticket changes, so a full queue leaves it pending.
         let place = match &prepared {
-            Ok(p) if is_plan || changes_system(&p[0].tool, &p[0].args) => Some(self.executor.enqueue(epoch, &label, Some(id)).map_err(queue_error)?),
+            Ok(p) if is_plan || changes_system(&p[0].tool) => Some(self.executor.enqueue(epoch, &label, Some(id)).map_err(queue_error)?),
             _ => None,
         };
         let mut store = lock(&self.tickets);
@@ -2153,11 +2179,11 @@ impl Engine {
                 }
             },
         };
-        let is_plan = match lock(&self.tickets).get_mut(id, Instant::now()) {
+        let (is_plan, approved) = match lock(&self.tickets).get_mut(id, Instant::now()) {
             // Locked, or cancelled just as its turn came.
             None => return,
             Some(ticket) if ticket.status.is_final() => return,
-            Some(ticket) => ticket.plan.is_some(),
+            Some(ticket) => (ticket.plan.is_some(), ticket.commands.clone()),
         };
         if is_plan {
             return self.run_plan(id, steps).await;
@@ -2171,6 +2197,10 @@ impl Engine {
         } else {
             prepared
         };
+        // Asked again just before it runs: what runs is what was shown (ADR 0004 §5).
+        if prepared.commands != approved {
+            return finish(Err(commands_changed()), failed);
+        }
         if let Some(ticket) = lock(&self.tickets).get_mut(id, Instant::now()) {
             ticket.status = TicketStatus::Running;
         }
@@ -2220,7 +2250,9 @@ impl Engine {
             if self.executor.held() {
                 return end(TicketStatus::Cancelled, format!("AegisWin is locking after inactivity, so step {n} did not start."), i, StepStatus::Cancelled);
             }
-            let fresh = match self.recheck(step) {
+            let mut approved = Vec::new();
+            update(&mut |t| approved = t.steps[i].command_lines.clone());
+            let fresh = match self.recheck(step).and_then(|p| if p.commands.as_ref() == Some(&approved) { Ok(p) } else { Err(commands_changed()) }) {
                 Ok(p) => p,
                 Err(e) => {
                     let reason = format!("Step {n} could not start: {}", e.message);
@@ -2325,6 +2357,9 @@ impl Engine {
                 return Err(AegisError::invalid(format!("Step {n}: {} cannot be a plan step. Plans can only use repairs that allow it.", tool.name)));
             }
             let prepared = self.prepare(plugin_id, tool_id, step.args.clone()).map_err(|e| at(n, e))?;
+            if prepared.commands.is_none() {
+                return Err(AegisError::invalid(format!("Step {n}: {} cannot list the commands it runs, so it cannot be a plan step.", tool.name)));
+            }
             if prepared.gate == Gate::NeedsAdmin {
                 return Err(AegisError::new(
                     ErrorCode::RequiresAdmin,
@@ -2344,13 +2379,10 @@ impl Engine {
             return Err(too_many_plans());
         }
 
-        // Dry runs: the exact commands each step would run. One that fails rejects the plan.
+        // The exact commands each step runs, from the plugin's `describe`; the plugin is not called.
         let mut shown = Vec::with_capacity(steps.len());
         for (i, (step, p)) in steps.iter().enumerate() {
-            let mut args = p.args.clone();
-            args["dryRun"] = Value::Bool(true);
-            let preview = p.plugin.call(&p.tool.id, args, p.ctx.clone()).await.map_err(|e| at(i + 1, AegisError { message: format!("its dry run failed: {}", e.message), ..e }))?;
-            let commands: Vec<String> = preview.get("commands").and_then(Value::as_array).map(|c| c.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            let command_lines = p.commands.clone().unwrap_or_default();
             shown.push(PlanStep {
                 index: i + 1,
                 tool: step.tool.clone(),
@@ -2361,14 +2393,15 @@ impl Engine {
                 requires_admin: p.tool.requires_admin,
                 args: p.args.clone(),
                 reasoning: step.reasoning.clone(),
-                commands,
+                commands: command_lines.iter().map(CommandLine::display).collect(),
+                command_lines,
                 status: StepStatus::Pending,
                 result: None,
                 error: None,
             });
         }
 
-        let hashed: Vec<(String, Value, Option<String>)> = shown.iter().map(|s| (s.tool.clone(), s.args.clone(), s.reasoning.clone())).collect();
+        let hashed: Vec<plan::HashedStep> = shown.iter().map(|s| (s.tool.clone(), s.args.clone(), s.reasoning.clone(), s.command_lines.clone())).collect();
         let hash = plan::plan_hash(request.title.as_deref(), request.reasoning.as_deref(), &hashed);
         let known: Vec<(String, String, String)> = self
             .registry
@@ -2410,6 +2443,7 @@ impl Engine {
                 requires_admin: admin_steps > 0,
                 args: Value::Null,
                 review: None,
+                commands: None,
                 plan: Some(meta),
                 steps: shown,
             },
@@ -2421,15 +2455,15 @@ impl Engine {
     }
 
     fn ticket_changes_system(&self, id: &str) -> bool {
-        let Some((plugin_id, tool_id, args, is_plan)) =
-            lock(&self.tickets).get(id, Instant::now()).map(|t| (t.plugin_id.clone(), t.tool_id.clone(), t.args.clone(), t.plan.is_some()))
+        let Some((plugin_id, tool_id, is_plan)) =
+            lock(&self.tickets).get(id, Instant::now()).map(|t| (t.plugin_id.clone(), t.tool_id.clone(), t.plan.is_some()))
         else {
             return false;
         };
         if is_plan {
             return true;
         }
-        self.registry.tool(&plugin_id, &tool_id).is_some_and(|(_, tool)| changes_system(tool, &args))
+        self.registry.tool(&plugin_id, &tool_id).is_some_and(|(_, tool)| changes_system(tool))
     }
 
     fn pending_ticket(&self, id: &str) -> AegisResult<()> {
@@ -2599,9 +2633,39 @@ impl Engine {
 }
 
 /// Every run that can change Windows or AegisWin goes through the executor.
-/// Read-only tools and dry runs never wait.
-fn changes_system(tool: &ToolManifest, args: &Value) -> bool {
-    !tool.read_only && args.get("dryRun") != Some(&Value::Bool(true))
+/// Read-only tools never wait, and dry runs AegisWin answers never get this
+/// far. A dry run of a tool its plugin does not describe is treated as a
+/// change: it went through the gate, and nothing but convention keeps it from
+/// changing anything (ADR 0004 §5).
+fn changes_system(tool: &ToolManifest) -> bool {
+    !tool.read_only
+}
+
+/// A plugin must name programs by absolute path (PLUGIN_SPEC §4).
+fn absolute_commands(plugin: &str, commands: Vec<CommandLine>) -> AegisResult<Vec<CommandLine>> {
+    match commands.iter().find(|c| !Path::new(&c.exe).is_absolute()) {
+        Some(c) => Err(internal(format!("{plugin} described a command without an absolute path ({})", c.exe))),
+        None => Ok(commands),
+    }
+}
+
+/// The answer to a dry run of a tool its plugin describes, written by
+/// AegisWin from `describe` and `review_call` (ADR 0004 §5).
+fn dry_run_answer(p: &Prepared) -> Value {
+    let commands = p.commands.as_deref().unwrap_or_default();
+    json!({
+        "executed": false,
+        "dryRun": true,
+        "commands": commands.iter().map(CommandLine::display).collect::<Vec<_>>(),
+        "commandLines": commands,
+        "review": p.plugin.review_call(&p.tool.id, &p.args, &p.ctx.enabled_components),
+        "requiresAdmin": p.tool.requires_admin,
+        "elevated": p.ctx.elevated,
+    })
+}
+
+fn commands_changed() -> AegisError {
+    AegisError::new(ErrorCode::Conflict, "The commands changed since you approved them, so nothing ran. Ask for the change again to see the new commands.")
 }
 
 fn queue_error(e: executor::Full) -> AegisError {

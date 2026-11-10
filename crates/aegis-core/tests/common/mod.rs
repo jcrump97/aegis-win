@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use aegis_core::engine::{Engine, EngineOptions};
 use aegis_core::history_service::HistoryHandle;
 use aegis_core::plugin_data::PluginStore;
-use aegis_core::registry::{CallReview, Plugin, PluginManifest, Registry, ToolContext, UnlockContext};
+use aegis_core::registry::{CallReview, CommandLine, Plugin, PluginManifest, Registry, ToolContext, UnlockContext};
 use aegis_core::vault::KdfParams;
 use aegis_core::AegisResult;
 use async_trait::async_trait;
@@ -27,12 +27,16 @@ pub struct DemoPlugin {
     /// `fix` with a note starting "wait" records the note, then blocks until
     /// a permit is added to `release`. A note starting "fail" makes `fix`
     /// fail, "unwell" makes it report `"success": false`, and "nodry" makes
-    /// its dry run fail. Every real `fix` run is recorded in `fixed`.
+    /// `describe` fail. Every `fix` run is recorded in `fixed`, and every
+    /// dry run that reached `call` in `dry_calls`.
     pub started: Mutex<Vec<String>>,
     pub release: tokio::sync::Semaphore,
     pub running: AtomicUsize,
     pub max_running: AtomicUsize,
     pub fixed: Mutex<Vec<String>>,
+    pub dry_calls: AtomicUsize,
+    /// Added to `fix`'s described arguments, to change its commands after approval.
+    pub describe_extra: Mutex<Option<String>>,
 }
 
 impl Default for DemoPlugin {
@@ -60,6 +64,9 @@ impl DemoPlugin {
                     { "id": "fix", "name": "Fix <it>", "description": "Changes something.", "requiresAdmin": false,
                       "defaultGatePolicy": "pin_required", "readOnly": false, "planEligible": true,
                       "inputSchema": { "type": "object", "properties": { "dryRun": { "type": "boolean", "default": false }, "note": { "type": "string" } } } },
+                    { "id": "old_fix", "name": "Old fix", "description": "Changes something, and does not describe its commands.", "requiresAdmin": false,
+                      "defaultGatePolicy": "pin_required", "readOnly": false,
+                      "inputSchema": { "type": "object", "properties": { "dryRun": { "type": "boolean", "default": false } } } },
                     { "id": "admin_fix", "name": "Admin fix", "description": "Needs admin.", "requiresAdmin": true,
                       "defaultGatePolicy": "pin_required", "readOnly": false, "inputSchema": { "type": "object", "properties": {} } },
                     { "id": "extra_tool", "name": "Extra", "description": "Component tool.", "requiresAdmin": false,
@@ -82,6 +89,8 @@ impl DemoPlugin {
             running: AtomicUsize::new(0),
             max_running: AtomicUsize::new(0),
             fixed: Mutex::new(Vec::new()),
+            dry_calls: AtomicUsize::new(0),
+            describe_extra: Mutex::new(None),
         }
     }
 }
@@ -102,11 +111,11 @@ impl Plugin for DemoPlugin {
             self.release.acquire().await.unwrap().forget();
             self.running.fetch_sub(1, Ordering::SeqCst);
         }
+        if args["dryRun"] == true {
+            self.dry_calls.fetch_add(1, Ordering::SeqCst);
+        }
         if tool == "fix" {
             let dry = args["dryRun"] == true;
-            if dry && note.starts_with("nodry") {
-                return Err(aegis_core::AegisError::new(aegis_core::ErrorCode::ExecutionFailed, "dry run broke"));
-            }
             if !dry {
                 self.fixed.lock().unwrap().push(note.clone());
                 if note.starts_with("fail") {
@@ -119,7 +128,6 @@ impl Plugin for DemoPlugin {
         }
         Ok(match tool {
             "echo" => json!({ "echo": args }),
-            "fix" if args["dryRun"] == true => json!({ "dryRun": true, "commands": [format!("fix.exe {note}")] }),
             _ => json!({ "done": tool }),
         })
     }
@@ -132,6 +140,19 @@ impl Plugin for DemoPlugin {
 
     fn on_lock(&self) {
         self.locks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn describe(&self, tool: &str, args: &Value) -> Option<AegisResult<Vec<CommandLine>>> {
+        (tool == "fix").then(|| {
+            let note = args["note"].as_str().unwrap_or_default();
+            if note.starts_with("nodry") {
+                return Err(aegis_core::AegisError::invalid("cannot describe that note"));
+            }
+            let mut argv = vec![note];
+            let extra = self.describe_extra.lock().unwrap().clone();
+            argv.extend(extra.as_deref());
+            Ok(vec![CommandLine::new(r"C:\demo\fix.exe", &argv)])
+        })
     }
 
     fn review_call(&self, tool: &str, args: &Value, _enabled_components: &[String]) -> Option<CallReview> {

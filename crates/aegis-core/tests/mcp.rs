@@ -96,6 +96,9 @@ async fn handshake_and_tool_listing() {
     let fix = tools.iter().find(|t| t["name"] == "demo__fix").unwrap();
     assert_eq!(fix["annotations"]["readOnlyHint"], false);
     assert!(fix["description"].as_str().unwrap().contains("approval in the AegisWin app"));
+    assert!(fix["description"].as_str().unwrap().contains("dryRun: true shows the exact commands without running them or needing approval."));
+    let old = tools.iter().find(|t| t["name"] == "demo__old_fix").unwrap();
+    assert!(old["description"].as_str().unwrap().contains("dryRun: true still needs the owner's approval"), "{old}");
     assert!(!list.to_string().contains("approvalUrl"));
 
     assert_eq!(s.rpc("ping", json!({})).await["result"], json!({}));
@@ -382,7 +385,7 @@ async fn plans_are_proposed_over_mcp_and_approved_with_their_fingerprint() {
     assert!(pending.get("csrf").is_none());
     let (hash, short) = (pending["plan"]["hash"].as_str().unwrap().to_owned(), pending["plan"]["shortHash"].as_str().unwrap().to_owned());
     assert!(pending["message"].as_str().unwrap().contains(&short), "the agent is told the fingerprint to share");
-    assert_eq!(pending["steps"][0]["commands"], json!(["fix.exe a"]));
+    assert_eq!(pending["steps"][0]["commands"], json!([r"C:\demo\fix.exe a"]));
     let id = pending["ticketId"].as_str().unwrap().to_owned();
     let (url, code) = s.device_code(&id).await;
 
@@ -391,7 +394,7 @@ async fn plans_are_proposed_over_mcp_and_approved_with_their_fingerprint() {
     assert!(html.contains("Fix &lt;both&gt;") && html.contains("First a, then &lt;b&gt;b&lt;/b&gt;.") && html.contains("&lt;i&gt;a&lt;/i&gt; first"), "{html}");
     assert!(!html.contains("<b>b</b>") && !html.contains("<i>a</i>"));
     assert!(html.contains("<code>") && html.contains(&short));
-    assert!(html.contains("fix.exe a") && html.contains("fix.exe b"));
+    assert!(html.contains(r"C:\demo\fix.exe a") && html.contains(r"C:\demo\fix.exe b"));
     assert!(html.contains("Approve and run 2 steps"));
     assert!(html.contains(&format!("name=\"plan_hash\" value=\"{hash}\"")));
     let csrf = extract_csrf(&html);

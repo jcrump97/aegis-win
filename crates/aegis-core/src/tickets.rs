@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AegisError;
 use crate::plan::PlanOrigin;
-use crate::registry::CallReview;
+use crate::registry::{CallReview, CommandLine};
 
 pub const TICKET_TTL: Duration = Duration::from_secs(30 * 60);
 /// Plans wait for a decision for less time than single requests (ADR 0003 §3).
@@ -75,8 +75,12 @@ pub struct PlanStep {
     pub args: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
-    /// The commands the step's dry run said it would run.
+    /// The commands the step runs, as shown (ADR 0004 §5).
     pub commands: Vec<String>,
+    /// The same commands as the plugin described them; covered by the plan's
+    /// hash and compared again just before the step runs.
+    #[serde(skip)]
+    pub command_lines: Vec<CommandLine>,
     pub status: StepStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -118,6 +122,8 @@ pub struct Ticket {
     pub requires_admin: bool,
     pub args: Value,
     pub review: Option<CallReview>,
+    /// The commands the call runs, when the plugin describes them (ADR 0004 §5).
+    pub commands: Option<Vec<CommandLine>>,
     pub created: Instant,
     pub created_at: String,
     pub status: TicketStatus,
@@ -191,6 +197,9 @@ pub struct TicketView {
     /// The plugin's code-generated description of the call, when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<CallReview>,
+    /// The exact commands it runs, as the plugin's code described them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     pub created_at: String,
     pub status: TicketStatus,
     /// While `queued`: 1 means it runs next. Other items are never described.
@@ -221,6 +230,7 @@ impl Ticket {
             requires_admin: self.requires_admin,
             args: self.args.clone(),
             review: self.review.clone(),
+            commands: self.commands.iter().flatten().map(CommandLine::display).collect(),
             created_at: self.created_at.clone(),
             status: self.status,
             queue_position: None,
@@ -254,6 +264,7 @@ pub struct NewTicket {
     pub requires_admin: bool,
     pub args: Value,
     pub review: Option<CallReview>,
+    pub commands: Option<Vec<CommandLine>>,
     pub plan: Option<PlanMeta>,
     pub steps: Vec<PlanStep>,
 }
@@ -283,6 +294,7 @@ impl TicketStore {
             requires_admin: t.requires_admin,
             args: t.args,
             review: t.review,
+            commands: t.commands,
             created: now,
             created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             status: TicketStatus::PendingApproval,
@@ -379,6 +391,7 @@ mod tests {
             requires_admin: false,
             args: json!({}),
             review: None,
+            commands: None,
             plan: None,
             steps: Vec::new(),
         }

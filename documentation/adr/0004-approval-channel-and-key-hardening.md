@@ -327,6 +327,14 @@ The same results are written into the record as `integrity` events the next time
   - Before each step runs, the engine calls `describe()` again and refuses the step if the result differs: "The commands changed since you approved them."
 - **Deferred.** The core executing the commands itself (the plugin returning commands, and `os` running them) is noted for later. With the check above, it isn't needed now.
 
+**As built (Phase 4, `security/repair-binding`).** §5 is done. Choices made while building:
+- **`describe` returns `Option<AegisResult<Vec<CommandLine>>>`.** Arguments can be invalid in ways the schema cannot say (an adapter filter with `|`), so a description can fail; that refuses the call, dry or not. Whether it is `Some` depends on the tool only, which lets `tools/list` tell agents which tools get free dry runs.
+- **Commands are absolute.** `windows-health` returns `GetSystemDirectoryW()` joined with the exe name, the folder `os::run_system_binary` runs it from; the engine refuses a description without an absolute path. Displayed commands quote arguments with spaces (`ipconfig.exe /renew "Wi-Fi 2"`).
+- **The dry run answer comes from the engine:** `commands`, `commandLines`, the plugin's `review` (`windows-health` now has `review_call`: the impact, each command, and warnings), `requiresAdmin`, `elevated`. `windows-health`'s `call` refuses a dry run outright.
+- **A dry run of a tool without `describe` is treated as a change** after its approval (it waits for the one slot and gets `change_started`), since nothing but convention keeps it from changing anything. Such a tool cannot be a plan step.
+- **Recorded too.** The approval record's `created` event keeps the commands shown, for single requests and for each plan step.
+- **The check runs after the turn comes**, with the plugin and component checks, for single requests and before each plan step; a plan stops there with "Step n could not start: The commands changed since you approved them".
+
 ## 6. Phased fix plan
 
 Each phase is its own branch, stacked on this one, with a review and isolated CI before every commit. Nothing is pushed without the owner's OK.

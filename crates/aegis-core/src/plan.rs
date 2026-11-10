@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::registry::CommandLine;
 use crate::schema::is_hidden_char;
 
 pub const MAX_STEPS: usize = 5;
@@ -94,11 +95,16 @@ fn clean(what: &str, text: Option<String>, max: usize, newlines: bool) -> Result
     Ok(Some(text))
 }
 
+/// One step as the hash sees it: the tool, its filled-in arguments, its
+/// reasoning, and the commands it runs.
+pub type HashedStep = (String, Value, Option<String>, Vec<CommandLine>);
+
 /// SHA-256 of the plan in canonical JSON (sorted keys, no spaces): the title,
-/// the reasoning, and each step's tool, filled-in arguments, and reasoning.
-/// Everything the review screen shows from the request is covered.
-pub fn plan_hash(title: Option<&str>, reasoning: Option<&str>, steps: &[(String, Value, Option<String>)]) -> String {
-    let steps: Vec<Value> = steps.iter().map(|(tool, args, why)| json!({ "tool": tool, "args": args, "reasoning": why })).collect();
+/// the reasoning, and each step's tool, filled-in arguments, reasoning and
+/// commands (ADR 0004 §5). Everything the review screen shows is covered.
+pub fn plan_hash(title: Option<&str>, reasoning: Option<&str>, steps: &[HashedStep]) -> String {
+    let steps: Vec<Value> =
+        steps.iter().map(|(tool, args, why, commands)| json!({ "tool": tool, "args": args, "reasoning": why, "commands": commands })).collect();
     let mut canonical = String::new();
     write_canonical(&json!({ "title": title, "reasoning": reasoning, "steps": steps }), &mut canonical);
     hex::encode(Sha256::digest(canonical.as_bytes()))
@@ -211,15 +217,16 @@ mod tests {
 
     #[test]
     fn the_hash_covers_every_shown_field_and_ignores_key_order() {
-        let base = || vec![("windows-health__flush_dns".to_owned(), json!({ "dryRun": false }), None)];
+        let flush = || vec![CommandLine::new(r"C:\Windows\System32\ipconfig.exe", &["/flushdns"])];
+        let base = || vec![("windows-health__flush_dns".to_owned(), json!({ "dryRun": false }), None, flush())];
         let h = plan_hash(Some("t"), Some("r"), &base());
         assert_eq!(h.len(), 64);
         assert_eq!(short_hash(&h).len(), 8);
-        let reordered = vec![("windows-health__flush_dns".to_owned(), serde_json::from_str(r#"{"dryRun":false}"#).unwrap(), None)];
+        let reordered = vec![("windows-health__flush_dns".to_owned(), serde_json::from_str(r#"{"dryRun":false}"#).unwrap(), None, flush())];
         assert_eq!(plan_hash(Some("t"), Some("r"), &reordered), h);
         let a = json!({ "a": 1, "b": 2 });
         let b: Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
-        let one = |args: Value| plan_hash(None, None, &[("x__y".to_owned(), args, None)]);
+        let one = |args: Value| plan_hash(None, None, &[("x__y".to_owned(), args, None, Vec::new())]);
         assert_eq!(one(a), one(b), "key order does not matter");
         assert_ne!(plan_hash(Some("T"), Some("r"), &base()), h, "title");
         assert_ne!(plan_hash(Some("t"), None, &base()), h, "reasoning");
@@ -229,6 +236,12 @@ mod tests {
         let mut s = base();
         s[0].1 = json!({ "dryRun": false, "adapterFilter": "x" });
         assert_ne!(plan_hash(Some("t"), Some("r"), &s), h, "arguments");
+        let mut s = base();
+        s[0].3[0].args.push("/x".into());
+        assert_ne!(plan_hash(Some("t"), Some("r"), &s), h, "commands");
+        let mut s = base();
+        s[0].3[0].exe = r"C:\Temp\ipconfig.exe".into();
+        assert_ne!(plan_hash(Some("t"), Some("r"), &s), h, "the program run");
         let mut s = base();
         s.push(s[0].clone());
         assert_ne!(plan_hash(Some("t"), Some("r"), &s), h, "steps");

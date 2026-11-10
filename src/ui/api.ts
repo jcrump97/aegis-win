@@ -188,7 +188,7 @@ export interface PlanStep {
   args: unknown;
   /** Supplied by whoever wrote the plan; shown under `PlanMeta.suppliedLabel`. */
   reasoning?: string;
-  /** What the step's dry run said it would run. */
+  /** The commands it runs, from the plugin's code; covered by the plan's hash (ADR 0004 §5). */
   commands: string[];
   status: StepStatus;
   result?: unknown;
@@ -231,6 +231,8 @@ export interface TicketView {
   args: unknown;
   /** What the call does, written by the plugin's code from the arguments. */
   review?: CallReview;
+  /** The exact commands it runs, checked again just before they run (ADR 0004 §5). */
+  commands?: string[];
   createdAt: string;
   status: TicketStatus;
   /** While queued: 1 means it runs next. */

@@ -297,7 +297,11 @@ fn tools_list(state: &AppState) -> AegisResult<Value> {
                 description.push_str(" Needs the owner's approval in the AegisWin app: returns a ticketId; poll aegis__check_ticket.");
             }
             if t.tool.input_schema.pointer("/properties/dryRun").is_some() {
-                description.push_str(" dryRun: true shows the exact commands without running them or needing approval.");
+                description.push_str(if t.described {
+                    " dryRun: true shows the exact commands without running them or needing approval."
+                } else {
+                    " dryRun: true still needs the owner's approval, since this tool cannot list its commands."
+                });
             }
             json!({
                 "name": registry::mcp_tool_name(&t.plugin_id, &t.tool.id),
@@ -562,6 +566,9 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
             body.push_str(&format!("<div class=\"msg\">{}</div>", escape_html(warning)));
         }
     }
+    if !ticket.commands.is_empty() {
+        body.push_str(&format!("<p>Commands it will run (checked again just before they run):</p><pre>{}</pre>", escape_html(&ticket.commands.join("\n"))));
+    }
     if ticket.requires_admin {
         body.push_str("<p>This action changes system settings and runs with administrator rights.</p>");
     }
@@ -622,7 +629,7 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
     body.push_str("<p>The steps run one at a time, in this order. The plan stops at the first failure, and changes made by earlier steps stay: Windows repairs cannot be undone.</p><ol class=\"steps\">");
     for step in &ticket.steps {
         let args = serde_json::to_string_pretty(&step.args).unwrap_or_default();
-        let commands = if step.commands.is_empty() { "(the dry run listed no commands)".to_owned() } else { step.commands.join("\n") };
+        let commands = if step.commands.is_empty() { "(none)".to_owned() } else { step.commands.join("\n") };
         body.push_str(&format!(
             "<li><strong>{}</strong> ({}){}{}<br>{}<p>Arguments:</p><pre>{}</pre><p>Commands it will run:</p><pre>{}</pre>",
             escape_html(&step.tool_name),
@@ -852,6 +859,7 @@ mod tests {
             requires_admin: false,
             args: json!({}),
             review: None,
+            commands: Vec::new(),
             created_at: "2026-11-07T10:00:00Z".into(),
             status: TicketStatus::Queued,
             queue_position: Some(2),

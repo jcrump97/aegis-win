@@ -70,7 +70,7 @@ const runningPlan = {
   plan: { origin: 'owner', suppliedLabel: 'Written by you', hash: 'ab'.repeat(32), shortHash: 'abababab', summary: '2 steps · stops if a step fails, earlier changes stay.', flags: [], expiresAt: '2026-11-08T10:10:00Z' },
   steps: [step(1, 'flush_dns', 'running'), step(2, 'winsock_reset', 'pending')],
 };
-const queued = { ...base, ticketId: 'one-2', pluginId: 'windows-health', toolId: 'ip_release_renew', toolName: 'Renew IP address', toolDescription: '', status: 'queued', queuePosition: 1 };
+const queued = { ...base, ticketId: 'one-2', pluginId: 'windows-health', toolId: 'ip_release_renew', toolName: 'Renew IP address', toolDescription: '', status: 'queued', queuePosition: 1, commands: ['C:\\Windows\\System32\\ipconfig.exe /renew "Wi-Fi 2"'] };
 const finished = { ...base, ticketId: 'one-3', pluginId: 'windows-health', toolId: 'sfc_scan', toolName: 'System file check', toolDescription: '', status: 'approved', result: { success: true } };
 
 const calls = [];
@@ -219,6 +219,7 @@ test('a running plan stays under "In progress" after switching to the Monitor ta
     const done = at((s) => s.includes('System file check'), 'the finished request');
     assert.ok(progress < plan && plan < waiting && waiting < earlier && earlier < done, `${when}: running, then queued, then finished`);
     assert.ok(sections[plan].includes('Stop after this step'), `${when}: the running plan can still be stopped`);
+    assert.ok(sections[waiting].includes('Commands it will run') && sections[waiting].includes('ipconfig.exe /renew "Wi-Fi 2"'), `${when}: a request shows its commands`);
   };
 
   nav(document, 'approvals').click();

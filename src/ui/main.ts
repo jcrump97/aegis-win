@@ -1175,7 +1175,7 @@ function planCard(t: TicketView, plan: NonNullable<TicketView['plan']>): HTMLEle
         h('div', { class: 'hint' }, 'Arguments'),
         h('pre', {}, JSON.stringify(s.args, null, 2)),
         h('div', { class: 'hint' }, 'Commands it will run'),
-        h('pre', {}, s.commands.length ? s.commands.join('\n') : '(the dry run listed no commands)'),
+        h('pre', {}, s.commands.length ? s.commands.join('\n') : '(none)'),
         s.reasoning ? suppliedText(plan.suppliedLabel, h('p', {}, s.reasoning)) : null,
         s.error ? errorNotice(s.error) : null,
         s.result !== undefined ? h('details', {}, h('summary', {}, 'Result'), renderValue(s.result), rawJson(s.result)) : null,
@@ -1217,6 +1217,9 @@ function ticketCard(t: TicketView): HTMLElement {
     );
   }
   body.push(h('div', { class: 'hint' }, 'Arguments'), h('pre', {}, JSON.stringify(t.args, null, 2)));
+  if (t.commands?.length) {
+    body.push(h('div', { class: 'hint' }, 'Commands it will run (checked again just before they run)'), h('pre', {}, t.commands.join('\n')));
+  }
   if (t.status === 'pending_approval') {
     body.push(...decisionForm(t, 'Approve and run'));
   } else {

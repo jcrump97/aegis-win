@@ -1,5 +1,5 @@
 //! Action plans through the engine (ADR 0003 §3–§5): a plan is checked and
-//! dry-run when proposed, approved once with the PIN and its fingerprint, run
+//! described (its commands listed) when proposed, approved once with the PIN and its fingerprint, run
 //! step by step in one turn, and stops at the first failure.
 
 mod common;
@@ -64,7 +64,7 @@ async fn a_proposed_plan_is_dry_run_and_runs_nothing_until_approved() {
     assert_eq!(plan.hash.len(), 64);
     assert_eq!(plan.supplied_label, "Supplied by the requesting agent");
     assert!(plan.summary.starts_with("2 steps"), "{}", plan.summary);
-    assert_eq!(t.steps[0].commands, ["fix.exe one"]);
+    assert_eq!(t.steps[0].commands, [r"C:\demo\fix.exe one"]);
     assert_eq!(t.steps[1].args, json!({ "note": "two", "dryRun": false }), "defaults are filled in and shown");
     assert_eq!(steps(&t), [StepStatus::Pending, StepStatus::Pending]);
     assert!(fixed(&f).is_empty(), "only dry runs so far");
@@ -89,7 +89,7 @@ async fn only_opted_in_tools_can_be_steps() {
     let e = refuse(vec![fix("a"), fix("a")]).await.unwrap_err();
     assert!(e.message.contains("the same"), "{e:?}");
     let e = refuse(vec![fix("nodry")]).await.unwrap_err();
-    assert!(e.message.contains("dry run failed"), "{e:?}");
+    assert!(e.message.starts_with("Step 1: cannot describe"), "{e:?}");
     // Turned-off plugins are refused like any call.
     f.engine.set_installed(BTreeMap::new()).unwrap();
     assert_eq!(refuse(vec![fix("a")]).await.unwrap_err().code, ErrorCode::PluginDisabled);

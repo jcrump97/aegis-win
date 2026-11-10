@@ -1,6 +1,6 @@
 # Plugin: `windows-health`
 
-Windows repair commands. Every repair is `pin_required` by default and supports `dryRun: true`, which returns the exact commands and their impact without running anything (dry runs skip the PIN and admin gates). All four repairs set `planEligible: true`, so they can be steps of one action plan approved with a single PIN ([ADR 0003](../../documentation/adr/0003-action-plans.md)); `interpret_health_output` is read-only and cannot.
+Windows repair commands. Every repair is `pin_required` by default. The plugin implements `describe`, built from the same `plan` that runs the commands, so AegisWin answers `dryRun: true` itself with the exact commands (absolute System32 paths and argument vectors) and their impact, without calling the plugin and without the PIN or admin gates. It also implements `review_call`, so an approval shows the impact, each command and any warning (dropped connections, a restart), and AegisWin refuses to run a repair whose commands changed since they were approved ([ADR 0004 §5](../../documentation/adr/0004-approval-channel-and-key-hardening.md)). All four repairs set `planEligible: true`, so they can be steps of one action plan approved with a single PIN ([ADR 0003](../../documentation/adr/0003-action-plans.md)); `interpret_health_output` is read-only and cannot.
 
 | Tool | MCP name | Command (System32, argv) | Admin |
 | :--- | :--- | :--- | :--- |
@@ -20,4 +20,4 @@ Windows repair commands. Every repair is `pin_required` by default and supports 
 
 ## Tests
 
-`cargo test -p aegis-plugin-windows-health` never runs a real repair, because CI runners are administrators. It checks gating, dry-run output, argument handling, SFC result parsing, and LLM interpretation against a loopback mock.
+`cargo test -p aegis-plugin-windows-health` never runs a real repair, because CI runners are administrators. It checks gating, the described commands and review, that a dry run reaching the plugin is refused, argument handling, SFC result parsing, and LLM interpretation against a loopback mock.
