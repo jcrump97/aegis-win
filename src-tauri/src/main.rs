@@ -431,6 +431,18 @@ async fn cancel_ticket(engine: EngineState<'_>, ticket_id: String) -> Cmd<Ticket
     engine.cancel_ticket(&ticket_id)
 }
 
+/// Serves a LAN bind over plain HTTP (turning on needs the PIN) or HTTPS again.
+#[tauri::command]
+async fn set_mcp_plain_http(engine: EngineState<'_>, on: bool, pin: Option<String>) -> Cmd<McpStatus> {
+    engine.set_mcp_plain_http(on, pin).await
+}
+
+/// Forgets the LAN certificate; a new one is made at the next start. Needs the PIN.
+#[tauri::command]
+async fn reset_mcp_certificate(engine: EngineState<'_>, pin: String) -> Cmd<McpStatus> {
+    engine.reset_mcp_certificate(pin).await
+}
+
 #[tauri::command]
 async fn start_mcp(engine: EngineState<'_>) -> Cmd<McpStatus> {
     engine.start_mcp().await
@@ -570,6 +582,8 @@ fn main() {
             cancel_ticket,
             propose_plan,
             start_mcp,
+            set_mcp_plain_http,
+            reset_mcp_certificate,
             stop_mcp,
             reveal_mcp_token,
             rotate_mcp_token,

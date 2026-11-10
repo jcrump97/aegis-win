@@ -14,6 +14,9 @@
 //! A LAN bind also listens on `127.0.0.1` at the same port, so clients on this
 //! PC keep one fixed URL whatever the bind address. Device page links always
 //! use the bind address, so other devices on the network can open them.
+//!
+//! A LAN bind serves HTTPS (`crate::tls`, ADR 0004 §2) unless the owner chose
+//! plain HTTP for compatibility; loopback is always plain HTTP.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -56,12 +59,25 @@ pub struct McpStatus {
     pub firewall_rule: bool,
     /// Something the owner should know (e.g. the firewall rule could not be added).
     pub note: Option<String>,
+    /// The LAN listener's certificate, when it serves HTTPS.
+    pub tls: Option<crate::tls::TlsInfo>,
+    /// A LAN bind serving plain HTTP, because the owner chose it.
+    pub plain_http: bool,
+    /// Said once the certificate changed or was imported.
+    pub certificate_notice: Option<String>,
 }
 
 impl McpStatus {
     pub fn stopped() -> Self {
-        Self { running: false, url: None, local_url: None, firewall_rule: false, note: None }
+        Self { running: false, url: None, local_url: None, firewall_rule: false, note: None, tls: None, plain_http: false, certificate_notice: None }
     }
+}
+
+/// How a LAN bind is served.
+pub enum Transport {
+    Https { config: Arc<rustls::ServerConfig>, info: crate::tls::TlsInfo, notice: Option<String> },
+    /// The owner's *Compatibility: plain HTTP* choice.
+    PlainHttp,
 }
 
 pub struct McpHandle {
@@ -95,6 +111,8 @@ impl McpHandle {
 struct AppState {
     engine: Arc<Engine>,
     allowed_hosts: Arc<Vec<String>>,
+    /// `http://` or `https://`: what a same-origin `Origin` starts with.
+    scheme: &'static str,
     stopped: watch::Receiver<bool>,
 }
 
@@ -107,12 +125,16 @@ fn allowed_hosts(host: Ipv4Addr, port: u16) -> Vec<String> {
     hosts
 }
 
-pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall: bool, elevated: bool) -> AegisResult<McpHandle> {
+/// Starts the server. `lan` says how a bind other than `127.0.0.1` is
+/// served; `127.0.0.1` is always plain HTTP.
+pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall: bool, elevated: bool, lan: Transport) -> AegisResult<McpHandle> {
     let listener = TcpListener::bind(SocketAddr::from((host, port))).await.map_err(|e| {
         AegisError::new(ErrorCode::Conflict, format!("Could not start the MCP server on {host}:{port} (port in use, or not an address of this PC): {e}"))
     })?;
     let port = listener.local_addr().map_err(|e| AegisError::failed(e.to_string()))?.port();
-    let base_url = format!("http://{host}:{port}");
+    let lan = if host == Ipv4Addr::LOCALHOST { Transport::PlainHttp } else { lan };
+    let scheme = if matches!(lan, Transport::Https { .. }) { "https://" } else { "http://" };
+    let base_url = format!("{scheme}{host}:{port}");
 
     // Any other bind keeps 127.0.0.1 too, so this PC's clients never need the
     // LAN address. That port must be ours: if another program held it, local
@@ -129,7 +151,7 @@ pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall
     };
     let local_url = loopback.is_some().then(|| format!("http://{}:{port}/mcp", Ipv4Addr::LOCALHOST));
 
-    let mut status = McpStatus { running: true, url: Some(format!("{base_url}/mcp")), local_url, firewall_rule: false, note: None };
+    let mut status = McpStatus { running: true, url: Some(format!("{base_url}/mcp")), local_url, ..McpStatus::stopped() };
     let mut firewall_rule = None;
     if !host.is_loopback() && open_firewall {
         if elevated {
@@ -151,15 +173,27 @@ pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall
     }
 
     let (stopped, rx) = watch::channel(false);
-    let mut tasks = vec![serve(listener, router(engine.clone(), allowed_hosts(host, port), rx.clone()), rx.clone())];
+    let app = router(engine.clone(), allowed_hosts(host, port), scheme, rx.clone());
+    let mut tasks = vec![match lan {
+        Transport::Https { config, info, notice } => {
+            status.tls = Some(info);
+            status.certificate_notice = notice;
+            let tls = crate::tls::TlsListener::new(listener, config, rx.clone()).map_err(|e| AegisError::failed(e.to_string()))?;
+            serve(tls, app, rx.clone())
+        }
+        Transport::PlainHttp => {
+            status.plain_http = host != Ipv4Addr::LOCALHOST;
+            serve(listener, app, rx.clone())
+        }
+    }];
     if let Some(l) = loopback {
-        tasks.push(serve(l, router(engine, allowed_hosts(Ipv4Addr::LOCALHOST, port), rx.clone()), rx));
+        tasks.push(serve(l, router(engine, allowed_hosts(Ipv4Addr::LOCALHOST, port), "http://", rx.clone()), rx));
     }
     Ok(McpHandle { stopped, tasks, status, firewall_rule })
 }
 
-fn router(engine: Arc<Engine>, allowed_hosts: Vec<String>, stopped: watch::Receiver<bool>) -> Router {
-    let state = AppState { engine, allowed_hosts: Arc::new(allowed_hosts), stopped };
+fn router(engine: Arc<Engine>, allowed_hosts: Vec<String>, scheme: &'static str, stopped: watch::Receiver<bool>) -> Router {
+    let state = AppState { engine, allowed_hosts: Arc::new(allowed_hosts), scheme, stopped };
     Router::new()
         .route("/mcp", post(mcp_post).get(method_not_allowed).delete(method_not_allowed))
         .route("/approve/{id}", get(portal_get).post(portal_post))
@@ -168,7 +202,10 @@ fn router(engine: Arc<Engine>, allowed_hosts: Vec<String>, stopped: watch::Recei
         .with_state(state)
 }
 
-fn serve(listener: TcpListener, app: Router, mut stopped: watch::Receiver<bool>) -> JoinHandle<()> {
+fn serve<L: axum::serve::Listener>(listener: L, app: Router, mut stopped: watch::Receiver<bool>) -> JoinHandle<()>
+where
+    L::Addr: std::fmt::Debug,
+{
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -198,7 +235,7 @@ async fn host_guard(State(state): State<AppState>, request: Request, next: Next)
         let ok = origin
             .to_str()
             .ok()
-            .and_then(|o| o.strip_prefix("http://"))
+            .and_then(|o| o.strip_prefix(state.scheme))
             .is_some_and(|o| state.allowed_hosts.iter().any(|a| a.eq_ignore_ascii_case(o)));
         if !ok {
             return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
@@ -335,7 +372,7 @@ fn tools_list(state: &AppState) -> AegisResult<Value> {
             "title": "Propose an action plan",
             "description": format!(
                 "Proposes up to {MAX_STEPS} repairs to run in order under one approval. Nothing runs until the owner approves it in the AegisWin app. \
-Each step is checked and dry-run now; the owner sees every argument and the exact commands. Steps run one at a time and the plan \
+Each step is checked and its exact commands listed now; the owner sees every argument and those commands. Steps run one at a time and the plan \
 stops at the first failure; earlier changes stay. Returns a ticketId and a plan fingerprint (plan.shortHash) to \
 tell the owner; poll aegis__check_ticket, whose steps array shows each step. Pending plans expire after 10 minutes. \
 Steps can use: {}.",

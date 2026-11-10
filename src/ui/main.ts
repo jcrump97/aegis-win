@@ -2,7 +2,7 @@
 // Rust engine enforces all gates, so this file only decides what to show.
 
 import './styles.css';
-import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
+import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type McpStatus, type McpTls, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { generatePassphrase } from './passphrase';
@@ -1263,8 +1263,19 @@ function mcpTab(): HTMLElement {
         : null,
       s.firewallRule ? h('div', { class: 'notice ok' }, 'A Windows Firewall rule allows other PCs on your private network to connect. It is removed when the server stops.') : null,
       s.note ? h('div', { class: 'notice' }, s.note) : null,
+      s.certificateNotice ? h('div', { class: 'notice' }, s.certificateNotice) : null,
+      s.tls ? tlsBlock(s.tls) : null,
     );
   };
+  const tlsBlock = (t: McpTls) =>
+    h(
+      'div',
+      { class: 'stack', id: 'mcp-tls' },
+      h('div', { class: 'hint' }, `Other devices connect over HTTPS with ${t.own ? 'your own certificate' : `a certificate AegisWin made${t.notAfter ? `, valid until ${t.notAfter} (renewed automatically)` : ''}`}. A phone warns the first time (Android Chrome: Advanced, then Proceed; iPhone Safari: Show Details, then visit this website). The browser cannot check that it is really AegisWin, so only continue on your own network. Fingerprint (SHA-256):`),
+      h('code', {}, t.fingerprint),
+      h('div', { class: 'hint' }, 'AI agents on other devices need this certificate file:'),
+      h('div', { class: 'row' }, h('code', { class: 'grow' }, t.certPath), h('button', { onclick: () => copyText(t.certPem) }, 'Copy certificate')),
+    );
   renderStatus();
 
   const host = h('select', { id: 'mcp-host' }, h('option', { value: '127.0.0.1' }, '127.0.0.1 — this PC only (recommended)'));
@@ -1280,6 +1291,7 @@ function mcpTab(): HTMLElement {
       updateShellBadges();
       toast('MCP settings saved.');
       renderStatus();
+      renderSecurity();
     } catch (e) {
       await handleError(e);
     }
@@ -1292,6 +1304,56 @@ function mcpTab(): HTMLElement {
     h('label', { class: 'inline', for: 'mcp-fw' }, firewall, 'Add a Windows Firewall rule for network mode (needs administrator)'),
     h('div', { class: 'row end' }, save),
   );
+
+  const securityCard = h('section', { class: 'card stack', id: 'mcp-security' });
+  const renderSecurity = () => {
+    const m = settings!.mcp;
+    if (m.host === '127.0.0.1') {
+      replace(securityCard);
+      securityCard.hidden = true;
+      return;
+    }
+    securityCard.hidden = false;
+    const after = async (status: McpStatus) => {
+      settings = await api.getSettings();
+      settings.mcp.status = status;
+      renderStatus();
+      renderSecurity();
+    };
+    const plain = h('button', { class: m.plainHttp ? 'primary' : 'danger' }, m.plainHttp ? 'Use HTTPS' : 'Use plain HTTP (PIN)');
+    plain.addEventListener('click', async () => {
+      try {
+        if (m.plainHttp) {
+          await after(await busy(plain, () => api.setMcpPlainHttp(false, null)));
+        } else {
+          const pin = await askPin('Serve plain HTTP on your network?', 'Anyone on this network can read your AI agent’s token and requests. Only for clients that cannot use HTTPS.', 'Use plain HTTP');
+          if (pin === null) return;
+          await after(await busy(plain, () => api.setMcpPlainHttp(true, pin)));
+        }
+      } catch (e) {
+        await handleError(e);
+      }
+    });
+    const reset = h('button', {}, 'Make a new certificate (PIN)');
+    reset.addEventListener('click', async () => {
+      const pin = await askPin('Make a new certificate?', 'Phones will warn once more, and AI agents on other devices need the new certificate file.', 'Make new certificate');
+      if (pin === null) return;
+      try {
+        await after(await busy(reset, () => api.resetMcpCertificate(pin)));
+        toast('A new certificate is used from the next start.');
+      } catch (e) {
+        await handleError(e);
+      }
+    });
+    replace(
+      securityCard,
+      h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'Network connection'), h('span', { class: `badge ${m.plainHttp ? 'danger' : 'ok'}` }, m.plainHttp ? 'plain HTTP' : 'HTTPS'), plain),
+      h('p', { class: 'hint' }, `On your network the server uses HTTPS. To use your own certificate, put mcp-cert.pem and mcp-key.pem in AegisWin’s data folder and start the server; the key moves into the vault and its file is removed.`),
+      m.plainHttp ? h('div', { class: 'notice error' }, 'Anyone on this network can read your AI agent’s token and requests.') : null,
+      m.plainHttp ? null : h('div', { class: 'row end' }, reset),
+    );
+  };
+  renderSecurity();
 
   const deviceCard = h('section', { class: 'card stack' });
   const renderDevice = () => {
@@ -1332,7 +1394,11 @@ function mcpTab(): HTMLElement {
       const { mcp: m } = settings!;
       const lan = m.host !== '127.0.0.1';
       const thisPc = m.status.localUrl ?? (lan ? null : m.status.url) ?? `http://127.0.0.1:${m.port}/mcp`;
-      const network = lan ? (m.status.url ?? `http://${m.host}:${m.port}/mcp`) : null;
+      const network = lan ? (m.status.url ?? `${m.plainHttp ? 'http' : 'https'}://${m.host}:${m.port}/mcp`) : null;
+      const certFile = m.status.tls?.certPath ?? 'mcp-cert.pem';
+      const trust = network?.startsWith('https://')
+        ? `Copy ${certFile} to the other device, then trust it there:\n  Claude Code and other Node.js clients: set NODE_EXTRA_CA_CERTS=<path to mcp-cert.pem> before starting them\n  curl: curl --cacert <path to mcp-cert.pem> ${network}`
+        : null;
       const claudeCode = (url: string) => `claude mcp add --transport http aegis-win ${url} --header "Authorization: Bearer ${token}"`;
       const json = (url: string) => JSON.stringify({ mcpServers: { 'aegis-win': { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2);
       const snippet = (label: string, text: string, button: string) => h('div', {}, h('div', { class: 'hint' }, label), h('pre', {}, text), h('button', { onclick: () => copyText(text) }, button));
@@ -1341,6 +1407,7 @@ function mcpTab(): HTMLElement {
         h('div', { class: 'row' }, h('code', { class: 'grow' }, token), h('button', { onclick: () => copyText(token) }, 'Copy token')),
         snippet(lan ? 'Claude Code on this PC' : 'Claude Code', claudeCode(thisPc), 'Copy command'),
         snippet(lan ? 'JSON config on this PC (clients that support HTTP servers)' : 'JSON config (clients that support HTTP servers)', json(thisPc), 'Copy JSON'),
+        trust ? snippet('On another device: trust the certificate first', trust, 'Copy instructions') : null,
         network ? snippet('Claude Code on another device on your network', claudeCode(network), 'Copy command') : null,
         network ? snippet('JSON config on another device on your network', json(network), 'Copy JSON') : null,
       );
@@ -1361,7 +1428,7 @@ function mcpTab(): HTMLElement {
   });
   const tokenCard = h('section', { class: 'card stack' }, h('h3', {}, 'Connect an AI client'), h('div', { class: 'row' }, reveal, rotate), tokenArea);
 
-  return h('div', { class: 'stack' }, container, statusCard, configCard, deviceCard, tokenCard, gatesCard());
+  return h('div', { class: 'stack' }, container, statusCard, configCard, securityCard, deviceCard, tokenCard, gatesCard());
 }
 
 function gatesCard(): HTMLElement {

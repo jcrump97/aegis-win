@@ -25,11 +25,17 @@ pub struct McpConfig {
     pub auth_token: Secret,
     /// Add a Windows Firewall rule for LAN binds (only possible when elevated).
     pub open_firewall: bool,
+    /// The LAN certificate and its key (ADR 0004 §2). Made at the first LAN start.
+    #[serde(default)]
+    pub tls: Option<crate::tls::TlsMaterial>,
+    /// *Compatibility: plain HTTP* for a LAN bind. Turning it on needs the PIN.
+    #[serde(default)]
+    pub plain_http: bool,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { enabled: false, host: "127.0.0.1".into(), port: DEFAULT_MCP_PORT, auth_token: Secret::random_token(), open_firewall: true }
+        Self { enabled: false, host: "127.0.0.1".into(), port: DEFAULT_MCP_PORT, auth_token: Secret::random_token(), open_firewall: true, tls: None, plain_http: false }
     }
 }
 

@@ -23,6 +23,7 @@ pub mod state;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 pub mod tickets;
+pub mod tls;
 pub mod vault;
 
 pub use error::{AegisError, AegisResult, ErrorCode};

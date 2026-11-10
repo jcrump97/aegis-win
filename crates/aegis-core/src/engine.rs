@@ -27,6 +27,7 @@ use crate::registry::{self, CommandLine, ExitReason, Gate, GatePolicy, Launch, L
 use crate::schema;
 use crate::secret::Secret;
 use crate::state::{VaultState, AUTO_LOCK_CHOICES, DEFAULT_AUTO_LOCK_MINUTES};
+use crate::tls::{self, Choice, TlsMaterial};
 use crate::tickets::{NewTicket, PlanMeta, PlanStep, StepStatus, TicketStatus, TicketStore, TicketView, STRIKES_PER_TICKET};
 use crate::vault::{self, KdfParams, NewKey, PinGuard, UnlockedVault, VaultError};
 
@@ -194,6 +195,8 @@ pub struct McpSettingsView {
     pub host: String,
     pub port: u16,
     pub open_firewall: bool,
+    /// *Compatibility: plain HTTP* for a LAN bind (ADR 0004 §2).
+    pub plain_http: bool,
     /// Approve from another device, with a one-time code (memory only).
     pub device_approval: bool,
     /// Why device approval was turned off, when too many wrong codes did it.
@@ -861,6 +864,7 @@ impl Engine {
                     enabled: s.mcp.enabled,
                     host: s.mcp.host.clone(),
                     port: s.mcp.port,
+                    plain_http: s.mcp.plain_http,
                     open_firewall: s.mcp.open_firewall,
                     device_approval: self.device_approval.load(Ordering::SeqCst),
                     device_approval_notice: self.device_tripped.load(Ordering::SeqCst).then(|| {
@@ -2584,11 +2588,78 @@ impl Engine {
         if let Some(old) = slot.take() {
             old.stop().await;
         }
+        let lan = if host == Ipv4Addr::LOCALHOST || config.plain_http { mcp::Transport::PlainHttp } else { self.lan_transport(host, config.tls)? };
         let engine = self.self_arc()?;
-        let handle = mcp::start(engine, host, config.port, config.open_firewall, self.elevated).await?;
+        let handle = mcp::start(engine, host, config.port, config.open_firewall, self.elevated, lan).await?;
         let status = handle.status();
         *slot = Some(handle);
         Ok(status)
+    }
+
+    /// The certificate for a LAN bind (ADR 0004 §2): the owner's own when
+    /// `mcp-key.pem` is in the data folder (its key moves into the vault and
+    /// the file is removed), else the vault's, made again when the address
+    /// changed or it expires within 30 days. Writes the public certificate
+    /// to `mcp-cert.pem` for agents.
+    fn lan_transport(&self, host: Ipv4Addr, current: Option<TlsMaterial>) -> AegisResult<mcp::Transport> {
+        let unusable = |e: String| AegisError::new(ErrorCode::InvalidArguments, format!("The MCP server's certificate could not be used: {e}"));
+        let (material, how) = TlsMaterial::choose(&self.data_dir, current, host, chrono::Utc::now().date_naive()).map_err(unusable)?;
+        let config = material.server_config().map_err(unusable)?;
+        let mut notice = match how {
+            Choice::Kept | Choice::New { replaced: false } => None,
+            Choice::New { replaced: true } => Some(tls::CHANGED.to_owned()),
+            Choice::Imported => Some(format!("Your own certificate from {} is in use. Its key is now kept in the vault, and {} was removed from the folder.", tls::CERT_FILE, tls::KEY_FILE)),
+        };
+        if how != Choice::Kept {
+            self.mutate(|s| {
+                s.mcp.tls = Some(material.clone());
+                Ok(())
+            })?;
+        }
+        if how == Choice::Imported {
+            // In the vault now, so the key no longer needs to be on disk.
+            if let Err(e) = std::fs::remove_file(self.data_dir.join(tls::KEY_FILE)) {
+                notice = Some(format!("Your own certificate is in use and its key is in the vault, but {} could not be removed: {e}. Delete it yourself.", tls::KEY_FILE));
+            }
+        }
+        let path = self.data_dir.join(tls::CERT_FILE);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(material.cert_pem.as_str()) {
+            vault::write_atomic(&path, material.cert_pem.as_bytes()).map_err(|e| AegisError::failed(format!("Could not write {}: {e}", path.display())))?;
+        }
+        Ok(mcp::Transport::Https { config, info: material.info(&path), notice })
+    }
+
+    /// Turns *Compatibility: plain HTTP* on (needs the PIN) or off for a LAN
+    /// bind, and restarts a running server.
+    pub async fn set_mcp_plain_http(&self, on: bool, pin: Option<String>) -> AegisResult<McpStatus> {
+        if on {
+            let pin = Zeroizing::new(pin.unwrap_or_default());
+            self.check_pin(&pin).await?;
+        }
+        self.mutate(|s| {
+            s.mcp.plain_http = on;
+            Ok(())
+        })?;
+        self.restart_mcp_if_running().await
+    }
+
+    /// Forgets the LAN certificate (the owner's own too) and makes a new one
+    /// at the next start. Needs the PIN.
+    pub async fn reset_mcp_certificate(&self, pin: String) -> AegisResult<McpStatus> {
+        self.check_pin(&Zeroizing::new(pin)).await?;
+        self.mutate(|s| {
+            s.mcp.tls = None;
+            Ok(())
+        })?;
+        self.restart_mcp_if_running().await
+    }
+
+    async fn restart_mcp_if_running(&self) -> AegisResult<McpStatus> {
+        if self.mcp_status().await.running {
+            self.start_mcp_inner().await
+        } else {
+            Ok(McpStatus::stopped())
+        }
     }
 
     pub async fn stop_mcp(&self) -> McpStatus {

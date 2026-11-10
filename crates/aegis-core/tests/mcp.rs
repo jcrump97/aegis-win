@@ -8,6 +8,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use aegis_core::engine::SettingsUpdate;
+use aegis_core::mcp::Transport;
+use aegis_core::tls::TlsMaterial;
 use common::{ready, Fixture, PIN};
 use serde_json::{json, Value};
 
@@ -239,7 +241,7 @@ async fn locking_stops_the_server() {
 #[tokio::test]
 async fn stop_drops_connections_that_outlive_the_grace_period() {
     let f = ready().await;
-    let handle = aegis_core::mcp::start(f.engine.clone(), Ipv4Addr::LOCALHOST, 0, false, false).await.unwrap();
+    let handle = aegis_core::mcp::start(f.engine.clone(), Ipv4Addr::LOCALHOST, 0, false, false, Transport::PlainHttp).await.unwrap();
     let addr = handle.status().url.unwrap().trim_start_matches("http://").trim_end_matches("/mcp").to_owned();
     // Headers never finish, so graceful shutdown would wait on this connection forever.
     let mut slow = tokio::net::TcpStream::connect(&addr).await.unwrap();
@@ -264,9 +266,15 @@ async fn loopback_bind_has_no_separate_local_url() {
 }
 
 /// Checks a running non-loopback bind on `host` and its 127.0.0.1 companion, then stops it.
+/// A client that trusts only `cert_pem`, as an agent given `mcp-cert.pem` would.
+fn trusting(cert_pem: &str) -> reqwest::Client {
+    let cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).add_root_certificate(cert).build().unwrap()
+}
+
 async fn assert_dual_listener(s: &Server, host: Ipv4Addr, local: &str) {
     let port = s.url.trim_end_matches("/mcp").rsplit(':').next().unwrap().to_owned();
-    assert_eq!(s.url, format!("http://{host}:{port}/mcp"));
+    assert_eq!(s.url, format!("https://{host}:{port}/mcp"), "the network address serves HTTPS");
     assert_eq!(local, format!("http://127.0.0.1:{port}/mcp"));
 
     let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
@@ -296,17 +304,29 @@ async fn assert_dual_listener(s: &Server, host: Ipv4Addr, local: &str) {
     assert!(out["result"]["structuredContent"].get("approvalUrl").is_none());
 }
 
-/// Runs everywhere: 127.0.0.2 is not 127.0.0.1, so it gets the same companion listener as a LAN bind.
+/// Runs everywhere: 127.0.0.2 is not 127.0.0.1, so it gets the same companion
+/// listener and HTTPS as a LAN bind.
 #[tokio::test]
 async fn non_loopback_bind_also_serves_127_0_0_1() {
     let f = ready().await;
     let host = Ipv4Addr::new(127, 0, 0, 2);
-    let handle = aegis_core::mcp::start(f.engine.clone(), host, 0, false, false).await.unwrap();
+    let tls = TlsMaterial::generate(host, chrono::Utc::now().date_naive()).unwrap();
+    let https = Transport::Https { config: tls.server_config().unwrap(), info: tls.info(std::path::Path::new("mcp-cert.pem")), notice: None };
+    let handle = aegis_core::mcp::start(f.engine.clone(), host, 0, false, false, https).await.unwrap();
     let status = handle.status();
+    assert_eq!(status.tls.as_ref().unwrap().fingerprint, tls.info(std::path::Path::new("x")).fingerprint);
+    assert!(!status.plain_http);
     let local = status.local_url.clone().expect("companion listener");
     let token = f.engine.reveal_mcp_token(PIN.into()).await.unwrap();
-    let s = Server { f, url: status.url.unwrap(), base: String::new(), token, http: reqwest::Client::new() };
+    let s = Server { f, url: status.url.unwrap(), base: String::new(), token, http: trusting(&tls.cert_pem) };
     assert_dual_listener(&s, host, &local).await;
+    assert!(reqwest::Client::new().post(&s.url).json(&json!({})).send().await.is_err(), "a client without the certificate cannot connect");
+
+    // A form post must come from the HTTPS origin, not the plain HTTP one.
+    let base = s.url.trim_end_matches("/mcp");
+    let form = |origin: String| s.http.post(format!("{base}/approve/nope")).header("origin", origin).header("content-type", "application/x-www-form-urlencoded").body("csrf=x");
+    assert_eq!(form(base.replace("https://", "http://")).send().await.unwrap().status(), 403);
+    assert_ne!(form(base.to_owned()).send().await.unwrap().status(), 403);
 
     handle.stop().await;
     for url in [s.url.as_str(), local.as_str()] {
@@ -319,7 +339,7 @@ async fn non_loopback_bind_refuses_to_start_when_127_0_0_1_is_taken() {
     let f = ready().await;
     let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = squatter.local_addr().unwrap().port();
-    let err = aegis_core::mcp::start(f.engine.clone(), Ipv4Addr::new(127, 0, 0, 2), port, false, false).await.err().expect("must not start");
+    let err = aegis_core::mcp::start(f.engine.clone(), Ipv4Addr::new(127, 0, 0, 2), port, false, false, Transport::PlainHttp).await.err().expect("must not start");
     assert_eq!(err.code, aegis_core::ErrorCode::Conflict);
     assert!(err.message.contains("127.0.0.1"), "{}", err.message);
 }
@@ -332,14 +352,38 @@ async fn lan_bind_from_settings_also_serves_loopback() {
         eprintln!("skipped: this PC has no private IPv4 address");
         return;
     };
-    let s = server_on(Some(lan.to_string())).await;
-    let local = s.f.engine.mcp_status().await.local_url.expect("companion listener");
+    let mut s = server_on(Some(lan.to_string())).await;
+    let status = s.f.engine.mcp_status().await;
+    let local = status.local_url.clone().expect("companion listener");
+    let tls = status.tls.clone().expect("a LAN bind serves HTTPS");
+    assert!(!tls.own && tls.not_after.is_some() && status.certificate_notice.is_none(), "{status:?}");
+    // Agents get the public certificate from the data folder; the key stays in the vault.
+    assert_eq!(std::fs::read_to_string(&tls.cert_path).unwrap(), tls.cert_pem);
+    assert!(!std::path::Path::new(&tls.cert_path).with_file_name("mcp-key.pem").exists());
+    s.http = trusting(&tls.cert_pem);
     assert_dual_listener(&s, lan, &local).await;
 
     // The device page link uses the bind address, so a phone can open it.
     let pending = s.call("demo__fix", json!({ "note": "phone" })).await["structuredContent"].clone();
     let (url, _) = s.device_code(pending["ticketId"].as_str().unwrap()).await;
-    assert!(url.starts_with(&format!("http://{lan}:")), "{url}");
+    assert!(url.starts_with(&format!("https://{lan}:")), "{url}");
+
+    // A restart keeps the certificate, so phones and agents keep trusting it.
+    let again = s.f.engine.start_mcp().await.unwrap();
+    assert_eq!(again.tls.unwrap().fingerprint, tls.fingerprint);
+    // Plain HTTP (with the PIN) drops it and says so.
+    let plain = s.f.engine.set_mcp_plain_http(true, Some(PIN.into())).await.unwrap();
+    assert!(plain.plain_http && plain.tls.is_none() && plain.url.unwrap().starts_with("http://"));
+    let back = s.f.engine.set_mcp_plain_http(false, None).await.unwrap();
+    assert_eq!(back.tls.unwrap().fingerprint, tls.fingerprint);
+    // A new certificate, on request, is announced.
+    let fresh = s.f.engine.reset_mcp_certificate(PIN.into()).await.unwrap();
+    let fresh_tls = fresh.tls.clone().unwrap();
+    assert_ne!(fresh_tls.fingerprint, tls.fingerprint);
+    assert!(fresh.certificate_notice.is_none(), "the owner asked for it");
+    s.http = trusting(&fresh_tls.cert_pem);
+    let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+    assert_eq!(s.http.post(&s.url).bearer_auth(&s.token).json(&ping).send().await.unwrap().status(), 200);
 
     s.f.engine.lock().await;
     for url in [s.url.as_str(), local.as_str()] {
@@ -513,4 +557,25 @@ async fn wrong_codes_turn_device_approval_off_and_locking_resets_it() {
     s.f.engine.lock().await;
     s.f.engine.unlock(PIN.into()).await.unwrap();
     assert!(!s.f.engine.device_approval_on(), "locking turns it off");
+}
+
+#[tokio::test]
+async fn plain_http_on_the_network_needs_the_pin_and_loopback_stays_plain_http() {
+    let s = server().await;
+    assert!(s.url.starts_with("http://127.0.0.1:"), "loopback is plain HTTP: {}", s.url);
+    let status = s.f.engine.mcp_status().await;
+    assert!(status.tls.is_none() && !status.plain_http, "no certificate and no warning on loopback");
+
+    let err = s.f.engine.set_mcp_plain_http(true, Some("000000".into())).await.unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::PinInvalid, "turning plain HTTP on needs the PIN");
+    assert!(!s.f.engine.settings().await.unwrap().mcp.plain_http);
+    let status = s.f.engine.set_mcp_plain_http(true, Some(PIN.into())).await.unwrap();
+    assert!(status.running && !status.plain_http, "still loopback, so no warning: {status:?}");
+    assert!(s.f.engine.settings().await.unwrap().mcp.plain_http);
+    s.f.engine.set_mcp_plain_http(false, None).await.unwrap();
+    assert!(!s.f.engine.settings().await.unwrap().mcp.plain_http, "turning it off needs no PIN");
+
+    let err = s.f.engine.reset_mcp_certificate("000000".into()).await.unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::PinInvalid);
+    assert!(s.f.engine.reset_mcp_certificate(PIN.into()).await.unwrap().running);
 }

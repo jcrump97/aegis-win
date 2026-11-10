@@ -84,6 +84,8 @@ The repo's `.mcp.json` points Claude Code at AegisWin's MCP server. It holds no 
 | `AEGIS_MCP_TOKEN` | Required. The bearer token from the MCP tab (**Show token and setup commands**, needs your PIN). Update it after rotating the token. |
 | `AEGIS_MCP_URL` | Optional, defaults to `http://127.0.0.1:47821/mcp`. Set it only if you changed the port. A LAN bind still listens on `127.0.0.1`, so clients on this PC never need the LAN address. |
 
+On your network the server uses HTTPS with a certificate AegisWin makes and keeps in the vault. Agents on other devices trust the public certificate, `data\mcp-cert.pem` (or **Copy certificate** on the MCP tab): `NODE_EXTRA_CA_CERTS=<path>` for Claude Code and other Node clients, `curl --cacert <path>` for curl. Phones show a one-time browser warning. To avoid it, put your own `mcp-cert.pem` and `mcp-key.pem` (for example from `tailscale cert`) in the data folder; AegisWin moves the key into the vault.
+
 Set them in your user environment, not in a file in the repo, so the token is never committed.
 
 ## Contributing

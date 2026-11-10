@@ -89,6 +89,14 @@ let recordEvents = [
   { at: '2026-11-08T10:01:00Z', event: 'decided', ticketId: 'one-3aaaaaaa', approved: true, via: 'browser', comment: 'go', lockedOut: false },
   { at: '2026-11-08T10:00:00Z', event: 'created', ticketId: 'one-3aaaaaaa', origin: 'mcp plan', toolName: 'Action plan (2 steps)', plan: { hash: 'cd'.repeat(32), title: 'Fix <b>it</b>', titleLabel: 'Supplied by the requesting agent', steps: [] } },
 ];
+let mcpLan = false;
+let plainHttp = false;
+const mcpCalls = [];
+const tls = { fingerprint: 'AB12 '.repeat(15) + 'AB12', notAfter: '2027-12-10', own: false, certPath: 'C:\\AegisWin\\data\\mcp-cert.pem', certPem: '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n' };
+const mcpStatus = () =>
+  mcpLan
+    ? { running: true, url: `${plainHttp ? 'http' : 'https'}://192.168.1.20:47821/mcp`, localUrl: 'http://127.0.0.1:47821/mcp', firewallRule: false, note: null, tls: plainHttp ? null : tls, plainHttp, certificateNotice: null }
+    : { running: false, url: null, localUrl: null, firewallRule: false, note: null, tls: null, plainHttp: false, certificateNotice: null };
 let app = null;
 function backend(cmd, args) {
   calls.push(cmd);
@@ -146,10 +154,17 @@ function backend(cmd, args) {
         uiScale: 100,
         autoLockMinutes: 15,
         llm: { baseUrl: 'http://127.0.0.1:11434', model: 'm', hasApiKey: false, contextTokens: 8192, endpoint: null, endpointError: null },
-        mcp: { enabled: false, host: '127.0.0.1', port: 47821, openFirewall: true, deviceApproval: false, deviceApprovalNotice: null, status: { running: false, url: null, localUrl: null, firewallRule: false, note: null }, suggestedLanHost: null },
+        mcp: { enabled: mcpLan, host: mcpLan ? '192.168.1.20' : '127.0.0.1', port: 47821, openFirewall: true, plainHttp, deviceApproval: false, deviceApprovalNotice: null, status: mcpStatus(), suggestedLanHost: mcpLan ? '192.168.1.20' : null },
       };
     case 'list_tickets':
       return [runningPlan, queued, finished];
+    case 'set_mcp_plain_http':
+      mcpCalls.push({ cmd, on: args.on, pin: args.pin });
+      plainHttp = args.on;
+      return mcpStatus();
+    case 'reset_mcp_certificate':
+      mcpCalls.push({ cmd, pin: args.pin });
+      return mcpStatus();
     case 'run_tool':
       if (args.toolId === 'list_monitors') return { status: 'completed', result: { monitors: [], maxMonitors: 20, loadError: null, note: '' } };
       return { status: 'completed', result: {} };
@@ -408,4 +423,42 @@ test('a full approval record shows a banner, and a shorter retention is set with
   for (const poll of intervals) await poll();
   await settle();
   assert.ok(!banner().textContent.includes('is full'), 'the banner goes once there is room');
+});
+
+test('a LAN server shows its certificate, and plain HTTP needs the PIN and carries a warning', async () => {
+  const { document } = app;
+  nav(document, 'mcp').click();
+  await settle();
+  // The owner starts the server on a LAN address (the backend switches here).
+  mcpLan = true;
+  document.querySelectorAll('button').find((b) => b.textContent === 'Start server').click();
+  await settle();
+  nav(document, 'llm').click();
+  await settle();
+  nav(document, 'mcp').click();
+  await settle();
+  const tlsBlock = document.querySelectorAll('div').find((d) => d.id === 'mcp-tls');
+  assert.ok(tlsBlock, 'the certificate is shown while HTTPS is served');
+  assert.ok(tlsBlock.textContent.includes(tls.fingerprint) && tlsBlock.textContent.includes('valid until 2027-12-10'), tlsBlock.textContent);
+  assert.ok(tlsBlock.querySelectorAll('button').some((b) => b.textContent === 'Copy certificate'));
+  assert.ok(!tlsBlock.textContent.includes('PRIVATE KEY'));
+
+  const card = () => document.querySelectorAll('section').find((s) => s.id === 'mcp-security');
+  const button = (label) => card().querySelectorAll('button').find((b) => b.textContent === label);
+  assert.ok(!card().hidden && card().textContent.includes('HTTPS'));
+  button('Use plain HTTP (PIN)').click();
+  await settle();
+  const dialog = () => document.querySelectorAll('dialog').find((d) => d.open);
+  assert.ok(dialog().textContent.includes('Anyone on this network can read your AI agent’s token and requests.'));
+  dialog().querySelector('input').value = '246810';
+  dialog().querySelector('form').dispatchEvent({ type: 'submit', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  await settle();
+  assert.deepEqual(mcpCalls, [{ cmd: 'set_mcp_plain_http', on: true, pin: '246810' }]);
+  assert.ok(card().textContent.includes('plain HTTP') && card().querySelector('.notice.error'), 'a red warning while plain HTTP is on');
+  assert.ok(!document.querySelectorAll('div').some((d) => d.id === 'mcp-tls'), 'no certificate shown over plain HTTP');
+
+  button('Use HTTPS').click();
+  await settle();
+  assert.deepEqual(mcpCalls.at(-1), { cmd: 'set_mcp_plain_http', on: false, pin: null }, 'going back to HTTPS needs no PIN');
+  mcpLan = false;
 });

@@ -264,13 +264,28 @@ export interface McpStatus {
   localUrl: string | null;
   firewallRule: boolean;
   note: string | null;
+  /** The LAN listener's certificate when it serves HTTPS (ADR 0004 §2). */
+  tls: McpTls | null;
+  /** A LAN bind serving plain HTTP because the owner chose it. */
+  plainHttp: boolean;
+  certificateNotice: string | null;
+}
+
+export interface McpTls {
+  /** SHA-256, upper-case hex in groups of 4. */
+  fingerprint: string;
+  /** YYYY-MM-DD; null for the owner's own certificate. */
+  notAfter: string | null;
+  own: boolean;
+  certPath: string;
+  certPem: string;
 }
 
 export interface SettingsView {
   uiScale: number;
   autoLockMinutes: number;
   llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; firstTokenSecs: number; endpoint: Endpoint | null; endpointError: string | null };
-  mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; deviceApproval: boolean; deviceApprovalNotice: string | null; status: McpStatus; suggestedLanHost: string | null };
+  mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; plainHttp: boolean; deviceApproval: boolean; deviceApprovalNotice: string | null; status: McpStatus; suggestedLanHost: string | null };
 }
 
 export interface SettingsUpdate {
@@ -350,6 +365,8 @@ export const api = {
   cancelTicket: (ticketId: string) => call<TicketView>('cancel_ticket', { ticketId }),
   proposePlan: (request: PlanRequest) => call<TicketView>('propose_plan', { request }),
   startMcp: () => call<McpStatus>('start_mcp'),
+  setMcpPlainHttp: (on: boolean, pin: string | null) => call<McpStatus>('set_mcp_plain_http', { on, pin }),
+  resetMcpCertificate: (pin: string) => call<McpStatus>('reset_mcp_certificate', { pin }),
   stopMcp: () => call<McpStatus>('stop_mcp'),
   revealMcpToken: (pin: string) => call<string>('reveal_mcp_token', { pin }),
   rotateMcpToken: () => call<void>('rotate_mcp_token'),

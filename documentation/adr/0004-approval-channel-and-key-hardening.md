@@ -166,6 +166,16 @@ The reasons:
 - **Crypto provider.** `rustls` with the `ring` provider. `aws-lc-rs` needs CMake and NASM to build on Windows.
 - **The Host check.** Today's `Host` header check stays as it is.
 
+**As built (Phase 5, `security/lan-https`).** §2 is done with Options A, D and F. Choices made while building:
+- **Both clients accept the certificate.** Node 20+ with `NODE_EXTRA_CA_CERTS` (both `https` and `fetch`), Windows `curl.exe` (Schannel) with `--cacert`, and `reqwest`/Schannel with only that root all connect to the self-signed `CA:FALSE` certificate and refuse it without; so no name-constrained CA was needed.
+- **Validity.** From yesterday (clock skew) to 397 calendar days later at 00:00 UTC, a 396-day span, under every browser limit. SAN: the bind address and `localhost` (AegisWin binds one LAN address).
+- **No "Save certificate" dialog**: the app has no file-dialog plugin, so the MCP tab shows the path of `data\mcp-cert.pem` (rewritten only when it changes) and **Copy certificate**, and the setup commands include the `NODE_EXTRA_CA_CERTS` and `curl --cacert` lines.
+- **No separate QR code on the MCP tab.** The per-request device code (§1.2) already shows a QR code, now of an `https://` link; a bare `/approve` page does not exist.
+- **The owner's own certificate shows no expiry date**: AegisWin does not parse X.509, and never replaces it. It is checked against its key at import and at every start.
+- **Bind addresses other than `127.0.0.1` get HTTPS**, including `127.0.0.2`, which the tests use to run the HTTPS listener everywhere.
+- **Added: Make a new certificate (PIN)**, for an owner who thinks the key was exposed. The owner's own certificate is forgotten too; remove its files to keep it from coming back.
+- **Handshakes** run on separate tasks (at most 32 at once, 10-second timeout), so a silent client cannot stall the listener; the device page's Origin check uses the listener's scheme.
+
 ### 2.4 Deferred: a paired phone
 
 A phone paired once (with a QR code in the app and a long device secret kept in an `HttpOnly; Secure` cookie) could approve with a short approval PIN of its own and no PC screen. That would remove the limitation in §1.2.
