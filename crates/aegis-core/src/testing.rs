@@ -110,6 +110,37 @@ async fn read_request(sock: &mut TcpStream) -> String {
     String::from_utf8_lossy(&req).into_owned()
 }
 
+/// Starts a server that streams one answer: each `(delay, text)` piece is
+/// written after waiting `delay`, then the connection closes. With `ollama`,
+/// it answers the Ollama check as Ollama; otherwise with 404. The join handle
+/// yields the raw answer request.
+pub async fn mock_stream(ollama: bool, pieces: Vec<(std::time::Duration, String)>) -> (String, JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut sock).await;
+            if request.starts_with("GET /api/version ") {
+                let (status, body) = if ollama { ("200 OK", r#"{"version":"0.12.0"}"#) } else { ("404 Not Found", "404 page not found") };
+                let resp = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                continue;
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n").await;
+            for (delay, piece) in pieces {
+                tokio::time::sleep(delay).await;
+                if sock.write_all(piece.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = sock.flush().await;
+            }
+            return request;
+        }
+    });
+    (base_url, handle)
+}
+
 pub fn llm_handle(base_url: &str, plugin_id: &str) -> LlmHandle {
     LlmHandle::new(http_client(), LlmConfig { base_url: base_url.into(), model: "test-model".into(), ..LlmConfig::default() }, plugin_id, false)
 }

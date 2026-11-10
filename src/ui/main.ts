@@ -497,6 +497,14 @@ function monitorDeps(pluginId: string) {
       if (!plugin || !tool) return { ok: false, error: { code: 'UNKNOWN_TOOL', message: 'This tool is not available. Check the plugin in Settings.' } };
       return invokeTool(plugin, tool, args, button);
     },
+    peek: async (toolId: string): Promise<unknown> => {
+      try {
+        const out = await api.runTool(pluginId, toolId, {}, null);
+        return out.status === 'completed' ? out.result : null;
+      } catch {
+        return null;
+      }
+    },
     llmDestination: () => {
       const e = settings?.llm.endpoint;
       return e ? { host: e.host, offLan: !e.isLan || e.relayed } : null;
@@ -1108,6 +1116,7 @@ function llmTab(): HTMLElement {
   const baseUrl = h('input', { type: 'text', id: 'llm-url', value: llm.baseUrl, spellcheck: 'false' });
   const model = h('input', { type: 'text', id: 'llm-model', value: llm.model, spellcheck: 'false' });
   const context = h('input', { type: 'number', id: 'llm-context', min: '2048', max: '131072', step: '1024', value: String(llm.contextTokens) });
+  const firstWait = h('input', { type: 'number', id: 'llm-first-wait', min: '30', max: '900', step: '10', value: String(llm.firstTokenSecs) });
   const classification = h('div');
   const showClass = () => {
     const s = settings!.llm;
@@ -1125,7 +1134,7 @@ function llmTab(): HTMLElement {
   const save = h('button', { class: 'primary' }, 'Save');
   save.addEventListener('click', async () => {
     try {
-      settings = await busy(save, () => api.updateSettings({ llmBaseUrl: baseUrl.value, llmModel: model.value, llmContextTokens: Number(context.value) }));
+      settings = await busy(save, () => api.updateSettings({ llmBaseUrl: baseUrl.value, llmModel: model.value, llmContextTokens: Number(context.value), llmFirstTokenSecs: Number(firstWait.value) }));
       plugins = await api.listPlugins();
       showClass();
       renderTrust();
@@ -1202,7 +1211,7 @@ function llmTab(): HTMLElement {
     'div',
     { class: 'stack' },
     h('div', {}, h('h2', {}, 'LLM'), h('p', { class: 'hint' }, 'Plugins can ask an LLM to explain logs and command output. Use a local server such as Ollama or LM Studio, or any OpenAI-compatible endpoint.')),
-    h('section', { class: 'card' }, h('h3', {}, 'Endpoint'), h('label', { for: 'llm-url' }, 'Base URL'), baseUrl, h('div', { class: 'hint' }, 'Ollama: http://127.0.0.1:11434/v1 · LM Studio: http://127.0.0.1:1234/v1'), h('label', { for: 'llm-model' }, 'Model'), model, h('label', { for: 'llm-context' }, 'Context window (tokens)'), context, h('div', { class: 'hint' }, 'How much the model reads at once. 8192 suits most local models; raise it for long monitor chats if your model allows. AegisWin sets it on Ollama; on other servers, match what the model is loaded with.'), h('div', { style: 'margin-top:0.6rem' }, classification), h('div', { class: 'row', style: 'margin-top:0.8rem' }, save, test), models),
+    h('section', { class: 'card' }, h('h3', {}, 'Endpoint'), h('label', { for: 'llm-url' }, 'Base URL'), baseUrl, h('div', { class: 'hint' }, 'Ollama: http://127.0.0.1:11434/v1 · LM Studio: http://127.0.0.1:1234/v1'), h('label', { for: 'llm-model' }, 'Model'), model, h('label', { for: 'llm-context' }, 'Context window (tokens)'), context, h('div', { class: 'hint' }, 'How much the model reads at once. 8192 suits most local models; raise it for long monitor chats if your model allows. AegisWin sets it on Ollama; on other servers, match what the model is loaded with.'), h('label', { for: 'llm-first-wait' }, 'First answer wait (seconds)'), firstWait, h('div', { class: 'hint' }, 'How long to wait for the model to start answering; loading a large model can take minutes. Once it answers, AegisWin allows 60 seconds between pieces and 10 minutes in all.'), h('div', { style: 'margin-top:0.6rem' }, classification), h('div', { class: 'row', style: 'margin-top:0.8rem' }, save, test), models),
     h('section', { class: 'card' }, h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'API key'), keyState), h('p', { class: 'hint' }, 'Stored encrypted in the vault and never shown again. Local servers usually need none.'), key, h('div', { class: 'row', style: 'margin-top:0.6rem' }, saveKey, clearKey)),
     h('section', { class: 'card' }, h('h3', {}, 'Off-LAN permission'), h('p', { class: 'hint' }, 'An endpoint outside your network only receives data from plugins you allow, after personal details are scrubbed. Changing the endpoint to a different host clears these permissions.'), trustBody),
   );

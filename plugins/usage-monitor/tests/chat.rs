@@ -12,7 +12,7 @@ use aegis_plugin_usage_monitor::chat::UNUSABLE;
 use aegis_plugin_usage_monitor::{UsageMonitorPlugin, COMPONENT_CRASHES};
 use serde_json::{json, Value};
 
-const CHAT_TOOLS: [&str; 3] = ["monitor_chat_start", "monitor_chat_reply", "monitor_chat_cancel"];
+const CHAT_TOOLS: [&str; 4] = ["monitor_chat_start", "monitor_chat_reply", "monitor_chat_cancel", "monitor_chat_progress"];
 
 fn rule() -> Value {
     json!({

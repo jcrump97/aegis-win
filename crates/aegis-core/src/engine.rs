@@ -122,6 +122,7 @@ pub struct LlmSettingsView {
     pub model: String,
     pub has_api_key: bool,
     pub context_tokens: u32,
+    pub first_token_secs: u32,
     pub endpoint: Option<Endpoint>,
     pub endpoint_error: Option<String>,
 }
@@ -156,6 +157,7 @@ pub struct SettingsUpdate {
     pub llm_base_url: Option<String>,
     pub llm_model: Option<String>,
     pub llm_context_tokens: Option<u32>,
+    pub llm_first_token_secs: Option<u32>,
     pub mcp_enabled: Option<bool>,
     pub mcp_host: Option<String>,
     pub mcp_port: Option<u16>,
@@ -703,6 +705,7 @@ impl Engine {
                     model: s.llm.model.clone(),
                     has_api_key: s.llm.api_key.as_ref().is_some_and(|k| !k.is_empty()),
                     context_tokens: s.llm.context_tokens,
+                    first_token_secs: s.llm.first_token_secs,
                     endpoint,
                     endpoint_error,
                 },
@@ -758,6 +761,16 @@ impl Engine {
                     )));
                 }
                 s.llm.context_tokens = tokens;
+            }
+            if let Some(secs) = update.llm_first_token_secs {
+                if !(crate::llm::MIN_FIRST_TOKEN_SECS..=crate::llm::MAX_FIRST_TOKEN_SECS).contains(&secs) {
+                    return Err(AegisError::invalid(format!(
+                        "First answer wait must be between {} and {} seconds.",
+                        crate::llm::MIN_FIRST_TOKEN_SECS,
+                        crate::llm::MAX_FIRST_TOKEN_SECS
+                    )));
+                }
+                s.llm.first_token_secs = secs;
             }
             // Trust is granted for a destination: a different host, or moving
             // between a local and an Ollama cloud model, needs a new grant.

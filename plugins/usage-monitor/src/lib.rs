@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use aegis_core::history::Retention;
 use aegis_core::history_service::HistoryHandle;
-use aegis_core::llm::{LlmHandle, LlmOptions};
+use aegis_core::llm::{LlmHandle, LlmOptions, LlmProgress};
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
 use aegis_core::registry::{CallReview, ExitReason, Launch, LockedContext, Plugin, PluginManifest, ResumeNotice, ToolContext, UnlockContext};
@@ -412,6 +412,8 @@ pub struct UsageMonitorPlugin {
     /// The in-app monitor chat (memory only, cleared on lock).
     chat: Mutex<Option<chat::Session>>,
     chat_generation: AtomicU64,
+    /// How the chat's current AI request is coming along.
+    chat_progress: LlmProgress,
 }
 
 impl Default for UsageMonitorPlugin {
@@ -423,6 +425,7 @@ impl Default for UsageMonitorPlugin {
             book: Mutex::new(()),
             chat: Mutex::new(None),
             chat_generation: AtomicU64::new(0),
+            chat_progress: LlmProgress::default(),
         }
     }
 }
@@ -744,7 +747,8 @@ impl UsageMonitorPlugin {
         let mut problem: Option<String> = None;
         let mut sent = Value::Null;
         for _ in 0..2 {
-            let answer = llm.complete_with(chat::SYSTEM_PROMPT, session.payload(&ctx.enabled_components, must, problem.as_deref()), CHAT_REPLY).await?;
+            let payload = session.payload(&ctx.enabled_components, must, problem.as_deref());
+            let answer = llm.complete_watched(chat::SYSTEM_PROMPT, payload, CHAT_REPLY, &self.chat_progress).await?;
             sent = json!({ "offLan": answer.off_lan, "host": answer.endpoint_host, "model": answer.model, "scrubbed": answer.scrubbed });
             let checked = creator::parse_reply(&answer.text).and_then(|reply| session.accept(&reply, must).map(|()| reply)).and_then(|reply| match reply {
                 creator::Reply::Proposal { rule, reasoning } => rules::validate(&rule, &ctx.enabled_components)
@@ -971,6 +975,7 @@ impl Plugin for UsageMonitorPlugin {
                 let propose_now = self.chat_reply(&args).await?;
                 self.chat_turn(&ctx, propose_now).await
             }
+            "monitor_chat_progress" => Ok(serde_json::to_value(self.chat_progress.view()).unwrap_or(Value::Null)),
             "monitor_chat_cancel" => {
                 self.chat_generation.fetch_add(1, Ordering::SeqCst);
                 let had = self.chat.lock().unwrap().take().is_some();

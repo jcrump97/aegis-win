@@ -6,7 +6,9 @@
 //! only call [`LlmHandle::complete`].
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -27,6 +29,22 @@ fn default_context_tokens() -> u32 {
     DEFAULT_CONTEXT_TOKENS
 }
 
+/// How long to wait for the first sign of an answer. A local model may first
+/// have to load from disk.
+pub const DEFAULT_FIRST_TOKEN_SECS: u32 = 180;
+pub const MIN_FIRST_TOKEN_SECS: u32 = 30;
+pub const MAX_FIRST_TOKEN_SECS: u32 = 900;
+/// Once the model is answering, the longest silence allowed between pieces.
+const IDLE_LIMIT: Duration = Duration::from_secs(60);
+/// The longest any one answer may take.
+const ANSWER_LIMIT: Duration = Duration::from_secs(600);
+/// A streamed answer larger than this is not an answer.
+const MAX_STREAM_BYTES: usize = 4 << 20;
+
+fn default_first_token_secs() -> u32 {
+    DEFAULT_FIRST_TOKEN_SECS
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmConfig {
@@ -38,12 +56,15 @@ pub struct LlmConfig {
     /// keeps every request inside it.
     #[serde(default = "default_context_tokens")]
     pub context_tokens: u32,
+    /// Seconds to wait for the model to start answering.
+    #[serde(default = "default_first_token_secs")]
+    pub first_token_secs: u32,
 }
 
 impl Default for LlmConfig {
     fn default() -> Self {
         // Ollama's OpenAI-compatible endpoint.
-        Self { base_url: "http://127.0.0.1:11434/v1".into(), model: "llama3.2:latest".into(), api_key: None, context_tokens: DEFAULT_CONTEXT_TOKENS }
+        Self { base_url: "http://127.0.0.1:11434/v1".into(), model: "llama3.2:latest".into(), api_key: None, context_tokens: DEFAULT_CONTEXT_TOKENS, first_token_secs: DEFAULT_FIRST_TOKEN_SECS }
     }
 }
 
@@ -239,7 +260,8 @@ pub struct LlmHandle {
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(180))
+        // No overall timeout: answers stream, and `LlmHandle` times the wait
+        // for the first piece, the gaps between pieces, and the whole answer.
         // A LAN endpoint must not be able to bounce data to an off-LAN host.
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -283,7 +305,13 @@ impl LlmHandle {
     }
 
     /// Like [`complete`](Self::complete), with per-call options.
-    pub async fn complete_with(&self, system_prompt: &str, mut payload: Value, options: LlmOptions) -> AegisResult<LlmAnswer> {
+    pub async fn complete_with(&self, system_prompt: &str, payload: Value, options: LlmOptions) -> AegisResult<LlmAnswer> {
+        self.complete_watched(system_prompt, payload, options, &LlmProgress::default()).await
+    }
+
+    /// Like [`complete_with`](Self::complete_with), reporting how the answer
+    /// is coming along to `progress` while it streams in.
+    pub async fn complete_watched(&self, system_prompt: &str, mut payload: Value, options: LlmOptions, progress: &LlmProgress) -> AegisResult<LlmAnswer> {
         let endpoint = self.preflight()?;
         let off_lan = !endpoint.stays_on_lan();
         if off_lan {
@@ -309,34 +337,24 @@ impl LlmHandle {
             Some(root) => {
                 let mut body = json!({
                     "model": self.config.model,
-                    "stream": false,
+                    "stream": true,
                     "messages": messages,
                     "options": { "temperature": 0.2, "num_ctx": self.config.context_tokens, "num_predict": options.max_tokens },
                 });
                 if options.json {
                     body["format"] = json!("json");
                 }
-                let value = self.post(&endpoint, format!("{root}/api/chat"), &body).await?;
-                Reply {
-                    text: value.pointer("/message/content").and_then(Value::as_str).map(str::to_owned),
-                    cut_off: value.get("done_reason").and_then(Value::as_str) == Some("length"),
-                    prompt_tokens: value.get("prompt_eval_count").and_then(Value::as_u64),
-                }
+                self.stream(&endpoint, format!("{root}/api/chat"), &body, Wire::Ndjson, progress).await?
             }
             None => {
                 let body = json!({
                     "model": self.config.model,
                     "temperature": 0.2,
                     "max_tokens": options.max_tokens,
-                    "stream": false,
+                    "stream": true,
                     "messages": messages,
                 });
-                let value = self.post(&endpoint, api_url(&self.config.base_url, "chat/completions"), &body).await?;
-                Reply {
-                    text: value.pointer("/choices/0/message/content").and_then(Value::as_str).map(str::to_owned),
-                    cut_off: value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length"),
-                    prompt_tokens: value.pointer("/usage/prompt_tokens").and_then(Value::as_u64),
-                }
+                self.stream(&endpoint, api_url(&self.config.base_url, "chat/completions"), &body, Wire::Sse, progress).await?
             }
         };
         let text = reply.text.ok_or_else(|| llm_failed(&endpoint, "the response has no answer text"))?;
@@ -395,16 +413,41 @@ impl LlmHandle {
         Ok(user.chars().take(keep).collect::<String>() + "\n…(truncated)")
     }
 
-    async fn post(&self, endpoint: &Endpoint, url: String, body: &Value) -> AegisResult<Value> {
+    /// Sends a streaming request and reads the answer as it arrives. Waits
+    /// up to the owner's first-answer setting for the first piece (thinking
+    /// counts), then at most [`IDLE_LIMIT`] between pieces and
+    /// [`ANSWER_LIMIT`] in all. A server that ignores `stream` and answers in
+    /// one piece is read the same way.
+    async fn stream(&self, endpoint: &Endpoint, url: String, body: &Value, wire: Wire, progress: &LlmProgress) -> AegisResult<Reply> {
+        let first_wait = Duration::from_secs(u64::from(self.config.first_token_secs));
+        let started = Instant::now();
+        let first_deadline = started + first_wait.min(ANSWER_LIMIT);
+        let all_deadline = started + ANSWER_LIMIT;
+        progress.begin(self.config.first_token_secs);
+        let _done = ProgressDone(progress);
+
         let mut request = self.client.post(url).json(body);
         if let Some(key) = self.config.api_key.as_ref().filter(|k| !k.is_empty()) {
             request = request.bearer_auth(key.expose());
         }
-        let response = request.send().await.map_err(|e| llm_failed(endpoint, &e.to_string()))?;
+        let first_wait_error = || {
+            llm_failed(
+                endpoint,
+                &format!(
+                    "the model did not start answering within {} seconds. It may still be loading, or be too large for this PC. Try again, raise First answer wait on the LLM tab, or pick a smaller model.",
+                    self.config.first_token_secs
+                ),
+            )
+        };
+        let mut response = match tokio::time::timeout_at(first_deadline.into(), request.send()).await {
+            Err(_) => return Err(first_wait_error()),
+            Ok(Err(e)) => return Err(send_failed(endpoint, &e)),
+            Ok(Ok(r)) => r,
+        };
         let status = response.status();
-        let raw = response.text().await.map_err(|e| llm_failed(endpoint, &format!("HTTP {status}: {e}")))?;
-        let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         if !status.is_success() {
+            let raw = tokio::time::timeout(Duration::from_secs(30), response.text()).await.ok().and_then(Result::ok).unwrap_or_default();
+            let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
             let detail = value
                 .pointer("/error/message")
                 .or_else(|| value.get("error"))
@@ -412,7 +455,29 @@ impl LlmHandle {
                 .unwrap_or("request rejected");
             return Err(self.rejected(endpoint, status, detail));
         }
-        Ok(value)
+
+        let mut parser = StreamParser::new(wire);
+        loop {
+            let deadline = if parser.active { (Instant::now() + IDLE_LIMIT).min(all_deadline) } else { first_deadline };
+            let chunk = match tokio::time::timeout_at(deadline.into(), response.chunk()).await {
+                Err(_) if Instant::now() >= all_deadline => {
+                    return Err(llm_failed(endpoint, &format!("the answer took longer than {} minutes, so AegisWin stopped waiting.", ANSWER_LIMIT.as_secs() / 60)));
+                }
+                Err(_) if parser.active => {
+                    return Err(llm_failed(endpoint, &format!("the model stopped answering for {} seconds partway through.", IDLE_LIMIT.as_secs())));
+                }
+                Err(_) => return Err(first_wait_error()),
+                Ok(Err(e)) => return Err(llm_failed(endpoint, &format!("the connection broke while the answer was arriving ({e})."))),
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(bytes))) => bytes,
+            };
+            parser.push(&chunk).map_err(|detail| llm_failed(endpoint, &detail))?;
+            progress.update(parser.active, parser.answering(), parser.answer_chars());
+            if parser.done {
+                break;
+            }
+        }
+        parser.finish().map_err(|detail| llm_failed(endpoint, &detail))
     }
 }
 
@@ -420,6 +485,236 @@ struct Reply {
     text: Option<String>,
     cut_off: bool,
     prompt_tokens: Option<u64>,
+}
+
+/// How a server streams its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    /// OpenAI server-sent events: `data: {...}` lines, then `data: [DONE]`.
+    Sse,
+    /// Ollama: one JSON object per line, the last with `"done": true`.
+    Ndjson,
+}
+
+/// Collects a streamed answer line by line.
+struct StreamParser {
+    wire: Wire,
+    pending: Vec<u8>,
+    /// Everything received, kept only while it is small, for a server that
+    /// ignored `stream` and sent one ordinary JSON answer.
+    whole: Vec<u8>,
+    received: usize,
+    saw_stream: bool,
+    text: String,
+    /// The model has sent something: thinking or answer text.
+    active: bool,
+    cut_off: bool,
+    prompt_tokens: Option<u64>,
+    done: bool,
+}
+
+impl StreamParser {
+    fn new(wire: Wire) -> Self {
+        Self {
+            wire,
+            pending: Vec::new(),
+            whole: Vec::new(),
+            received: 0,
+            saw_stream: false,
+            text: String::new(),
+            active: false,
+            cut_off: false,
+            prompt_tokens: None,
+            done: false,
+        }
+    }
+
+    fn answering(&self) -> bool {
+        !self.text.trim().is_empty()
+    }
+
+    fn answer_chars(&self) -> u64 {
+        self.text.chars().count() as u64
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.received += bytes.len();
+        if self.received > MAX_STREAM_BYTES {
+            return Err("the answer was far larger than expected, so AegisWin stopped reading it.".into());
+        }
+        if !self.saw_stream {
+            self.whole.extend_from_slice(bytes);
+        }
+        self.pending.extend_from_slice(bytes);
+        while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            self.line(&String::from_utf8_lossy(&line))?;
+            if self.done {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn line(&mut self, line: &str) -> Result<(), String> {
+        let line = line.trim();
+        let data = match self.wire {
+            Wire::Sse => match line.strip_prefix("data:") {
+                Some(d) => d.trim(),
+                None => return Ok(()),
+            },
+            Wire::Ndjson => line,
+        };
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data == "[DONE]" {
+            self.saw_stream = true;
+            self.done = true;
+            return Ok(());
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+        if let Some(e) = v.pointer("/error/message").or_else(|| v.get("error")).and_then(Value::as_str) {
+            return Err(format!("the server reported an error: {}", truncate(e, 300)));
+        }
+        let (piece, thinking, finish, prompt_tokens) = match self.wire {
+            Wire::Sse => {
+                let delta = v.pointer("/choices/0/delta");
+                if delta.is_none() && v.pointer("/choices/0/message").is_some() {
+                    // An ordinary answer on one line; read at the end.
+                    return Ok(());
+                }
+                self.saw_stream = true;
+                let piece = delta.and_then(|d| d.get("content")).and_then(Value::as_str);
+                let thinking = delta.and_then(|d| d.get("reasoning_content").or_else(|| d.get("reasoning"))).and_then(Value::as_str);
+                let finish = v.pointer("/choices/0/finish_reason").and_then(Value::as_str);
+                (piece, thinking, finish, v.pointer("/usage/prompt_tokens").and_then(Value::as_u64))
+            }
+            Wire::Ndjson => {
+                self.saw_stream = true;
+                let piece = v.pointer("/message/content").and_then(Value::as_str);
+                let thinking = v.pointer("/message/thinking").and_then(Value::as_str);
+                let done = v.get("done").and_then(Value::as_bool) == Some(true);
+                if done {
+                    self.done = true;
+                }
+                let finish = if done { v.get("done_reason").and_then(Value::as_str) } else { None };
+                (piece, thinking, finish, v.get("prompt_eval_count").and_then(Value::as_u64))
+            }
+        };
+        if let Some(piece) = piece {
+            self.text.push_str(piece);
+        }
+        if piece.is_some_and(|p| !p.is_empty()) || thinking.is_some_and(|t| !t.is_empty()) {
+            self.active = true;
+        }
+        if finish == Some("length") {
+            self.cut_off = true;
+        }
+        if prompt_tokens.is_some() {
+            self.prompt_tokens = prompt_tokens;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Reply, String> {
+        if !self.pending.is_empty() && !self.done {
+            let rest = std::mem::take(&mut self.pending);
+            self.line(&String::from_utf8_lossy(&rest))?;
+        }
+        if !self.saw_stream {
+            // The server ignored `stream` and answered in one piece.
+            let v: Value = serde_json::from_slice(&self.whole).unwrap_or(Value::Null);
+            return Ok(Reply {
+                text: v.pointer("/choices/0/message/content").or_else(|| v.pointer("/message/content")).and_then(Value::as_str).map(str::to_owned),
+                cut_off: v.pointer("/choices/0/finish_reason").or_else(|| v.get("done_reason")).and_then(Value::as_str) == Some("length"),
+                prompt_tokens: v.pointer("/usage/prompt_tokens").or_else(|| v.get("prompt_eval_count")).and_then(Value::as_u64),
+            });
+        }
+        Ok(Reply { text: Some(self.text), cut_off: self.cut_off, prompt_tokens: self.prompt_tokens })
+    }
+}
+
+/// How one LLM request is coming along, for a progress line in the app. A
+/// plugin keeps one and passes it to [`LlmHandle::complete_watched`].
+#[derive(Debug, Default)]
+pub struct LlmProgress {
+    /// 0 idle, 1 waiting for the model, 2 thinking, 3 answering.
+    phase: AtomicU8,
+    chars: AtomicU64,
+    first_token_secs: AtomicU64,
+    started: Mutex<Option<Instant>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressView {
+    /// `idle`, `waiting` (no answer yet), `thinking`, or `answering`.
+    pub phase: &'static str,
+    pub elapsed_secs: u64,
+    /// Answer characters received so far.
+    pub chars: u64,
+    pub first_token_secs: u64,
+}
+
+impl LlmProgress {
+    fn begin(&self, first_token_secs: u32) {
+        self.chars.store(0, Ordering::SeqCst);
+        self.first_token_secs.store(u64::from(first_token_secs), Ordering::SeqCst);
+        *self.started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+        self.phase.store(1, Ordering::SeqCst);
+    }
+
+    fn update(&self, active: bool, answering: bool, chars: u64) {
+        self.chars.store(chars, Ordering::SeqCst);
+        self.phase.store(if answering { 3 } else if active { 2 } else { 1 }, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.phase.store(0, Ordering::SeqCst);
+        *self.started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub fn view(&self) -> ProgressView {
+        let phase = match self.phase.load(Ordering::SeqCst) {
+            1 => "waiting",
+            2 => "thinking",
+            3 => "answering",
+            _ => "idle",
+        };
+        let started = *self.started.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ProgressView {
+            phase,
+            elapsed_secs: started.map_or(0, |s| s.elapsed().as_secs()),
+            chars: self.chars.load(Ordering::SeqCst),
+            first_token_secs: self.first_token_secs.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Marks the progress idle however the request ends.
+struct ProgressDone<'a>(&'a LlmProgress);
+
+impl Drop for ProgressDone<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+/// Explains a request that never got an answer.
+fn send_failed(endpoint: &Endpoint, e: &reqwest::Error) -> AegisError {
+    if e.is_connect() {
+        return llm_failed(
+            endpoint,
+            "could not connect. Check that the LLM server is running (Ollama: open it from the Start menu) and that the base URL on the LLM tab is right.",
+        );
+    }
+    if e.is_timeout() {
+        return llm_failed(endpoint, "connecting took longer than 10 seconds. Check that the server is reachable from this PC.");
+    }
+    llm_failed(endpoint, &e.to_string())
 }
 
 /// A deliberately low estimate of characters per token, so requests err on
@@ -547,11 +842,11 @@ impl LlmHandle {
 /// Lists model ids at the endpoint (`GET /models`). Sends no diagnostic data.
 pub async fn list_models(client: &reqwest::Client, config: &LlmConfig) -> AegisResult<Vec<String>> {
     let endpoint = classify_endpoint(&config.base_url)?;
-    let mut request = client.get(api_url(&config.base_url, "models"));
+    let mut request = client.get(api_url(&config.base_url, "models")).timeout(Duration::from_secs(30));
     if let Some(key) = config.api_key.as_ref().filter(|k| !k.is_empty()) {
         request = request.bearer_auth(key.expose());
     }
-    let response = request.send().await.map_err(|e| llm_failed(&endpoint, &e.to_string()))?;
+    let response = request.send().await.map_err(|e| send_failed(&endpoint, &e))?;
     let status = response.status();
     if !status.is_success() {
         return Err(llm_failed(&endpoint, &format!("HTTP {status}")));
@@ -721,7 +1016,7 @@ long</think>
     }
 
     fn sized(base: &str, context_tokens: u32) -> LlmHandle {
-        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: "m".into(), api_key: None, context_tokens }, "event-logs", false)
+        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: "m".into(), api_key: None, context_tokens, ..LlmConfig::default() }, "event-logs", false)
     }
 
     #[tokio::test]
@@ -736,7 +1031,7 @@ long</think>
         let body: Value = serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
         assert_eq!(body["options"], json!({ "temperature": 0.2, "num_ctx": 16384, "num_predict": 1024 }));
         assert_eq!(body["format"], "json");
-        assert_eq!(body["stream"], false);
+        assert_eq!(body["stream"], true);
     }
 
     #[tokio::test]
@@ -764,9 +1059,99 @@ long</think>
         assert!(err.message.contains("filled the model's whole 4096-token context window"), "{}", err.message);
     }
 
+    fn timed(base: &str, first_token_secs: u32) -> LlmHandle {
+        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: "m".into(), first_token_secs, ..LlmConfig::default() }, "event-logs", false)
+    }
+
+    fn at(ms: u64, text: &str) -> (Duration, String) {
+        (Duration::from_millis(ms), text.to_owned())
+    }
+
+    #[tokio::test]
+    async fn reads_an_openai_stream_and_reports_progress() {
+        let sse = |content: &str| format!("data: {}\n\n", json!({ "choices": [{ "delta": { "content": content } }] }));
+        let (base, server) = crate::testing::mock_stream(
+            false,
+            vec![
+                at(0, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n"),
+                at(10, &sse("Disk ")),
+                // A line split across two writes.
+                at(10, &sse("is full.")[..12]),
+                at(10, &sse("is full.")[12..]),
+                at(10, "data: [DONE]\n\n"),
+            ],
+        )
+        .await;
+        let progress = LlmProgress::default();
+        let answer = timed(&base, 30).complete_watched("sys", json!({}), LlmOptions::default(), &progress).await.unwrap();
+        assert_eq!(answer.text, "Disk is full.");
+        assert_eq!(progress.view().phase, "idle", "finished");
+        let request = server.await.unwrap();
+        assert!(request.contains("\"stream\":true"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn reads_an_ollama_stream_with_thinking() {
+        let line = |v: Value| format!("{v}\n");
+        let (base, _server) = crate::testing::mock_stream(
+            true,
+            vec![
+                at(0, &line(json!({ "message": { "content": "", "thinking": "let me see" }, "done": false }))),
+                at(10, &line(json!({ "message": { "content": "{\"a\":1}" }, "done": false }))),
+                at(10, &line(json!({ "message": { "content": "" }, "done": true, "done_reason": "length", "prompt_eval_count": 50 }))),
+            ],
+        )
+        .await;
+        let err = timed(&base, 30).complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("cut off at its 2048-token limit"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn waits_for_the_first_piece_then_for_gaps() {
+        // Nothing arrives in time.
+        let (base, _server) = crate::testing::mock_stream(false, vec![at(3_000, "data: [DONE]\n\n")]).await;
+        let mut slow = timed(&base, 30);
+        slow.config.first_token_secs = 1;
+        let err = slow.complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("did not start answering within 1 seconds"), "{}", err.message);
+
+        // Thinking counts as a start, so the first-answer wait no longer applies.
+        let (base, _server) = crate::testing::mock_stream(
+            false,
+            vec![at(0, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"x\"}}]}\n\n"), at(1_500, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")],
+        )
+        .await;
+        let mut thinking = timed(&base, 30);
+        thinking.config.first_token_secs = 1;
+        assert_eq!(thinking.complete("sys", json!({})).await.unwrap().text, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_is_not_running_gets_a_clear_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = timed(&format!("http://127.0.0.1:{port}/v1"), 30).complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("could not connect. Check that the LLM server is running"), "{}", err.message);
+    }
+
+    #[test]
+    fn progress_reports_each_phase() {
+        let p = LlmProgress::default();
+        assert_eq!(p.view().phase, "idle");
+        p.begin(180);
+        assert_eq!((p.view().phase, p.view().first_token_secs), ("waiting", 180));
+        p.update(true, false, 0);
+        assert_eq!(p.view().phase, "thinking");
+        p.update(true, true, 42);
+        assert_eq!((p.view().phase, p.view().chars), ("answering", 42));
+        p.end();
+        assert_eq!(p.view().phase, "idle");
+    }
+
     #[tokio::test]
     async fn test_connection_checks_the_context_window() {
-        let config = |base: &str, context_tokens| LlmConfig { base_url: base.into(), model: "m".into(), api_key: None, context_tokens };
+        let config = |base: &str, context_tokens| LlmConfig { base_url: base.into(), model: "m".into(), api_key: None, context_tokens, ..LlmConfig::default() };
         let (base, _server) = crate::testing::mock_ollama(&["unused"], 8192).await;
         let info = server_info(&http_client(), &config(&base, 16384)).await;
         assert!(info.ollama);

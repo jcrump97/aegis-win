@@ -177,3 +177,25 @@ test('Serial executor: the app shows the change in progress, and the shell never
   assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
   assert.match(mainRs, /"quit" => quit_app\(app\),/);
 });
+
+test('UI: the monitor chat polls only the progress tool, quietly and without a PIN', async () => {
+  const monitors = fs.readFileSync('src/ui/monitors.ts', 'utf8');
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  const peeks = [...monitors.matchAll(/deps\.peek\('([a-z_]+)'\)/g)].map((m) => m[1]);
+  assert.deepEqual(peeks, ['monitor_chat_progress'], 'peek is only for the progress tool');
+  assert.match(main, /peek: async \(toolId: string\): Promise<unknown> => \{\s*try \{\s*const out = await api\.runTool\(pluginId, toolId, \{\}, null\);/);
+  const { build } = await import('esbuild');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+  const { installFakeDom } = await import('./helpers/fake-dom.mjs');
+  installFakeDom();
+  const bundle = await build({ entryPoints: ['src/ui/monitors.ts'], bundle: true, write: false, format: 'esm', platform: 'browser', logLevel: 'silent' });
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-mon-')), 'monitors.mjs');
+  fs.writeFileSync(file, bundle.outputFiles[0].text);
+  const { progressText } = await import(pathToFileURL(file).href);
+  assert.equal(progressText({ phase: 'idle' }), null);
+  assert.match(progressText({ phase: 'waiting', elapsedSecs: 12, firstTokenSecs: 180 }), /12 s of up to 180 s/);
+  assert.equal(progressText({ phase: 'thinking', elapsedSecs: 3 }), 'The model is thinking (3 s).');
+  assert.match(progressText({ phase: 'answering', elapsedSecs: 9, chars: 120 }), /120 characters so far \(9 s\)/);
+});

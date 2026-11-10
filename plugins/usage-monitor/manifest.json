@@ -164,6 +164,16 @@
       "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} }
     },
     {
+      "id": "monitor_chat_progress",
+      "name": "AI Progress",
+      "description": "In the app only: says whether the AI is still loading, thinking, or answering the current monitor chat step, and for how long. Sends nothing to the AI.",
+      "requiresAdmin": false,
+      "defaultGatePolicy": "auto",
+      "readOnly": true,
+      "appOnly": true,
+      "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+    },
+    {
       "id": "capture_diagnostic_snapshot",
       "name": "Capture Correlated Diagnostic Clues",
       "description": "Returns current system load, top processes by CPU and memory, recorded spikes, crash and hang events from the last 24 hours with related spikes, foreground app changes, and monitor hits.",

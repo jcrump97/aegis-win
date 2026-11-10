@@ -225,7 +225,7 @@ export interface McpStatus {
 export interface SettingsView {
   uiScale: number;
   autoLockMinutes: number;
-  llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; endpoint: Endpoint | null; endpointError: string | null };
+  llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; firstTokenSecs: number; endpoint: Endpoint | null; endpointError: string | null };
   mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; status: McpStatus; suggestedLanHost: string | null };
 }
 
@@ -235,6 +235,7 @@ export interface SettingsUpdate {
   llmBaseUrl?: string;
   llmModel?: string;
   llmContextTokens?: number;
+  llmFirstTokenSecs?: number;
   mcpEnabled?: boolean;
   mcpHost?: string;
   mcpPort?: number;

@@ -13,12 +13,14 @@ export interface MonitorDeps {
   tool(id: string): ToolView | undefined;
   /** Runs a usage-monitor tool, asking for the PIN or Off-LAN trust when the engine needs it. `error: null` means the owner cancelled. */
   run(toolId: string, args: Record<string, unknown>, button: HTMLButtonElement): Promise<ToolRun>;
+  /** Runs a read-only, PIN-free tool quietly (no busy button, no prompts); `null` on any failure. */
+  peek(toolId: string): Promise<unknown>;
   /** Where the first chat message would go, from the LLM settings. */
   llmDestination(): { host: string; offLan: boolean } | null;
 }
 
 /** Tools this screen handles; the plugin tab does not show generic forms for them. */
-export const MONITOR_TOOLS = new Set(['propose_monitor', 'activate_monitor', 'list_monitors', 'pause_monitor', 'delete_monitor', 'monitor_chat_start', 'monitor_chat_reply', 'monitor_chat_cancel', 'read_monitor_history', 'configure_history_retention', 'purge_telemetry_history']);
+export const MONITOR_TOOLS = new Set(['propose_monitor', 'activate_monitor', 'list_monitors', 'pause_monitor', 'delete_monitor', 'monitor_chat_start', 'monitor_chat_reply', 'monitor_chat_cancel', 'monitor_chat_progress', 'read_monitor_history', 'configure_history_retention', 'purge_telemetry_history']);
 
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : {});
@@ -293,10 +295,26 @@ function destinationText(d: unknown): string {
   return v.offLan === true ? `${str(v.host)}, outside your local network (personal details are scrubbed first)` : `${str(v.host)}, on your local network`;
 }
 
+/** One line about an AI request in flight, from `monitor_chat_progress`. */
+export function progressText(p: Json): string | null {
+  const secs = typeof p.elapsedSecs === 'number' ? p.elapsedSecs : 0;
+  switch (p.phase) {
+    case 'waiting':
+      return `Waiting for the model to start answering (${secs} s of up to ${typeof p.firstTokenSecs === 'number' ? p.firstTokenSecs : '?'} s; loading a model can take a while).`;
+    case 'thinking':
+      return `The model is thinking (${secs} s).`;
+    case 'answering':
+      return `The model is answering: ${typeof p.chars === 'number' ? p.chars : 0} characters so far (${secs} s).`;
+    default:
+      return null;
+  }
+}
+
 function monitorChat(deps: MonitorDeps, adjust: (rule: unknown) => void, started: () => void): HTMLElement {
   const log = h('div', { class: 'stack chat-log' });
   const message = h('div');
   const step = h('div', { class: 'stack' });
+  const progress = h('p', { class: 'hint', 'aria-live': 'polite' });
   const card = h(
     'section',
     { class: 'card stack' },
@@ -304,6 +322,7 @@ function monitorChat(deps: MonitorDeps, adjust: (rule: unknown) => void, started
     h('p', { class: 'hint' }, 'Say what you want to watch in your own words. The AI may ask up to three rounds of questions, then proposes a rule. AegisWin checks the rule and describes it; nothing runs until you start it with your PIN.'),
     log,
     message,
+    progress,
     step,
   );
   const say = (who: string, text: string) => log.appendChild(h('div', { class: 'chat-line' }, h('strong', {}, `${who}: `), text));
@@ -312,11 +331,30 @@ function monitorChat(deps: MonitorDeps, adjust: (rule: unknown) => void, started
     if (str(sent.host)) log.appendChild(h('p', { class: 'hint' }, `Sent to ${str(sent.model)} at ${destinationText(sent)}.`));
   };
 
+  /** Polls the AI's progress once a second while a chat step runs. */
+  const watch = () => {
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      const p = obj(await deps.peek('monitor_chat_progress'));
+      if (stopped) return;
+      replace(progress, progressText(p));
+      setTimeout(() => void tick(), 1000);
+    };
+    setTimeout(() => void tick(), 1000);
+    return () => {
+      stopped = true;
+      replace(progress);
+    };
+  };
+
   /** Runs one chat step with every button in the step disabled. */
   const send = async (toolId: string, args: Json, button: HTMLButtonElement) => {
     const buttons = Array.from(step.querySelectorAll('button')).filter((b) => b !== button);
     buttons.forEach((b) => (b.disabled = true));
+    const stop = watch();
     const r = await deps.run(toolId, args, button);
+    stop();
     buttons.forEach((b) => (b.disabled = false));
     replace(message, r.ok || !r.error ? null : errorBox(r.error));
     if (r.ok) show(obj(r.value));
