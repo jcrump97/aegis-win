@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use aegis_core::history::Retention;
 use aegis_core::history_service::HistoryHandle;
-use aegis_core::llm::LlmHandle;
+use aegis_core::llm::{LlmHandle, LlmOptions};
 use aegis_core::os::{self, eventlog};
 use aegis_core::plugin_data::PluginStore;
 use aegis_core::registry::{CallReview, ExitReason, Launch, LockedContext, Plugin, PluginManifest, ResumeNotice, ToolContext, UnlockContext};
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use monitors::{MonitorBook, MonitorHit, MonitorRuntime};
 use replay::RecordedTick;
 use serde_json::{json, Value};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 pub mod chat;
 pub mod creator;
@@ -346,12 +346,31 @@ fn poll_events(needs: &[(rules::Channel, Vec<u32>)]) -> Vec<rules::ObservedEvent
     out
 }
 
-/// Running process names, for the one lookup the owner agrees to in the chat.
-fn running_app_names() -> Vec<String> {
+/// Running process names, for the one lookup the owner agrees to in the
+/// chat: the apps the owner named plus the busiest, without Windows' own.
+fn running_app_names(mention_text: &str) -> Vec<String> {
+    let windows_dir = os::system32().parent().map(|d| d.to_string_lossy().to_lowercase() + "\\").unwrap_or_default();
     let mut sys = System::new();
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-    chat::clean_app_names(sys.processes().values().map(|p| p.name().to_string_lossy().into_owned()))
+    let kind = ProcessRefreshKind::nothing().with_cpu().with_memory().with_exe(UpdateKind::OnlyIfNotSet);
+    sys.refresh_cpu_usage();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    // CPU use needs two readings.
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(Duration::from_millis(500)));
+    sys.refresh_cpu_usage();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    let cores = sys.cpus().len().max(1) as f32;
+    let samples = sys.processes().values().filter(|p| p.pid().as_u32() != 0).map(|p| chat::AppSample {
+        name: p.name().to_string_lossy().into_owned(),
+        in_windows_dir: !windows_dir.is_empty() && p.exe().is_some_and(|e| e.to_string_lossy().to_lowercase().starts_with(&windows_dir)),
+        memory_bytes: p.memory(),
+        cpu_percent: p.cpu_usage() / cores,
+    });
+    chat::pick_app_names(samples, mention_text)
 }
+
+/// A chat reply is one small JSON object; 1024 tokens leaves room for a short
+/// thinking phase and stops a looping model long before the request times out.
+const CHAT_REPLY: LlmOptions = LlmOptions { max_tokens: 1024 };
 
 /// Where the next LLM request would go, without sending anything.
 fn destination(llm: &LlmHandle) -> Value {
@@ -687,15 +706,15 @@ impl UsageMonitorPlugin {
     async fn chat_reply(&self, args: &Value) -> AegisResult<bool> {
         let propose_now = args["proposeNow"].as_bool().unwrap_or(false);
         let share = args.get("shareRunningApps").and_then(Value::as_bool);
-        let (generation, awaiting) = {
+        let (generation, awaiting, mention_text) = {
             let guard = self.chat.lock().unwrap();
             let s = guard.as_ref().ok_or_else(|| AegisError::invalid("There is no monitor conversation. Start one first."))?;
-            (s.generation, s.awaiting)
+            (s.generation, s.awaiting, s.mention_text())
         };
         let apps = match awaiting {
             chat::Awaiting::Done => return Err(AegisError::invalid("This conversation is finished. Start a new one.")),
             chat::Awaiting::AppsConsent => match share.or(propose_now.then_some(false)) {
-                Some(true) => Some(tokio::task::spawn_blocking(running_app_names).await.unwrap_or_default()),
+                Some(true) => Some(tokio::task::spawn_blocking(move || running_app_names(&mention_text)).await.unwrap_or_default()),
                 Some(false) => None,
                 None => return Err(AegisError::invalid("Say whether the AI may see running app names (shareRunningApps).")),
             },
@@ -724,7 +743,7 @@ impl UsageMonitorPlugin {
         let mut problem: Option<String> = None;
         let mut sent = Value::Null;
         for _ in 0..2 {
-            let answer = llm.complete(chat::SYSTEM_PROMPT, session.payload(&ctx.enabled_components, must, problem.as_deref())).await?;
+            let answer = llm.complete_with(chat::SYSTEM_PROMPT, session.payload(&ctx.enabled_components, must, problem.as_deref()), CHAT_REPLY).await?;
             sent = json!({ "offLan": answer.off_lan, "host": answer.endpoint_host, "model": answer.model, "scrubbed": answer.scrubbed });
             let checked = creator::parse_reply(&answer.text).and_then(|reply| session.accept(&reply, must).map(|()| reply)).and_then(|reply| match reply {
                 creator::Reply::Proposal { rule, reasoning } => rules::validate(&rule, &ctx.enabled_components)

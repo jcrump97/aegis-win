@@ -13,7 +13,7 @@ use crate::rules::{self, clean_text};
 
 pub const MAX_REQUEST_CHARS: usize = 1000;
 pub const MAX_ANSWER_CHARS: usize = 300;
-pub const MAX_APP_NAMES: usize = 200;
+pub const MAX_APP_NAMES: usize = 60;
 pub const UNUSABLE: &str = "The AI gave an answer AegisWin could not use.";
 pub const REASONING_LABEL: &str = "Why the AI suggested this (AI-generated, may be wrong). The description above is what the monitor does.";
 
@@ -93,6 +93,12 @@ impl Session {
         Ok(Self { generation, request, rounds: Vec::new(), awaiting: Awaiting::Turn, apps_requested: false, running_apps: None })
     }
 
+    /// The owner's own words so far, used to keep apps they named in the list.
+    pub fn mention_text(&self) -> String {
+        let answers = self.rounds.iter().flat_map(|r| r.answers.iter().flatten().map(String::as_str));
+        std::iter::once(self.request.as_str()).chain(answers).collect::<Vec<_>>().join(" ")
+    }
+
     /// The AI must conclude: the owner pressed "Propose now", or the question rounds are used up.
     pub fn must_conclude(&self, propose_now: bool) -> bool {
         propose_now || self.rounds.len() >= MAX_ROUNDS
@@ -155,14 +161,70 @@ impl Session {
     }
 }
 
+/// One running process as the app picker sees it.
+#[derive(Debug, Clone, Default)]
+pub struct AppSample {
+    pub name: String,
+    /// The executable lives under `%SystemRoot%`.
+    pub in_windows_dir: bool,
+    pub memory_bytes: u64,
+    /// Share of the whole machine, 0-100.
+    pub cpu_percent: f32,
+}
+
+/// Windows background processes that never answer a monitor question but use
+/// up the AI's context. Compared without `.exe`, ignoring case.
+const SYSTEM_NOISE: &[&str] = &[
+    "aggregatorhost", "applicationframehost", "audiodg", "backgroundtaskhost", "conhost", "csrss", "ctfmon", "dashost",
+    "dllhost", "dwm", "fontdrvhost", "idle", "lsaiso", "lsass", "memcompression", "memory compression", "registry",
+    "runtimebroker", "searchhost", "searchindexer", "searchprotocolhost", "searchfilterhost", "secure system",
+    "securityhealthservice", "securityhealthsystray", "services", "shellexperiencehost", "sihost", "smartscreen", "smss",
+    "spoolsv", "startmenuexperiencehost", "svchost", "system", "taskhostw", "textinputhost", "unsecapp", "wininit",
+    "winlogon", "wlanext", "wmiprvse", "wudfhost",
+];
+
+fn stem(name: &str) -> String {
+    let lower = name.to_lowercase();
+    lower.strip_suffix(".exe").map(str::to_owned).unwrap_or(lower)
+}
+
+/// Whether the owner's own words name this app: "steam" matches `steam.exe`,
+/// and "photoshop" matches `Photoshop.exe`.
+fn mentioned(stem: &str, words: &[String]) -> bool {
+    stem.chars().count() >= 3 && words.iter().any(|w| w.contains(stem) || (w.chars().count() >= 4 && stem.contains(w.as_str())))
+}
+
 /// Running process names as the AI may see them: valid names only, without
-/// duplicates, sorted, at most [`MAX_APP_NAMES`].
-pub fn clean_app_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut out: Vec<String> = names.into_iter().map(|n| clean_text(&n)).filter(|n| n != "*" && rules::check_process(n, false).is_ok()).collect();
-    out.sort_by_key(|n| n.to_lowercase());
-    out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    out.truncate(MAX_APP_NAMES);
-    out
+/// duplicates or Windows background noise, at most [`MAX_APP_NAMES`]. Apps the
+/// owner named come first, then the busiest by memory and CPU, so a small
+/// local model gets the useful names instead of an alphabetical slice.
+pub fn pick_app_names(samples: impl IntoIterator<Item = AppSample>, mention_text: &str) -> Vec<String> {
+    let words: Vec<String> = mention_text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(str::to_owned)
+        .collect();
+    // name (as first seen) -> (mentioned, score); aggregated across instances.
+    let mut apps: Vec<(String, bool, f64)> = Vec::new();
+    for s in samples {
+        let name = clean_text(&s.name);
+        if name == "*" || rules::check_process(&name, false).is_err() {
+            continue;
+        }
+        let stem = stem(&name);
+        let named = mentioned(&stem, &words);
+        if !named && (s.in_windows_dir || SYSTEM_NOISE.contains(&stem.as_str())) {
+            continue;
+        }
+        let score = s.memory_bytes as f64 / 1_048_576.0 + 50.0 * f64::from(s.cpu_percent.max(0.0));
+        match apps.iter_mut().find(|(n, ..)| n.eq_ignore_ascii_case(&name)) {
+            Some(app) => app.2 += score,
+            None => apps.push((name, named, score)),
+        }
+    }
+    apps.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.total_cmp(&a.2)).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+    apps.into_iter().take(MAX_APP_NAMES).map(|(n, ..)| n).collect()
 }
 
 #[cfg(test)]
@@ -222,8 +284,33 @@ mod tests {
         s.apps_requested = true;
         assert!(s.accept(&apps, false).is_err(), "only once");
         assert_eq!(s.payload(&[], false, None)["runningApps"], "the owner declined to share running app names");
-        s.running_apps = Some(clean_app_names(["game.exe".into(), "Game.exe".into(), "C:\\x\\evil.exe".into(), "a|b".into(), "*".into(), "steam.exe".into()]));
+        let app = |name: &str, mb: u64| AppSample { name: name.into(), memory_bytes: mb << 20, ..Default::default() };
+        s.running_apps = Some(pick_app_names([app("steam.exe", 1), app("game.exe", 5), app("Game.exe", 5), app("C:\\x\\evil.exe", 9), app("a|b", 9), app("*", 9)], ""));
         assert_eq!(s.payload(&[], false, None)["runningApps"], json!(["game.exe", "steam.exe"]));
+    }
+
+    #[test]
+    fn the_app_list_keeps_named_and_busy_apps_and_drops_windows_noise() {
+        let app = |name: &str, mb: u64, cpu: f32, win: bool| AppSample { name: name.into(), in_windows_dir: win, memory_bytes: mb << 20, cpu_percent: cpu };
+        let mut samples = vec![
+            app("svchost.exe", 900, 5.0, true),
+            app("svchost.exe", 900, 5.0, true),
+            app("explorer.exe", 200, 1.0, true),
+            app("RuntimeBroker.exe", 50, 0.0, false),
+            app("chrome.exe", 300, 2.0, false),
+            app("chrome.exe", 300, 2.0, false),
+            app("Photoshop.exe", 1, 0.0, false),
+            app("vlc.exe", 1, 0.0, false),
+            app("game.exe", 100, 30.0, false),
+        ];
+        samples.extend((0..100).map(|i| app(&format!("idle{i:03}.exe"), 1, 0.0, false)));
+        let mut s = Session::new(1, "Photoshop freezes when the explorer window opens").unwrap();
+        s.rounds.push(Round { questions: questions(1), answers: vec![Some("also VLC".into())] });
+        let names = pick_app_names(samples, &s.mention_text());
+        assert_eq!(names.len(), MAX_APP_NAMES);
+        // Named apps first (even explorer.exe from the Windows folder), then by load.
+        assert_eq!(&names[..5], ["explorer.exe", "Photoshop.exe", "vlc.exe", "game.exe", "chrome.exe"]);
+        assert!(!names.iter().any(|n| n == "svchost.exe" || n == "RuntimeBroker.exe"));
     }
 
     #[test]

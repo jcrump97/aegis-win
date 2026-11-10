@@ -262,15 +262,21 @@ impl LlmHandle {
         Ok(endpoint)
     }
 
-    pub async fn complete(&self, system_prompt: &str, mut payload: Value) -> AegisResult<LlmAnswer> {
+    pub async fn complete(&self, system_prompt: &str, payload: Value) -> AegisResult<LlmAnswer> {
+        self.complete_with(system_prompt, payload, LlmOptions::default()).await
+    }
+
+    /// Like [`complete`](Self::complete), with a cap on the reply length.
+    pub async fn complete_with(&self, system_prompt: &str, mut payload: Value, options: LlmOptions) -> AegisResult<LlmAnswer> {
         let endpoint = self.preflight()?;
         let off_lan = !endpoint.stays_on_lan();
         if off_lan {
             scrub_value(&mut payload, crate::os::username().as_deref(), crate::os::hostname().as_deref());
         }
+        // Compact JSON: indentation costs tokens a small local model can't spare.
         let mut user = match payload {
             Value::String(s) => s,
-            other => serde_json::to_string_pretty(&other).unwrap_or_default(),
+            other => serde_json::to_string(&other).unwrap_or_default(),
         };
         if user.chars().count() > MAX_PROMPT_CHARS {
             user = user.chars().take(MAX_PROMPT_CHARS).collect::<String>() + "\n…(truncated)";
@@ -278,6 +284,7 @@ impl LlmHandle {
         let body = json!({
             "model": self.config.model,
             "temperature": 0.2,
+            "max_tokens": options.max_tokens,
             "stream": false,
             "messages": [
                 { "role": "system", "content": system_prompt },
@@ -304,14 +311,54 @@ impl LlmHandle {
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .ok_or_else(|| llm_failed(&endpoint, "response has no choices[0].message.content"))?;
+        let cut_off = value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length");
+        let text = strip_thinking(text).filter(|_| !cut_off).ok_or_else(|| {
+            llm_failed(
+                &endpoint,
+                &format!(
+                    "the model's answer was cut off at its {}-token limit. Try a model that answers more briefly, or one without a long thinking phase.",
+                    options.max_tokens
+                ),
+            )
+        })?;
         Ok(LlmAnswer {
-            text: text.trim().to_owned(),
+            text,
             model: self.config.model.clone(),
             endpoint_host: endpoint.host,
             off_lan,
             scrubbed: off_lan,
         })
     }
+}
+
+/// Per-call request options.
+#[derive(Debug, Clone, Copy)]
+pub struct LlmOptions {
+    /// The most tokens the model may write. Without a cap a looping model runs
+    /// until the request times out.
+    pub max_tokens: u32,
+}
+
+impl Default for LlmOptions {
+    fn default() -> Self {
+        Self { max_tokens: 2048 }
+    }
+}
+
+/// Drops `<think>…</think>` blocks that reasoning models put before their
+/// answer, and trims. `None` when a block is never closed: the answer was cut
+/// off while the model was still thinking.
+fn strip_thinking(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        let end = after.find("</think>")?;
+        rest = &after[end + "</think>".len()..];
+    }
+    out.push_str(rest);
+    Some(out.trim().to_owned())
 }
 
 impl LlmHandle {
@@ -478,5 +525,33 @@ mod tests {
         let request = server.await.unwrap();
         assert!(request.starts_with("POST /v1/chat/completions "), "{request}");
         assert!(request.contains("\"model\":\"m\""));
+        assert!(request.contains("\"max_tokens\":2048"), "{request}");
+        // The payload is sent as compact JSON.
+        assert!(request.contains(r#"{\"q\":1}"#), "{request}");
+    }
+
+    #[tokio::test]
+    async fn complete_with_caps_the_reply_and_strips_thinking() {
+        let (base, server) = crate::testing::mock_llm("<think>hmm
+long</think>
+{\"ok\":true}").await;
+        let answer = handle(&base, false).complete_with("sys", json!({}), LlmOptions { max_tokens: 1024 }).await.unwrap();
+        assert_eq!(answer.text, "{\"ok\":true}");
+        assert!(server.await.unwrap().contains("\"max_tokens\":1024"));
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_answer_is_reported_as_such() {
+        let body = json!({ "choices": [{ "message": { "content": "{\"a\":" }, "finish_reason": "length" }] }).to_string();
+        let (base, _server) = crate::testing::mock_http("200 OK", body).await;
+        let err = handle(&base, false).complete("sys", json!({})).await.unwrap_err();
+        assert!(err.message.contains("cut off at its 2048-token limit"), "{}", err.message);
+    }
+
+    #[test]
+    fn strip_thinking_handles_blocks_and_unclosed_tags() {
+        assert_eq!(strip_thinking("  plain  ").as_deref(), Some("plain"));
+        assert_eq!(strip_thinking("<think>a</think>x<think>b</think> y").as_deref(), Some("x y"));
+        assert_eq!(strip_thinking("<think>still going"), None);
     }
 }
