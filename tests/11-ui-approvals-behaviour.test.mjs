@@ -124,7 +124,7 @@ function backend(cmd, args) {
         uiScale: 100,
         autoLockMinutes: 15,
         llm: { baseUrl: 'http://127.0.0.1:11434', model: 'm', hasApiKey: false, contextTokens: 8192, endpoint: null, endpointError: null },
-        mcp: { enabled: false, host: '127.0.0.1', port: 47821, openFirewall: true, status: { running: false, url: null, localUrl: null, firewallRule: false, note: null }, suggestedLanHost: null },
+        mcp: { enabled: false, host: '127.0.0.1', port: 47821, openFirewall: true, deviceApproval: false, deviceApprovalNotice: null, status: { running: false, url: null, localUrl: null, firewallRule: false, note: null }, suggestedLanHost: null },
       };
     case 'list_tickets':
       return [runningPlan, queued, finished];

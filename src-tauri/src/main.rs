@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aegis_core::autostart::{Autostart, AutostartState};
-use aegis_core::engine::{Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
+use aegis_core::engine::{DeviceCodeView, Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
 use aegis_core::registry::{ExitReason, GatePolicy, Launch, Plugin, Registry};
@@ -340,6 +340,19 @@ async fn decide_ticket(
     engine.decide(&ticket_id, approve, pin, comment, "app", plan_hash.as_deref()).await
 }
 
+/// Turns Approve from another device on (needs the PIN) or off (does not).
+#[tauri::command]
+async fn set_device_approval(engine: EngineState<'_>, on: bool, pin: Option<String>) -> Cmd<()> {
+    engine.set_device_approval(on, pin).await
+}
+
+/// A one-time code, page link and QR code for approving one request on
+/// another device. Only the code's hash is kept.
+#[tauri::command]
+async fn show_device_code(engine: EngineState<'_>, ticket_id: String) -> Cmd<DeviceCodeView> {
+    engine.device_code(&ticket_id).await
+}
+
 /// Opens a plan the owner built in the app. Nothing runs until it is approved
 /// with the PIN on the Approvals tab, like any other plan.
 #[tauri::command]
@@ -483,6 +496,8 @@ fn main() {
             run_tool,
             list_tickets,
             decide_ticket,
+            set_device_approval,
+            show_device_code,
             cancel_ticket,
             propose_plan,
             start_mcp,

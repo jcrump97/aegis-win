@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod os;
 pub mod plan;
 pub mod plugin_data;
+pub mod qr;
 pub mod registry;
 pub mod schema;
 pub mod secret;

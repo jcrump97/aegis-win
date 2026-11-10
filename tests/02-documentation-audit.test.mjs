@@ -88,9 +88,9 @@ test('Documentation Audit: ADRs 0002 and 0003 are accepted and keep their trust 
   assert.match(monitor, /`activate_monitor` \| \*\*pin_required\*\*/);
   const plans = fs.readFileSync('documentation/adr/0003-action-plans.md', 'utf8');
   assert.match(plans, /\*\*Status\*\*: Accepted/);
-  // One PIN approves exactly the stored plan, and the browser page never skips the PIN.
+  // One PIN approves exactly the stored plan, and the device page never asks for the PIN (ADR 0004 §1).
   assert.match(plans, /hashed with SHA-256/);
-  assert.match(plans, /It always requires the PIN\./);
+  assert.match(plans, /It never asks for the PIN\./);
   assert.match(plans, /one global serial executor/);
   // Plugin data in the vault: own records only, and the store never replaces the gate.
   const spec = fs.readFileSync('documentation/PLUGIN_SPEC.md', 'utf8');

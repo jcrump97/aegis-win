@@ -101,6 +101,10 @@ Rules for the code:
 
 **The limitation (decision D1).** The code is shown only in the app, so the owner must be at the PC to read it. In that situation, approving in the app is just as easy. The device path is mostly worthwhile when the PC's screen is in reach but its keyboard isn't (a TV, an HTPC, a second room with the monitor visible). A "paired phone" that can approve with no PC screen at all needs a trusted certificate to be safe (§2.4), so it is deferred.
 
+**As built (Phase 1, `security/approval-channel`).** §1.1 and §1.2 are done except the tray balloon and taskbar flash, which follow on their own branch. Two choices made while building:
+- **The link is per ticket, not a list.** The app's code, link and QR code point at `/approve/{ticketId}`, so the device page never lists requests to whoever can reach the port. The ticket ID is 128 bits; the code is still what approves.
+- **The setting lives in memory only.** It is off at every start and turned off at every lock, which meets "never turns on by itself" and "a restored backup starts off" without a stored flag.
+
 ### 1.3 Limits on how many requests agents can make
 
 Today there is one MCP bearer token per install. The limits apply per token, so they still work if more tokens are added later.

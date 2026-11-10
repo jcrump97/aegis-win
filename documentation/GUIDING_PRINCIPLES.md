@@ -12,7 +12,7 @@ This document records the foundational engineering philosophy for **AegisWin**. 
 
 ## 3. Zero-Knowledge Human Authority
 - **The AI Never Sees the PIN**: The user's PIN is prompted on startup and verified locally via cryptographic KDF (Scrypt/Argon2id + timing-safe comparison). Neither the MCP client agent nor any LLM provider can ever read, query, or infer the PIN.
-- **Out-of-Band Web Approval Portal**: When an MCP agent calls a gated tool, the server issues a ticket and returns a local approval URL (`http://<host>:<port>/approve/<ticket-id>`). The human operator reviews the exact tool parameters, enters optional feedback comments, selects Accept or Decline, and authenticates with their PIN.
+- **Approval in the App**: When an MCP agent calls a gated tool, the server issues a ticket and tells the agent to wait for the owner. The owner reviews the exact tool parameters on the Approvals tab, enters optional feedback comments, selects Accept or Decline, and authenticates with their PIN. The agent never gets an approval link, and no web page ever asks for the PIN. An opt-in device page (`/approve/<ticket-id>`) approves with a one-time code the app shows, never the PIN ([ADR 0004](adr/0004-approval-channel-and-key-hardening.md) §1).
 
 ## 4. Network-Aware Data Sovereignty
 - **LAN vs. Off-LAN LLM Classification**: Localhost (`127.0.0.1`, `::1`) and private RFC1918 LAN subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) are recognized as local home/lab networks. Any external endpoint triggers a per-plugin trust prompt warning the user that diagnostic data may leave the LAN.

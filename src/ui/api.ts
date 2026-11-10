@@ -1,10 +1,20 @@
 // Typed wrappers around the Tauri commands in src-tauri/src/main.rs.
 // Shapes mirror the camelCase serde views in aegis-core; none carry secrets
-// except revealMcpToken, which needs the PIN.
+// except revealMcpToken, which needs the PIN, and showDeviceCode, whose
+// one-time code is shown once and works for 5 minutes.
 
 import { invoke } from '@tauri-apps/api/core';
 
 export type GatePolicy = 'auto' | 'pin_required';
+
+/** A one-time code for approving one request on another device. */
+export interface DeviceCodeView {
+  code: string;
+  expiresAt: string;
+  url: string;
+  /** One SVG path of 1x1 squares in a `size` x `size` viewBox. */
+  qr: { size: number; path: string };
+}
 
 export interface AegisError {
   code: string;
@@ -226,7 +236,7 @@ export interface SettingsView {
   uiScale: number;
   autoLockMinutes: number;
   llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; firstTokenSecs: number; endpoint: Endpoint | null; endpointError: string | null };
-  mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; status: McpStatus; suggestedLanHost: string | null };
+  mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; deviceApproval: boolean; deviceApprovalNotice: string | null; status: McpStatus; suggestedLanHost: string | null };
 }
 
 export interface SettingsUpdate {
@@ -297,6 +307,8 @@ export const api = {
   listTickets: () => call<TicketView[]>('list_tickets'),
   decideTicket: (ticketId: string, approve: boolean, pin: string, comment: string | null, planHash: string | null) =>
     call<TicketView>('decide_ticket', { ticketId, approve, pin, comment, planHash }),
+  setDeviceApproval: (on: boolean, pin: string | null) => call<void>('set_device_approval', { on, pin }),
+  showDeviceCode: (ticketId: string) => call<DeviceCodeView>('show_device_code', { ticketId }),
   cancelTicket: (ticketId: string) => call<TicketView>('cancel_ticket', { ticketId }),
   proposePlan: (request: PlanRequest) => call<TicketView>('propose_plan', { request }),
   startMcp: () => call<McpStatus>('start_mcp'),

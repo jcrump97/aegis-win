@@ -2,7 +2,7 @@
 // Rust engine enforces all gates, so this file only decides what to show.
 
 import './styles.css';
-import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
+import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { rawJson, renderValue, schemaForm } from './render';
@@ -740,7 +740,7 @@ function recordText(e: ApprovalRecordEvent): string {
         ? `${asText(e.toolName)} from ${asText(e.origin)}${plan.title ? `, titled "${plan.title}" (${asText(plan.titleLabel)})` : ''}, fingerprint ${asText(plan.hash).slice(0, 12)}`
         : `${asText(e.toolName)} (${asText(e.tool)}) from ${asText(e.origin)}, arguments ${asText(e.args)}`;
     case 'decided':
-      return `${e.lockedOut ? 'Locked after too many wrong PINs' : e.approved ? 'Approved' : 'Declined'} via ${asText(e.via)}${e.comment ? `. Note: ${asText(e.comment)}` : ''}`;
+      return `${e.lockedOut ? `Locked after too many wrong ${e.via === 'device code' ? 'codes' : 'PINs'}` : e.approved ? 'Approved' : 'Declined'} via ${asText(e.via)}${e.comment ? `. Note: ${asText(e.comment)}` : ''}`;
     case 'change_started':
       return `${asText(e.toolName)}${e.step ? ` (step ${asText(e.step)})` : ''}${e.origin ? ` from ${asText(e.origin)}` : ''}, arguments ${asText(e.args)}`;
     case 'change_finished':
@@ -836,6 +836,52 @@ function cancelButton(t: TicketView, label: string, message: HTMLElement): HTMLB
   return button;
 }
 
+/** Draws a QR code from its SVG path data, element by element. */
+function qrSvg(qr: DeviceCodeView['qr']): SVGSVGElement {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${qr.size} ${qr.size}`);
+  svg.setAttribute('width', '180');
+  svg.setAttribute('height', '180');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', 'QR code for the device page');
+  svg.setAttribute('shape-rendering', 'crispEdges');
+  const bg = document.createElementNS(ns, 'rect');
+  bg.setAttribute('width', String(qr.size));
+  bg.setAttribute('height', String(qr.size));
+  bg.setAttribute('fill', '#fff');
+  const dark = document.createElementNS(ns, 'path');
+  dark.setAttribute('d', qr.path);
+  dark.setAttribute('fill', '#000');
+  svg.append(bg, dark);
+  return svg;
+}
+
+/** Shows a one-time code, link and QR code for approving on another device. */
+function deviceCodeButton(t: TicketView): Node[] {
+  const area = h('div', { class: 'stack' });
+  const button = h('button', {}, 'Approve on another device');
+  button.addEventListener('click', async () => {
+    try {
+      const c = await busy(button, () => api.showDeviceCode(t.ticketId));
+      replace(
+        area,
+        h(
+          'div',
+          { class: 'card stack device-code' },
+          h('p', {}, 'On your phone or other device, open this page (or scan the code), check the request, and type this code to approve:'),
+          h('p', { class: 'device-code-value' }, h('code', {}, c.code)),
+          h('div', { class: 'row' }, qrSvg(c.qr), h('div', { class: 'stack grow' }, h('code', {}, c.url), h('button', { onclick: () => copyText(c.url) }, 'Copy link'))),
+          h('p', { class: 'hint' }, `The code works once, for this request only, until ${new Date(c.expiresAt).toLocaleTimeString()}. Asking for a new one replaces it. The page never asks for your PIN.`),
+        ),
+      );
+    } catch (e) {
+      replace(area, errorNotice(asError(e)));
+    }
+  });
+  return [h('div', { class: 'row' }, button), area];
+}
+
 /** PIN and note fields with Approve and Decline; a plan's approval names its hash. */
 function decisionForm(t: TicketView, approveLabel: string): Node[] {
   const pin = h('input', { type: 'password', autocomplete: 'off', id: `pin-${t.ticketId}` });
@@ -863,14 +909,16 @@ function decisionForm(t: TicketView, approveLabel: string): Node[] {
   decline.addEventListener('click', () => decide(false, decline));
   return [
     h('div', { class: 'grid2' }, h('div', {}, h('label', { for: `pin-${t.ticketId}` }, 'Your PIN'), pin, h('div', { class: 'hint' }, `${t.attemptsRemaining} attempt(s) left for this request`)), h('div', {}, h('label', { for: `comment-${t.ticketId}` }, 'Note for the agent (optional)'), comment)),
+    h('p', { class: 'hint' }, 'AegisWin only asks for your PIN in this window. A web page asking for it is not AegisWin.'),
     message,
     h('div', { class: 'row', style: 'margin-top:0.6rem' }, approve, decline),
+    ...(settings?.mcp.deviceApproval && settings.mcp.status.running ? deviceCodeButton(t) : []),
   ];
 }
 
 function decidedNotes(t: TicketView): Node[] {
   const out: Node[] = [];
-  if (t.decidedVia) out.push(h('p', { class: 'hint' }, `Decided in the ${t.decidedVia === 'browser' ? 'browser' : 'app'}${t.comment ? `: "${t.comment}"` : ''}`));
+  if (t.decidedVia) out.push(h('p', { class: 'hint' }, `Decided ${t.decidedVia === 'device code' ? 'on another device' : 'in the app'}${t.comment ? `: "${t.comment}"` : ''}`));
   if (t.error) out.push(errorNotice(t.error));
   return out;
 }
@@ -970,7 +1018,7 @@ function ticketCard(t: TicketView): HTMLElement {
 // ---- MCP --------------------------------------------------------------------
 
 function mcpTab(): HTMLElement {
-  const container = h('div', { class: 'stack' }, h('h2', {}, 'MCP server'), h('p', { class: 'hint' }, 'Lets AI agents such as Claude call AegisWin tools over the Model Context Protocol. Tools set to “needs my PIN” wait until you approve them in the browser or on the Approvals tab; the rest run right away. Repairs need your PIN by default.'));
+  const container = h('div', { class: 'stack' }, h('h2', {}, 'MCP server'), h('p', { class: 'hint' }, 'Lets AI agents such as Claude call AegisWin tools over the Model Context Protocol. Tools set to “needs my PIN” wait until you approve them on the Approvals tab; the rest run right away. Repairs need your PIN by default.'));
   if (!settings) return container;
   const mcp = settings.mcp;
 
@@ -1027,6 +1075,34 @@ function mcpTab(): HTMLElement {
     h('div', { class: 'row end' }, save),
   );
 
+  const deviceCard = h('section', { class: 'card stack' });
+  const renderDevice = () => {
+    const m = settings!.mcp;
+    const toggle = h('button', { class: m.deviceApproval ? '' : 'primary' }, m.deviceApproval ? 'Turn off' : 'Turn on (PIN)');
+    toggle.addEventListener('click', async () => {
+      try {
+        if (m.deviceApproval) {
+          await busy(toggle, () => api.setDeviceApproval(false, null));
+        } else {
+          const pin = await askPin('Approve from another device?', 'Each request then gets an “Approve on another device” button that shows a one-time code. Anyone who can reach the MCP server could open the page, but only the code approves.', 'Turn on');
+          if (pin === null) return;
+          await busy(toggle, () => api.setDeviceApproval(true, pin));
+        }
+        settings = await api.getSettings();
+        renderDevice();
+      } catch (e) {
+        await handleError(e);
+      }
+    });
+    replace(
+      deviceCard,
+      h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'Approve from another device'), h('span', { class: `badge ${m.deviceApproval ? 'ok' : ''}` }, m.deviceApproval ? 'on' : 'off'), toggle),
+      h('p', { class: 'hint' }, 'Off by default and turned off again whenever AegisWin locks. When on, a request can be approved from a phone or other PC with a one-time code shown here; declining needs no code. AegisWin never asks for your PIN on a web page.'),
+      m.deviceApprovalNotice ? h('div', { class: 'notice' }, m.deviceApprovalNotice) : null,
+    );
+  };
+  renderDevice();
+
   const tokenArea = h('div', { class: 'stack' });
   const reveal = h('button', {}, 'Show token and setup commands');
   reveal.addEventListener('click', async () => {
@@ -1067,7 +1143,7 @@ function mcpTab(): HTMLElement {
   });
   const tokenCard = h('section', { class: 'card stack' }, h('h3', {}, 'Connect an AI client'), h('div', { class: 'row' }, reveal, rotate), tokenArea);
 
-  return h('div', { class: 'stack' }, container, statusCard, configCard, tokenCard, gatesCard());
+  return h('div', { class: 'stack' }, container, statusCard, configCard, deviceCard, tokenCard, gatesCard());
 }
 
 function gatesCard(): HTMLElement {

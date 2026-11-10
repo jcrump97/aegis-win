@@ -1,16 +1,19 @@
-//! MCP server (Streamable HTTP, JSON responses only) and the browser
-//! approval portal for `pin_required` tools.
+//! MCP server (Streamable HTTP, JSON responses only) and the device page for
+//! approving on another device.
 //!
 //! - `POST /mcp`: JSON-RPC 2.0, bearer token required.
-//! - `GET|POST /approve/{ticketId}`: a no-script HTML page where the owner
-//!   approves or declines with their PIN. Protected by a per-ticket CSRF token.
+//! - `GET|POST /approve/{ticketId}`: a no-script HTML page that exists only
+//!   while the owner has turned on Approve from another device. Approving
+//!   needs the one-time code the app showed for that request; declining
+//!   needs nothing. The page never asks for the PIN (ADR 0004 §1.1).
+//!   Protected by a per-ticket CSRF token.
 //!
 //! Every request must carry a `Host` header naming the address it arrived on
 //! (DNS rebinding defense), and a cross-site `Origin` is rejected.
 //!
 //! A LAN bind also listens on `127.0.0.1` at the same port, so clients on this
-//! PC keep one fixed URL whatever the bind address. Approval links always use
-//! the bind address, so other devices on the network can open them.
+//! PC keep one fixed URL whatever the bind address. Device page links always
+//! use the bind address, so other devices on the network can open them.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -92,7 +95,6 @@ impl McpHandle {
 struct AppState {
     engine: Arc<Engine>,
     allowed_hosts: Arc<Vec<String>>,
-    base_url: Arc<String>,
     stopped: watch::Receiver<bool>,
 }
 
@@ -148,17 +150,16 @@ pub async fn start(engine: Arc<Engine>, host: Ipv4Addr, port: u16, open_firewall
         }
     }
 
-    let base_url = Arc::new(base_url);
     let (stopped, rx) = watch::channel(false);
-    let mut tasks = vec![serve(listener, router(engine.clone(), allowed_hosts(host, port), base_url.clone(), rx.clone()), rx.clone())];
+    let mut tasks = vec![serve(listener, router(engine.clone(), allowed_hosts(host, port), rx.clone()), rx.clone())];
     if let Some(l) = loopback {
-        tasks.push(serve(l, router(engine, allowed_hosts(Ipv4Addr::LOCALHOST, port), base_url, rx.clone()), rx));
+        tasks.push(serve(l, router(engine, allowed_hosts(Ipv4Addr::LOCALHOST, port), rx.clone()), rx));
     }
     Ok(McpHandle { stopped, tasks, status, firewall_rule })
 }
 
-fn router(engine: Arc<Engine>, allowed_hosts: Vec<String>, base_url: Arc<String>, stopped: watch::Receiver<bool>) -> Router {
-    let state = AppState { engine, allowed_hosts: Arc::new(allowed_hosts), base_url, stopped };
+fn router(engine: Arc<Engine>, allowed_hosts: Vec<String>, stopped: watch::Receiver<bool>) -> Router {
+    let state = AppState { engine, allowed_hosts: Arc::new(allowed_hosts), stopped };
     Router::new()
         .route("/mcp", post(mcp_post).get(method_not_allowed).delete(method_not_allowed))
         .route("/approve/{id}", get(portal_get).post(portal_post))
@@ -275,8 +276,8 @@ fn initialize(params: &Value) -> Value {
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "aegis-win", "title": "AegisWin", "version": env!("CARGO_PKG_VERSION") },
         "instructions": "AegisWin diagnoses and repairs this Windows PC. Read-only tools run immediately. \
-Tools marked as needing approval return status 'pending_approval' with an approvalUrl: give that link to the user, \
-who approves with their PIN, then call aegis__check_ticket with the ticketId until the status is final. \
+Tools marked as needing approval return status 'pending_approval': tell the user to approve the request in the AegisWin app, \
+then call aegis__check_ticket with the ticketId until the status is final. AegisWin never asks anyone to type its PIN outside the app. \
 To run several repairs in order under one approval, use aegis__propose_plan. \
 Tools that need administrator rights fail unless AegisWin runs elevated.",
     })
@@ -293,7 +294,7 @@ fn tools_list(state: &AppState) -> AegisResult<Value> {
                 description.push_str(" Needs AegisWin running as administrator.");
             }
             if t.policy == GatePolicy::PinRequired {
-                description.push_str(" Needs the owner's PIN approval: returns a ticketId and approvalUrl; poll aegis__check_ticket.");
+                description.push_str(" Needs the owner's approval in the AegisWin app: returns a ticketId; poll aegis__check_ticket.");
             }
             if t.tool.input_schema.pointer("/properties/dryRun").is_some() {
                 description.push_str(" dryRun: true shows the exact commands without running them or needing approval.");
@@ -329,9 +330,9 @@ fn tools_list(state: &AppState) -> AegisResult<Value> {
             "name": PROPOSE_PLAN_TOOL,
             "title": "Propose an action plan",
             "description": format!(
-                "Proposes up to {MAX_STEPS} repairs to run in order under one approval. Nothing runs until the owner approves with their PIN. \
+                "Proposes up to {MAX_STEPS} repairs to run in order under one approval. Nothing runs until the owner approves it in the AegisWin app. \
 Each step is checked and dry-run now; the owner sees every argument and the exact commands. Steps run one at a time and the plan \
-stops at the first failure; earlier changes stay. Returns a ticketId, an approvalUrl, and a plan fingerprint (plan.shortHash) to \
+stops at the first failure; earlier changes stay. Returns a ticketId and a plan fingerprint (plan.shortHash) to \
 tell the owner; poll aegis__check_ticket, whose steps array shows each step. Pending plans expire after 10 minutes. \
 Steps can use: {}.",
                 eligible.join(", ")
@@ -395,17 +396,16 @@ fn tool_error(e: &AegisError) -> Value {
     })
 }
 
-fn ticket_payload(state: &AppState, ticket: &TicketView) -> Value {
+fn ticket_payload(ticket: &TicketView) -> Value {
     let mut value = serde_json::to_value(ticket).unwrap_or_default();
     match (ticket.status, &ticket.plan) {
         (TicketStatus::PendingApproval, plan) => {
-            value["approvalUrl"] = json!(format!("{}/approve/{}", state.base_url, ticket.ticket_id));
             value["message"] = json!(match plan {
                 Some(p) => format!(
-                    "Waiting for the owner. Show them the approvalUrl and the plan fingerprint {} (or they can approve in the AegisWin app), then call aegis__check_ticket.",
+                    "Waiting for the owner to approve in the AegisWin app. Tell them the plan fingerprint {}, then call aegis__check_ticket to see the outcome.",
                     p.short_hash
                 ),
-                None => "Waiting for the owner. Show them the approvalUrl (or they can approve in the AegisWin app), then call aegis__check_ticket.".into(),
+                None => "Waiting for the owner to approve in the AegisWin app. Call aegis__check_ticket to see the outcome.".into(),
             });
         }
         (TicketStatus::Queued, _) => {
@@ -433,21 +433,21 @@ async fn tools_call(state: &AppState, id: &Value, params: &Value) -> Response {
     if name == CHECK_TICKET_TOOL {
         let ticket_id = args.get("ticketId").and_then(Value::as_str).unwrap_or_default();
         return match state.engine.ticket(ticket_id) {
-            Some(ticket) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
+            Some(ticket) => rpc_result(id, tool_text(&ticket_payload(&ticket), false)),
             None => rpc_result(id, tool_error(&not_found())),
         };
     }
     if name == CANCEL_TICKET_TOOL {
         let ticket_id = args.get("ticketId").and_then(Value::as_str).unwrap_or_default();
         return match state.engine.cancel_ticket(ticket_id) {
-            Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
+            Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(&ticket), false)),
             Err(e) if e.code == ErrorCode::NotFound => rpc_result(id, tool_error(&not_found())),
             Err(e) => rpc_result(id, tool_error(&e)),
         };
     }
     if name == PROPOSE_PLAN_TOOL {
         return match state.engine.propose_plan(PlanOrigin::Agent, args).await {
-            Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
+            Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(&ticket), false)),
             Err(e) => rpc_result(id, tool_error(&e)),
         };
     }
@@ -456,7 +456,7 @@ async fn tools_call(state: &AppState, id: &Value, params: &Value) -> Response {
     };
     match state.engine.run_tool(Origin::Mcp, plugin_id, tool_id, args).await {
         Ok(RunOutcome::Completed { result }) => rpc_result(id, tool_text(&result, false)),
-        Ok(RunOutcome::PendingApproval { ticket }) => rpc_result(id, tool_text(&ticket_payload(state, &ticket), false)),
+        Ok(RunOutcome::PendingApproval { ticket }) => rpc_result(id, tool_text(&ticket_payload(&ticket), false)),
         Err(e) if e.code == ErrorCode::UnknownTool => rpc_error(StatusCode::OK, id, -32602, &format!("unknown tool: {name}")),
         Err(e) => rpc_result(id, tool_error(&e)),
     }
@@ -527,6 +527,12 @@ pre{background:#262a31}dt{color:#9aa3af}input,textarea{background:#262a31;color:
 .decline{background:#30353d;color:inherit}.msg{background:#3a2e1a}.ok{background:#1d3324}.supplied{border-color:#3a3f48}\
 .label{color:#9aa3af}.stop{background:#30353d;color:inherit}}";
 
+/// The one-time code field. Not `required`: declining needs no code.
+const CODE_FIELD: &str = "<label for=\"code\">Code shown in the AegisWin app (needed to approve)</label>\
+<input id=\"code\" name=\"code\" type=\"text\" inputmode=\"text\" autocapitalize=\"characters\" spellcheck=\"false\" \
+maxlength=\"16\" placeholder=\"XXXX-XXXX\" autofocus>\
+<p class=\"label\">AegisWin never asks for your PIN on a web page. If a page asks for it, it is not AegisWin.</p>";
+
 fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str, bool)>) -> String {
     if let Some(plan) = &ticket.plan {
         return render_plan(ticket, plan, csrf, message);
@@ -562,7 +568,7 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
     match (ticket.status, csrf) {
         (TicketStatus::PendingApproval, Some(csrf)) => body.push_str(&format!(
             "<form method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-<label for=\"pin\">Your AegisWin PIN</label><input id=\"pin\" name=\"pin\" type=\"password\" required autofocus>\
+{CODE_FIELD}\
 <label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
 <p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run</button>\
 <button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button></div></form>",
@@ -656,7 +662,7 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
         (TicketStatus::PendingApproval, Some(csrf)) => body.push_str(&format!(
             "<form method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
 <input type=\"hidden\" name=\"plan_hash\" value=\"{}\">\
-<label for=\"pin\">Your AegisWin PIN</label><input id=\"pin\" name=\"pin\" type=\"password\" required autofocus>\
+{CODE_FIELD}\
 <label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
 <p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run {} step{}</button>\
 <button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button></div></form>",
@@ -687,7 +693,15 @@ fn status_label(status: TicketStatus) -> String {
     serde_json::to_value(status).ok().and_then(|v| v.as_str().map(|s| s.replace('_', " "))).unwrap_or_default()
 }
 
+/// The device page exists only while the owner has it turned on.
+fn device_page_off(state: &AppState) -> Option<Response> {
+    (!state.engine.device_approval_on()).then(|| page(StatusCode::NOT_FOUND, "<h1>Not found</h1>"))
+}
+
 async fn portal_get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if let Some(off) = device_page_off(&state) {
+        return off;
+    }
     if !valid_ticket_id(&id) {
         return page(StatusCode::NOT_FOUND, "<h1>Not found</h1>");
     }
@@ -703,9 +717,9 @@ async fn portal_get(State(state): State<AppState>, Path(id): Path<String>) -> Re
 #[derive(Deserialize)]
 struct PortalForm {
     csrf: String,
-    /// Not sent by the cancel form.
+    /// The one-time device code; not sent by the cancel form.
     #[serde(default)]
-    pin: String,
+    code: String,
     decision: String,
     #[serde(default)]
     comment: Option<String>,
@@ -715,7 +729,9 @@ struct PortalForm {
 }
 
 async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form(form): Form<PortalForm>) -> Response {
-    let pin = zeroize::Zeroizing::new(form.pin);
+    if let Some(off) = device_page_off(&state) {
+        return off;
+    }
     if !valid_ticket_id(&id) || state.engine.ticket(&id).is_none() {
         return page(StatusCode::NOT_FOUND, "<h1>No such request</h1>");
     }
@@ -728,7 +744,7 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
         "cancel" => return portal_cancel(&state, &id),
         _ => return page(StatusCode::BAD_REQUEST, "<h1>Choose approve or decline</h1>"),
     };
-    let result = state.engine.decide(&id, approve, pin.to_string(), form.comment, "browser", form.plan_hash.as_deref()).await;
+    let result = state.engine.decide_on_device(&id, approve, &form.code, form.comment, form.plan_hash.as_deref());
     let ticket = state.engine.ticket(&id);
     let csrf = state.engine.ticket_csrf(&id);
     match (result, ticket) {
@@ -745,9 +761,8 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
         }
         (Err(e), Some(ticket)) => {
             let status = match e.code {
-                ErrorCode::PinInvalid => StatusCode::FORBIDDEN,
-                ErrorCode::PinLockedOut if ticket.status == TicketStatus::LockedOut => StatusCode::LOCKED,
-                ErrorCode::PinLockedOut => StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::CodeInvalid if ticket.status == TicketStatus::LockedOut => StatusCode::LOCKED,
+                ErrorCode::CodeInvalid => StatusCode::FORBIDDEN,
                 ErrorCode::Conflict => StatusCode::CONFLICT,
                 ErrorCode::VaultLocked => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -850,7 +865,8 @@ mod tests {
         };
         let html = render_ticket(&ticket, Some("csrf-token"), None);
         assert!(html.contains("Another change is running first"), "{html}");
-        assert!(!html.contains("name=\"pin\"") && !html.contains("value=\"approve\""), "a decided request cannot be decided again");
+        assert!(!html.contains("name=\"code\"") && !html.contains("value=\"approve\""), "a decided request cannot be decided again");
+        assert!(!html.contains("name=\"pin\""), "the page never asks for the PIN");
         assert!(html.contains("value=\"cancel\"") && html.contains("Cancel before it starts"), "{html}");
         let closed = render_ticket(&TicketView { status: TicketStatus::Approved, ..ticket }, Some("csrf-token"), None);
         assert!(!closed.contains("<form") && !closed.contains("csrf-token"), "a finished request offers no form");

@@ -1,4 +1,4 @@
-//! Drives the real MCP server and approval portal over loopback HTTP.
+//! Drives the real MCP server and the device approval page over loopback HTTP.
 
 mod common;
 
@@ -59,6 +59,15 @@ impl Server {
     async fn call(&self, name: &str, arguments: Value) -> Value {
         self.rpc("tools/call", json!({ "name": name, "arguments": arguments })).await["result"].clone()
     }
+
+    /// Turns on Approve from another device and gets a code for `ticket_id`:
+    /// the page URL and the code, as the app would show them.
+    async fn device_code(&self, ticket_id: &str) -> (String, String) {
+        self.f.engine.set_device_approval(true, Some(PIN.into())).await.unwrap();
+        let code = self.f.engine.device_code(ticket_id).await.unwrap();
+        assert!(code.qr.size > 21 && !code.qr.path.is_empty());
+        (code.url, code.code)
+    }
 }
 
 #[tokio::test]
@@ -86,7 +95,8 @@ async fn handshake_and_tool_listing() {
     assert!(names.iter().all(|n| n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')));
     let fix = tools.iter().find(|t| t["name"] == "demo__fix").unwrap();
     assert_eq!(fix["annotations"]["readOnlyHint"], false);
-    assert!(fix["description"].as_str().unwrap().contains("PIN approval"));
+    assert!(fix["description"].as_str().unwrap().contains("approval in the AegisWin app"));
+    assert!(!list.to_string().contains("approvalUrl"));
 
     assert_eq!(s.rpc("ping", json!({})).await["result"], json!({}));
     assert_eq!(s.rpc("resources/list", json!({})).await["error"]["code"], -32601);
@@ -134,15 +144,23 @@ fn extract_csrf(html: &str) -> String {
 }
 
 #[tokio::test]
-async fn pin_gated_tools_are_approved_in_the_browser_portal() {
+async fn pin_gated_tools_are_approved_with_a_device_code() {
     let s = server().await;
     let pending = s.call("demo__fix", json!({ "note": "<script>alert(1)</script>" })).await;
     let content = &pending["structuredContent"];
     assert_eq!(content["status"], "pending_approval");
     assert!(content.get("csrf").is_none());
+    assert!(content.get("approvalUrl").is_none(), "agents get no link to hand the owner (ADR 0004 §1.1)");
+    assert!(content["message"].as_str().unwrap().contains("approve in the AegisWin app"), "{content}");
     let ticket_id = content["ticketId"].as_str().unwrap().to_owned();
-    let approval_url = content["approvalUrl"].as_str().unwrap().to_owned();
-    assert_eq!(approval_url, format!("{}/approve/{ticket_id}", s.base));
+    let page_url = format!("{}/approve/{ticket_id}", s.base);
+
+    // The page does not exist until the owner turns the feature on.
+    assert_eq!(s.http.get(&page_url).send().await.unwrap().status(), 404);
+    let err = s.f.engine.set_device_approval(true, Some("000000".into())).await.unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::PinInvalid, "turning it on needs the PIN");
+    let (approval_url, code) = s.device_code(&ticket_id).await;
+    assert_eq!(approval_url, page_url);
 
     let page = s.http.get(&approval_url).send().await.unwrap();
     assert_eq!(page.status(), 200);
@@ -159,25 +177,34 @@ async fn pin_gated_tools_are_approved_in_the_browser_portal() {
     assert!(html.contains("<li>Fixes &lt;script&gt;alert(1)&lt;/script&gt;.</li>"), "{html}");
     assert!(html.contains("Fixing &lt;b&gt;cannot&lt;/b&gt; be undone."));
     assert_eq!(content["review"]["warnings"][0], "Fixing <b>cannot</b> be undone.", "agents see the same review");
+    assert!(!html.contains("name=\"pin\"") && html.contains("name=\"code\""), "the page asks for the code, never the PIN");
+    assert!(html.contains("AegisWin never asks for your PIN on a web page"));
     let csrf = extract_csrf(&html);
 
-    let post = |origin: &str, csrf: &str, pin: &str, decision: &str| {
+    let post = |origin: &str, csrf: &str, code: &str, decision: &str| {
         s.http
             .post(&approval_url)
             .header("origin", origin)
             .header("content-type", "application/x-www-form-urlencoded")
             .body(
                 url::form_urlencoded::Serializer::new(String::new())
-                    .extend_pairs([("csrf", csrf), ("pin", pin), ("decision", decision), ("comment", "ok from test")])
+                    .extend_pairs([("csrf", csrf), ("code", code), ("decision", decision), ("comment", "ok from test")])
                     .finish(),
             )
     };
-    let form = |csrf: &str, pin: &str, decision: &str| post(&s.base, csrf, pin, decision);
-    assert_eq!(form("0".repeat(32).as_str(), PIN, "approve").send().await.unwrap().status(), 403, "bad CSRF");
-    let null_origin = post("null", &csrf, PIN, "approve").send().await.unwrap();
+    let form = |csrf: &str, code: &str, decision: &str| post(&s.base, csrf, code, decision);
+    assert_eq!(form("0".repeat(32).as_str(), &code, "approve").send().await.unwrap().status(), 403, "bad CSRF");
+    let null_origin = post("null", &csrf, &code, "approve").send().await.unwrap();
     assert_eq!(null_origin.status(), 403, "an opaque origin is still refused");
-    assert_eq!(form(&csrf, "000000", "approve").send().await.unwrap().status(), 403, "wrong PIN");
-    let approved = form(&csrf, PIN, "approve").send().await.unwrap();
+    let typo = form(&csrf, "123", "approve").send().await.unwrap();
+    assert_eq!(typo.status(), 403);
+    assert!(typo.text().await.unwrap().contains("3 attempt(s) left"), "something that is not a code costs no attempt");
+    assert_eq!(form(&csrf, PIN, "approve").send().await.unwrap().status(), 403, "the PIN is not a code");
+    let wrong = if code == "ZZZZ-ZZZZ" { "YYYY-YYYY" } else { "ZZZZ-ZZZZ" };
+    let missed = form(&csrf, wrong, "approve").send().await.unwrap();
+    assert_eq!(missed.status(), 403, "wrong code");
+    assert!(missed.text().await.unwrap().contains("2 attempt(s) left"));
+    let approved = form(&csrf, &code.to_lowercase(), "approve").send().await.unwrap();
     assert_eq!(approved.status(), 200);
     assert!(approved.text().await.unwrap().contains("Approved"));
 
@@ -192,10 +219,10 @@ async fn pin_gated_tools_are_approved_in_the_browser_portal() {
     }
     assert_eq!(status["status"], "approved", "{status}");
     assert_eq!(status["result"]["done"], "fix");
-    assert_eq!(status["decidedVia"], "browser");
+    assert_eq!(status["decidedVia"], "device code");
     assert_eq!(status["comment"], "ok from test");
 
-    assert_eq!(form(&csrf, PIN, "approve").send().await.unwrap().status(), 409, "no double approval");
+    assert_eq!(form(&csrf, &code, "approve").send().await.unwrap().status(), 409, "no double approval");
     assert_eq!(s.http.get(format!("{}/approve/../../x", s.base)).send().await.unwrap().status(), 404);
 }
 
@@ -250,7 +277,7 @@ async fn assert_dual_listener(s: &Server, host: Ipv4Addr, local: &str) {
     let r = s.http.post(&s.url).bearer_auth(&s.token).header("host", format!("127.0.0.1:{port}")).json(&ping).send().await.unwrap();
     assert_eq!(r.status(), 403);
 
-    // A ticket asked for over loopback still links to the bind address, so a phone can approve it.
+    // Agents get no approval link, whichever listener they use.
     let out: Value = s
         .http
         .post(local)
@@ -262,8 +289,8 @@ async fn assert_dual_listener(s: &Server, host: Ipv4Addr, local: &str) {
         .json()
         .await
         .unwrap();
-    let approval_url = out["result"]["structuredContent"]["approvalUrl"].as_str().unwrap_or_default();
-    assert!(approval_url.starts_with(&format!("http://{host}:{port}/approve/")), "{out}");
+    assert_eq!(out["result"]["structuredContent"]["status"], "pending_approval", "{out}");
+    assert!(out["result"]["structuredContent"].get("approvalUrl").is_none());
 }
 
 /// Runs everywhere: 127.0.0.2 is not 127.0.0.1, so it gets the same companion listener as a LAN bind.
@@ -305,6 +332,11 @@ async fn lan_bind_from_settings_also_serves_loopback() {
     let s = server_on(Some(lan.to_string())).await;
     let local = s.f.engine.mcp_status().await.local_url.expect("companion listener");
     assert_dual_listener(&s, lan, &local).await;
+
+    // The device page link uses the bind address, so a phone can open it.
+    let pending = s.call("demo__fix", json!({ "note": "phone" })).await["structuredContent"].clone();
+    let (url, _) = s.device_code(pending["ticketId"].as_str().unwrap()).await;
+    assert!(url.starts_with(&format!("http://{lan}:")), "{url}");
 
     s.f.engine.lock().await;
     for url in [s.url.as_str(), local.as_str()] {
@@ -352,7 +384,7 @@ async fn plans_are_proposed_over_mcp_and_approved_with_their_fingerprint() {
     assert!(pending["message"].as_str().unwrap().contains(&short), "the agent is told the fingerprint to share");
     assert_eq!(pending["steps"][0]["commands"], json!(["fix.exe a"]));
     let id = pending["ticketId"].as_str().unwrap().to_owned();
-    let url = pending["approvalUrl"].as_str().unwrap().to_owned();
+    let (url, code) = s.device_code(&id).await;
 
     let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
     assert!(html.contains("Supplied by the requesting agent"));
@@ -372,17 +404,17 @@ async fn plans_are_proposed_over_mcp_and_approved_with_their_fingerprint() {
             .body(url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish())
     };
     let stale = "0".repeat(64);
-    for pairs in [vec![("csrf", csrf.as_str()), ("pin", PIN), ("decision", "approve")], vec![("csrf", &csrf), ("pin", PIN), ("decision", "approve"), ("plan_hash", &stale)]] {
+    for pairs in [vec![("csrf", csrf.as_str()), ("code", &code), ("decision", "approve")], vec![("csrf", &csrf), ("code", &code), ("decision", "approve"), ("plan_hash", &stale)]] {
         let r = post(pairs).send().await.unwrap();
         assert_eq!(r.status(), 409);
-        assert!(r.text().await.unwrap().contains("3 attempt(s) left"), "a stale page costs no PIN attempt");
+        assert!(r.text().await.unwrap().contains("3 attempt(s) left"), "a stale page costs no attempt");
     }
-    let approved = post(vec![("csrf", &csrf), ("pin", PIN), ("decision", "approve"), ("plan_hash", &hash)]).send().await.unwrap();
+    let approved = post(vec![("csrf", &csrf), ("code", &code), ("decision", "approve"), ("plan_hash", &hash)]).send().await.unwrap();
     assert_eq!(approved.status(), 200);
     let done = poll_until_final(&s, &id).await;
     assert_eq!(done["status"], "approved", "{done}");
     assert_eq!(step_statuses(&done), ["succeeded", "succeeded"]);
-    assert_eq!(done["decidedVia"], "browser");
+    assert_eq!(done["decidedVia"], "device code");
     assert_eq!(*s.f.plugin.fixed.lock().unwrap(), ["a", "b"]);
 }
 
@@ -398,7 +430,8 @@ async fn plans_can_be_cancelled_over_mcp_and_stopped_from_the_page() {
     assert_eq!(step_statuses(&withdrawn), ["cancelled"]);
 
     let pending = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "wait-a" } }, { "tool": "demo__fix", "args": { "note": "b" } }] })).await["structuredContent"].clone();
-    let (id, url, hash) = (pending["ticketId"].as_str().unwrap().to_owned(), pending["approvalUrl"].as_str().unwrap().to_owned(), pending["plan"]["hash"].as_str().unwrap().to_owned());
+    let (id, hash) = (pending["ticketId"].as_str().unwrap().to_owned(), pending["plan"]["hash"].as_str().unwrap().to_owned());
+    let (url, code) = s.device_code(&id).await;
     let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
     let post = |pairs: Vec<(&str, &str)>| {
         s.http
@@ -407,7 +440,7 @@ async fn plans_can_be_cancelled_over_mcp_and_stopped_from_the_page() {
             .header("content-type", "application/x-www-form-urlencoded")
             .body(url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish())
     };
-    let approved = post(vec![("csrf", &csrf), ("pin", PIN), ("decision", "approve"), ("plan_hash", &hash)]).send().await.unwrap();
+    let approved = post(vec![("csrf", &csrf), ("code", &code), ("decision", "approve"), ("plan_hash", &hash)]).send().await.unwrap();
     assert!(approved.text().await.unwrap().contains("Stop after this step"), "the running plan offers a stop button");
     for _ in 0..250 {
         if !s.f.plugin.started.lock().unwrap().is_empty() {
@@ -427,4 +460,54 @@ async fn plans_can_be_cancelled_over_mcp_and_stopped_from_the_page() {
     assert_eq!(done["status"], "cancelled", "{done}");
     assert_eq!(step_statuses(&done), ["succeeded", "cancelled"]);
     assert_eq!(*s.f.plugin.fixed.lock().unwrap(), ["wait-a"]);
+}
+
+#[tokio::test]
+async fn declining_on_the_device_page_needs_no_code() {
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "no" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (url, _) = s.device_code(&id).await;
+    let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "decline")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let done = s.call("aegis__check_ticket", json!({ "ticketId": id })).await["structuredContent"].clone();
+    assert_eq!((done["status"].as_str(), done["decidedVia"].as_str()), (Some("declined"), Some("device code")));
+}
+
+#[tokio::test]
+async fn wrong_codes_turn_device_approval_off_and_locking_resets_it() {
+    use aegis_core::engine::DEVICE_MISSES_PER_HOUR;
+    let s = server().await;
+    s.f.engine.set_device_approval(true, Some(PIN.into())).await.unwrap();
+    let mut misses = 0;
+    while misses < DEVICE_MISSES_PER_HOUR {
+        let pending = s.call("demo__fix", json!({ "note": "guess" })).await["structuredContent"].clone();
+        let id = pending["ticketId"].as_str().unwrap().to_owned();
+        let code = s.f.engine.device_code(&id).await.unwrap().code;
+        let wrong = if code == "ZZZZ-ZZZZ" { "YYYY-YYYY" } else { "ZZZZ-ZZZZ" };
+        for _ in 0..3 {
+            if misses == DEVICE_MISSES_PER_HOUR {
+                break;
+            }
+            let err = s.f.engine.decide_on_device(&id, true, wrong, None, None).unwrap_err();
+            assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid);
+            misses += 1;
+        }
+    }
+    assert!(!s.f.engine.device_approval_on(), "too many wrong codes turn it off");
+    let mcp = s.f.engine.settings().await.unwrap().mcp;
+    assert!(!mcp.device_approval && mcp.device_approval_notice.unwrap().contains("wrong codes"));
+    // Wrong codes never count toward the vault's PIN guard.
+    assert!(s.f.engine.check_pin(PIN).await.is_ok());
+
+    // Turning it off needs no PIN; turning it on clears the notice.
+    s.f.engine.set_device_approval(true, Some(PIN.into())).await.unwrap();
+    assert!(s.f.engine.settings().await.unwrap().mcp.device_approval_notice.is_none());
+    s.f.engine.set_device_approval(false, None).await.unwrap();
+    s.f.engine.set_device_approval(true, Some(PIN.into())).await.unwrap();
+    s.f.engine.lock().await;
+    s.f.engine.unlock(PIN.into()).await.unwrap();
+    assert!(!s.f.engine.device_approval_on(), "locking turns it off");
 }

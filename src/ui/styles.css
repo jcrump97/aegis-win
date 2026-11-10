@@ -181,3 +181,5 @@ dialog::backdrop { background: rgba(3, 6, 12, 0.7); }
 .chat-log:empty { display: none; }
 .chat-line { white-space: pre-wrap; }
 button.chip { padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.88rem; }
+.device-code-value code { font-size: 1.6rem; letter-spacing: 0.15em; }
+.device-code svg { flex: none; border-radius: 6px; }

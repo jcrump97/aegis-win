@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::error::AegisError;
 use crate::plan::PlanOrigin;
@@ -15,6 +17,10 @@ pub const TICKET_TTL: Duration = Duration::from_secs(30 * 60);
 /// Plans wait for a decision for less time than single requests (ADR 0003 §3).
 pub const PLAN_TTL: Duration = Duration::from_secs(10 * 60);
 pub const STRIKES_PER_TICKET: u8 = 3;
+/// A device code works for 5 minutes, and never past its ticket (ADR 0004 §1.2).
+pub const DEVICE_CODE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Crockford base32: no `I`, `L`, `O` or `U`.
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MAX_TICKETS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,6 +131,50 @@ pub struct Ticket {
     pub steps: Vec<PlanStep>,
     /// A running plan stops before its next step.
     pub cancel_requested: bool,
+    /// The one-time code for approving on another device, while one is shown.
+    pub device_code: Option<DeviceCode>,
+}
+
+/// Only the code's hash is kept; the code itself is shown once, in the app.
+#[derive(Debug, Clone)]
+pub struct DeviceCode {
+    hash: [u8; 32],
+    pub expires: Instant,
+}
+
+impl DeviceCode {
+    /// A fresh 40-bit code for a ticket, shown as `K7QM-4XRT`, valid until
+    /// `expires`.
+    pub fn generate(expires: Instant) -> (String, Self) {
+        let mut bytes = [0u8; 5];
+        getrandom::fill(&mut bytes).expect("the OS random number generator is unavailable");
+        let bits = bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+        let code: String = (0..8).rev().map(|i| char::from(CROCKFORD[((bits >> (i * 5)) & 31) as usize])).collect();
+        let hash = Sha256::digest(code.as_bytes()).into();
+        (format!("{}-{}", &code[..4], &code[4..]), Self { hash, expires })
+    }
+
+    /// Whether `input` is this code, still valid at `now`. Ignores case,
+    /// spaces and dashes, and reads `I`/`L` as `1` and `O` as `0`.
+    pub fn matches(&self, input: &str, now: Instant) -> bool {
+        let Some(code) = normalize_code(input) else { return false };
+        let hash: [u8; 32] = Sha256::digest(code.as_bytes()).into();
+        now < self.expires && bool::from(hash.ct_eq(&self.hash))
+    }
+}
+
+/// The canonical form of a typed code, or `None` when it cannot be one.
+pub fn normalize_code(input: &str) -> Option<String> {
+    let code: String = input
+        .chars()
+        .filter(|c| !matches!(c, '-' | ' ' | '\t'))
+        .map(|c| match c.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            c => c,
+        })
+        .collect();
+    (code.len() == 8 && code.bytes().all(|b| CROCKFORD.contains(&b))).then_some(code)
 }
 
 /// What agents and the UI may see about a ticket (never the CSRF token).
@@ -245,18 +295,30 @@ impl TicketStore {
             plan,
             steps: t.steps,
             cancel_requested: false,
+            device_code: None,
         };
         let view = ticket.view();
         self.tickets.insert(ticket.id.clone(), ticket);
         view
     }
 
-    /// Marks pending tickets older than the TTL as expired.
+    /// Marks pending tickets older than the TTL as expired. A ticket that is
+    /// no longer pending keeps no device code.
     pub fn expire(&mut self, now: Instant) {
         for t in self.tickets.values_mut() {
             if t.status == TicketStatus::PendingApproval && now.duration_since(t.created) >= t.ttl {
                 t.status = TicketStatus::Expired;
             }
+            if t.status != TicketStatus::PendingApproval {
+                t.device_code = None;
+            }
+        }
+    }
+
+    /// Forgets every device code (the setting was turned off).
+    pub fn clear_device_codes(&mut self) {
+        for t in self.tickets.values_mut() {
+            t.device_code = None;
         }
     }
 
@@ -317,6 +379,36 @@ mod tests {
         assert_eq!(csrf.len(), 32);
         assert!(!serde_json::to_string(&view).unwrap().contains(&csrf));
         assert_eq!(view.attempts_remaining, STRIKES_PER_TICKET);
+    }
+
+    #[test]
+    fn device_codes_are_crockford_single_form_and_expire() {
+        let now = Instant::now();
+        let (shown, code) = DeviceCode::generate(now + DEVICE_CODE_TTL);
+        assert_eq!(shown.len(), 9);
+        assert_eq!(shown.as_bytes()[4], b'-');
+        assert!(shown.bytes().filter(|&b| b != b'-').all(|b| CROCKFORD.contains(&b)), "{shown}");
+        assert!(code.matches(&shown, now));
+        assert!(code.matches(&shown.to_lowercase().replace('-', " "), now), "case and separators are ignored");
+        assert!(!code.matches(&shown, now + DEVICE_CODE_TTL), "expired");
+        assert!(!code.matches("0000-0000", now) || shown == "0000-0000");
+        assert_eq!(normalize_code("k7qm-4xrt").as_deref(), Some("K7QM4XRT"));
+        assert_eq!(normalize_code("IL0O-abcd").as_deref(), Some("1100ABCD"), "I and L read as 1, O as 0");
+        assert_eq!(normalize_code("U000-0000"), None, "U is not in the alphabet");
+        assert_eq!(normalize_code("123"), None);
+        // Codes differ from one another.
+        let (other, _) = DeviceCode::generate(now);
+        assert_ne!(shown, other);
+    }
+
+    #[test]
+    fn a_decided_ticket_keeps_no_device_code() {
+        let mut store = TicketStore::default();
+        let now = Instant::now();
+        let id = store.create(new_ticket(), now).ticket_id;
+        store.get_mut(&id, now).unwrap().device_code = Some(DeviceCode::generate(now + DEVICE_CODE_TTL).1);
+        store.get_mut(&id, now).unwrap().status = TicketStatus::Declined;
+        assert!(store.get(&id, now).unwrap().device_code.is_none());
     }
 
     #[test]

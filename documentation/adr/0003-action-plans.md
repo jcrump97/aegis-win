@@ -144,9 +144,9 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 ## 6. MCP and in-app parity
 
 - **One engine entry point** creates every plan, recording its origin (MCP or in-app). Both paths share validation, limits, dry runs, hashing, review, and execution.
-- **MCP**: `aegis__propose_plan` returns `{ status: "pending_approval", ticketId, approvalUrl, planHash, expiresAt }`. Agents never receive the CSRF token.
+- **MCP**: `aegis__propose_plan` returns `{ status: "pending_approval", ticketId, planHash, expiresAt }`. Agents never receive the CSRF token. (Amended by ADR 0004 §1.1: no `approvalUrl`.)
 - **In-app**: an **Add to plan** button next to Run on each eligible tool, then **Review and run**. The PIN is entered on the review screen. In v1 the built-in LLM does not propose plans; only MCP agents and the owner do.
-- **Browser page** (`/approve/{ticketId}`): server-rendered with no script, as today. It shows the full plan, every step and argument, the dry-run commands, the labelled supplied text, and the short hash. **It always requires the PIN.** Five steps fit on one page.
+- **Device page** (`/approve/{ticketId}`): server-rendered with no script, as today. It shows the full plan, every step and argument, the dry-run commands, the labelled supplied text, and the short hash. **It never asks for the PIN.** Amended by ADR 0004 §1: the page exists only while the owner has turned on Approve from another device, and approving there needs the one-time code the app showed for this plan, plus the full plan hash. Five steps fit on one page.
 - **No "approve all".** Each plan is approved on its own.
 - **Single-tool tickets become one-step plans inside the engine.** Their MCP responses, 30-minute expiry, and browser page stay as they are; they skip the plan-only checks (eligibility, dry-run preview, pending-plan limit).
 

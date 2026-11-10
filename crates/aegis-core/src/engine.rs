@@ -2,7 +2,7 @@
 //! tickets and the MCP server. Tauri commands and the MCP server both call
 //! into it, so every gate is enforced in exactly one place.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +72,28 @@ pub struct Engine {
     resume_notices: Mutex<BTreeMap<String, ResumeNotice>>,
     /// Monitoring paused from the tray (no PIN).
     paused: AtomicBool,
+    /// "Approve from another device" (ADR 0004 §1.2). Memory only: off at
+    /// every start and every lock, so it never turns on by itself.
+    device_approval: AtomicBool,
+    /// Wrong device codes in the last hour, across all tickets.
+    device_misses: Mutex<VecDeque<Instant>>,
+    /// Device approval was turned off by too many wrong codes.
+    device_tripped: AtomicBool,
+}
+
+/// Wrong device codes allowed in an hour before device approval turns off.
+pub const DEVICE_MISSES_PER_HOUR: usize = 10;
+
+/// A device code as the app shows it, once.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCodeView {
+    /// `K7QM-4XRT`.
+    pub code: String,
+    pub expires_at: String,
+    /// The device page; also drawn as `qr`.
+    pub url: String,
+    pub qr: crate::qr::QrView,
 }
 
 /// Where a tool call came from. Only the desktop UI can pass a PIN inline;
@@ -134,6 +156,10 @@ pub struct McpSettingsView {
     pub host: String,
     pub port: u16,
     pub open_firewall: bool,
+    /// Approve from another device, with a one-time code (memory only).
+    pub device_approval: bool,
+    /// Why device approval was turned off, when too many wrong codes did it.
+    pub device_approval_notice: Option<String>,
     pub status: McpStatus,
     /// This PC's private LAN address, offered as the alternative to loopback.
     pub suggested_lan_host: Option<String>,
@@ -284,6 +310,9 @@ impl Engine {
             locked_work: Mutex::new(BTreeSet::new()),
             resume_notices: Mutex::new(BTreeMap::new()),
             paused: AtomicBool::new(false),
+            device_approval: AtomicBool::new(false),
+            device_misses: Mutex::new(VecDeque::new()),
+            device_tripped: AtomicBool::new(false),
             data_dir,
             registry,
             vault: Mutex::new(None),
@@ -647,6 +676,8 @@ impl Engine {
         self.history.close_all();
         lock(&self.tickets).clear();
         lock(&self.resume_notices).clear();
+        self.device_approval.store(false, Ordering::SeqCst);
+        lock(&self.device_misses).clear();
         self.status()
     }
 
@@ -667,7 +698,7 @@ impl Engine {
         let ok = tokio::task::spawn_blocking(move || verifier.verify(&pin)).await.map_err(internal)?;
         lock(&self.guard).record(ok, Instant::now());
         if ok {
-            // A correct PIN, in the app or on the approval page, is the owner.
+            // A correct PIN is the owner: only the app asks for it.
             self.note_activity();
             Ok(())
         } else {
@@ -714,6 +745,10 @@ impl Engine {
                     host: s.mcp.host.clone(),
                     port: s.mcp.port,
                     open_firewall: s.mcp.open_firewall,
+                    device_approval: self.device_approval.load(Ordering::SeqCst),
+                    device_approval_notice: self.device_tripped.load(Ordering::SeqCst).then(|| {
+                        format!("{DEVICE_MISSES_PER_HOUR} wrong codes were typed on the device page within an hour, so Approve from another device was turned off. Turn it on again only if you typed them.")
+                    }),
                     status,
                     suggested_lan_host: crate::os::primary_lan_ipv4().map(|ip| ip.to_string()),
                 },
@@ -1516,9 +1551,10 @@ impl Engine {
         lock(&self.tickets).get(id, Instant::now()).map(|t| t.csrf.clone())
     }
 
-    /// Approves or declines a pending ticket. Both need the PIN, so an agent
-    /// cannot decline-spam or probe PINs. Three wrong PINs lock the ticket;
-    /// every wrong PIN also counts toward the global guard.
+    /// Approves or declines a pending ticket in the app. Both need the PIN.
+    /// Three wrong PINs lock the ticket; every wrong PIN also counts toward
+    /// the global guard. Agents never reach this: the PIN is only typed in
+    /// the app (ADR 0004 §1.1).
     pub async fn decide_ticket(
         &self,
         id: &str,
@@ -1543,48 +1579,112 @@ impl Engine {
     ) -> AegisResult<TicketView> {
         let pin = Zeroizing::new(pin);
         let epoch = self.executor.epoch();
-        self.pending_ticket(id)?;
-        // Checked before the PIN, so a stale page does not cost an attempt.
-        if approve {
-            let expected = lock(&self.tickets).get(id, Instant::now()).and_then(|t| t.plan.as_ref().map(|p| p.hash.clone()));
-            if let Some(expected) = expected {
-                let matches = plan_hash.is_some_and(|h| bool::from(h.as_bytes().ct_eq(expected.as_bytes())));
-                if !matches {
-                    return Err(AegisError::new(ErrorCode::Conflict, "This approval does not match the plan's fingerprint. Reload the request and check its steps again."));
-                }
-            }
-        }
-        // A full queue is refused before the PIN is checked; the request stays pending.
-        if approve && self.ticket_changes_system(id) && !self.executor.has_room() {
-            return Err(queue_error(executor::Full::Full));
-        }
+        self.before_decision(id, approve, plan_hash)?;
         let verified = {
             let _serial = self.pin_check.lock().await;
             self.pending_ticket(id)?;
             self.verify_pin_serialized(&pin).await
         };
+        match verified {
+            Ok(()) => {}
+            Err(e) if e.code == ErrorCode::PinInvalid => {
+                return Err(self.strike(id, via, |left| match left {
+                    0 => AegisError::new(ErrorCode::PinLockedOut, "Too many wrong PINs for this request, so it was locked. The agent has to ask again."),
+                    left => AegisError::new(ErrorCode::PinInvalid, format!("Incorrect PIN. {left} attempt(s) left for this request.")),
+                }));
+            }
+            Err(e) => return Err(e),
+        }
+        self.apply_decision(epoch, id, approve, comment, via)
+    }
+
+    /// Approves or declines from the device page (ADR 0004 §1.2). Approving
+    /// needs the one-time code the app showed for this ticket; declining needs
+    /// nothing. Wrong codes count per ticket and toward an hourly limit that
+    /// turns the feature off, never toward the vault PIN guard.
+    pub fn decide_on_device(&self, id: &str, approve: bool, code: &str, comment: Option<String>, plan_hash: Option<&str>) -> AegisResult<TicketView> {
+        const VIA: &str = "device code";
+        if !self.device_approval_on() {
+            return Err(ticket_not_found());
+        }
+        let epoch = self.executor.epoch();
+        self.before_decision(id, approve, plan_hash)?;
+        if approve && crate::tickets::normalize_code(code).is_none() {
+            // Not a code at all (empty or mistyped length): costs no attempt.
+            return Err(AegisError::new(ErrorCode::CodeInvalid, "Type the 8-character code shown in the AegisWin app, like K7QM-4XRT."));
+        }
+        if approve {
+            let now = Instant::now();
+            let mut store = lock(&self.tickets);
+            let ticket = store.get_mut(id, now).ok_or_else(ticket_not_found)?;
+            if ticket.status != TicketStatus::PendingApproval {
+                return Err(ticket_conflict(ticket.status));
+            }
+            if ticket.device_code.as_ref().is_some_and(|c| c.matches(code, now)) {
+                // Single use.
+                ticket.device_code = None;
+            } else {
+                drop(store);
+                self.device_miss(now);
+                return Err(self.strike(id, VIA, |left| match left {
+                    0 => AegisError::new(ErrorCode::CodeInvalid, "Too many wrong codes for this request, so it was locked. The agent has to ask again."),
+                    left => AegisError::new(
+                        ErrorCode::CodeInvalid,
+                        format!("Wrong or expired code. {left} attempt(s) left for this request. In the AegisWin app, click Approve on another device on this request for a new code."),
+                    ),
+                }));
+            }
+        }
+        self.apply_decision(epoch, id, approve, comment, VIA)
+    }
+
+    /// Checked before any PIN or code, so a stale page costs no attempt.
+    fn before_decision(&self, id: &str, approve: bool, plan_hash: Option<&str>) -> AegisResult<()> {
+        self.pending_ticket(id)?;
+        if !approve {
+            return Ok(());
+        }
+        let expected = lock(&self.tickets).get(id, Instant::now()).and_then(|t| t.plan.as_ref().map(|p| p.hash.clone()));
+        if let Some(expected) = expected {
+            let matches = plan_hash.is_some_and(|h| bool::from(h.as_bytes().ct_eq(expected.as_bytes())));
+            if !matches {
+                return Err(AegisError::new(ErrorCode::Conflict, "This approval does not match the plan's fingerprint. Reload the request and check its steps again."));
+            }
+        }
+        // A full queue is refused first; the request stays pending.
+        if self.ticket_changes_system(id) && !self.executor.has_room() {
+            return Err(queue_error(executor::Full::Full));
+        }
+        Ok(())
+    }
+
+    /// Counts a wrong PIN or code against a ticket; the third locks it.
+    /// `error` gets the attempts left.
+    fn strike(&self, id: &str, via: &'static str, error: impl Fn(u8) -> AegisError) -> AegisError {
+        let mut store = lock(&self.tickets);
+        let Some(ticket) = store.get_mut(id, Instant::now()) else { return ticket_not_found() };
+        if ticket.status != TicketStatus::PendingApproval {
+            return ticket_conflict(ticket.status);
+        }
+        ticket.strikes += 1;
+        let left = STRIKES_PER_TICKET.saturating_sub(ticket.strikes);
+        if left == 0 {
+            ticket.status = TicketStatus::LockedOut;
+            ticket.decided_via = Some(via);
+            drop(store);
+            self.record_decided(id, false, via, None, true);
+        }
+        error(left)
+    }
+
+    /// The decision itself, once the PIN or code checked out.
+    fn apply_decision(&self, epoch: u64, id: &str, approve: bool, comment: Option<String>, via: &'static str) -> AegisResult<TicketView> {
+        let comment = comment.map(|c| c.trim().chars().take(MAX_COMMENT_CHARS).collect::<String>()).filter(|c| !c.is_empty());
         let mut store = lock(&self.tickets);
         let ticket = store.get_mut(id, Instant::now()).ok_or_else(ticket_not_found)?;
         if ticket.status != TicketStatus::PendingApproval {
             return Err(ticket_conflict(ticket.status));
         }
-        match verified {
-            Ok(()) => {}
-            Err(e) if e.code == ErrorCode::PinInvalid => {
-                ticket.strikes += 1;
-                let left = STRIKES_PER_TICKET.saturating_sub(ticket.strikes);
-                if left == 0 {
-                    ticket.status = TicketStatus::LockedOut;
-                    ticket.decided_via = Some(via);
-                    drop(store);
-                    self.record_decided(id, false, via, None, true);
-                    return Err(AegisError::new(ErrorCode::PinLockedOut, "Too many wrong PINs for this request, so it was locked. The agent has to ask again."));
-                }
-                return Err(AegisError::new(ErrorCode::PinInvalid, format!("Incorrect PIN. {left} attempt(s) left for this request.")));
-            }
-            Err(e) => return Err(e),
-        }
-        let comment = comment.map(|c| c.trim().chars().take(MAX_COMMENT_CHARS).collect::<String>()).filter(|c| !c.is_empty());
         if !approve {
             ticket.comment = comment.clone();
             ticket.decided_via = Some(via);
@@ -1982,6 +2082,71 @@ impl Engine {
             return Err(ticket_conflict(ticket.status));
         }
         Ok(())
+    }
+
+    // ---- approve from another device (ADR 0004 §1.2) ---------------------
+
+    pub fn device_approval_on(&self) -> bool {
+        self.device_approval.load(Ordering::SeqCst)
+    }
+
+    /// Turning device approval on needs the PIN, in the app; turning it off
+    /// does not, and forgets every code.
+    pub async fn set_device_approval(&self, on: bool, pin: Option<String>) -> AegisResult<()> {
+        if on {
+            let pin = Zeroizing::new(pin.unwrap_or_default());
+            self.check_pin(&pin).await?;
+            lock(&self.device_misses).clear();
+            self.device_tripped.store(false, Ordering::SeqCst);
+            self.device_approval.store(true, Ordering::SeqCst);
+        } else {
+            self.device_approval.store(false, Ordering::SeqCst);
+            lock(&self.tickets).clear_device_codes();
+        }
+        Ok(())
+    }
+
+    /// Makes a new one-time code for a pending ticket, replacing any earlier
+    /// one. App only: the code is shown once and only its hash is kept.
+    pub async fn device_code(&self, id: &str) -> AegisResult<DeviceCodeView> {
+        if !self.device_approval_on() {
+            return Err(AegisError::invalid("Turn on Approve from another device in the MCP server tab first."));
+        }
+        let url = self
+            .mcp_status()
+            .await
+            .url
+            .and_then(|u| u.strip_suffix("/mcp").map(|base| format!("{base}/approve/{id}")))
+            .ok_or_else(|| AegisError::invalid("The MCP server is not running, so there is no device page."))?;
+        let now = Instant::now();
+        let mut store = lock(&self.tickets);
+        let ticket = store.get_mut(id, now).ok_or_else(ticket_not_found)?;
+        if ticket.status != TicketStatus::PendingApproval {
+            return Err(ticket_conflict(ticket.status));
+        }
+        let expires = (now + crate::tickets::DEVICE_CODE_TTL).min(ticket.created + ticket.ttl);
+        let (code, device_code) = crate::tickets::DeviceCode::generate(expires);
+        ticket.device_code = Some(device_code);
+        drop(store);
+        let expires_at = chrono::Utc::now() + chrono::Duration::from_std(expires.saturating_duration_since(now)).unwrap_or_default();
+        let qr = crate::qr::encode(&url).ok_or_else(|| AegisError::failed("The QR code could not be drawn."))?;
+        Ok(DeviceCodeView { code, expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), url, qr })
+    }
+
+    /// Notes a wrong device code. Too many in an hour turn the feature off.
+    fn device_miss(&self, now: Instant) {
+        let mut misses = lock(&self.device_misses);
+        while misses.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(3600)) {
+            misses.pop_front();
+        }
+        misses.push_back(now);
+        if misses.len() >= DEVICE_MISSES_PER_HOUR {
+            misses.clear();
+            drop(misses);
+            self.device_approval.store(false, Ordering::SeqCst);
+            self.device_tripped.store(true, Ordering::SeqCst);
+            lock(&self.tickets).clear_device_codes();
+        }
     }
 
     // ---- MCP server ------------------------------------------------------

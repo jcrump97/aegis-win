@@ -24,6 +24,8 @@ pub enum ErrorCode {
     PinInvalid,
     PinLockedOut,
     PinTooWeak,
+    /// A wrong or expired one-time device code (ADR 0004 §1.2).
+    CodeInvalid,
     NotFound,
     Conflict,
     Internal,

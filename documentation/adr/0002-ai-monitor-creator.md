@@ -188,7 +188,7 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
 
 - **Timeout:** default 15 minutes. Options: 5, 15, 30, or 60 minutes. There is no "off".
 - **What counts as idle:** no interaction with the AegisWin window or the approval portal. **MCP agent activity does not keep the vault unlocked.**
-  - As built: clicks and key presses in the app window (reported at most every 30 seconds through `note_activity`), and any correct PIN, in the app or on the approval page. Loading the approval page does not count, because an agent holding the link can load it too. Unlocking counts.
+  - As built: clicks and key presses in the app window (reported at most every 30 seconds through `note_activity`), and any correct PIN in the app (since ADR 0004, no web page takes the PIN). Loading or using the device page does not count. Unlocking counts.
   - The check runs every 5 seconds. Changing the timeout needs no PIN; it is a UI-only setting and only shortens or lengthens an already bounded wait.
 - **Running tools:** when auto-lock is due, no new queued item or plan step starts. Auto-lock waits for the running step only, then cancels everything queued ([ADR 0003 §5.1](0003-action-plans.md)). Pending, undecided tickets are cleared by the lock, as today.
 

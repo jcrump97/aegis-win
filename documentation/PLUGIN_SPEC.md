@@ -56,7 +56,7 @@ A tool that declares a boolean `dryRun` property MUST make `dryRun: true` side-e
 
 ## 3. Tool Gate Policy Values
 - `"auto"`: Executes immediately when invoked from the UI or MCP server (ideal for read-only log queries or telemetry snapshots).
-- `"pin_required"`: Requires explicit human approval via the local `/approve/<ticket-id>` PIN-gated web page when called over MCP (or PIN confirmation modal in the UI). Users can change every tool's gate policy on the app's MCP server tab; loosening a gate to `auto` needs the PIN.
+- `"pin_required"`: Requires explicit human approval with the PIN on the app's Approvals tab when called over MCP (or the PIN confirmation modal for in-app runs). With the opt-in **Approve from another device**, a one-time code shown in the app can approve it on the device page instead. Users can change every tool's gate policy on the app's MCP server tab; loosening a gate to `auto` needs the PIN.
 - **Describing a gated call.** When raw arguments are hard to judge (for example a monitor rule as JSON), the plugin implements `Plugin::review_call`, which returns a `CallReview` of plain sentences and warnings written by its own code from the validated arguments. The engine stores it on the approval ticket, and the browser page and the app show it, escaped, above the raw arguments. It must never repeat AI- or agent-supplied reasoning as if it were a description; names the agent chose are quoted.
 
 ## 4. Talking to Windows
