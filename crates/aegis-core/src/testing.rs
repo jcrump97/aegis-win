@@ -45,6 +45,18 @@ pub async fn mock_ollama(answers: &[&str], context_length: u64) -> (String, Join
     serve_as(Some(show), replies).await
 }
 
+/// Like [`mock_ollama`], with `show` as the `/api/show` answer and each body
+/// sent as is (a whole NDJSON stream, say).
+pub async fn mock_ollama_raw(show: serde_json::Value, bodies: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+    serve_as(Some(show.to_string()), bodies.into_iter().map(|b| ("200 OK", b)).collect()).await
+}
+
+/// Answers successive requests with `bodies` (status 200), as a server that
+/// is not Ollama.
+pub async fn mock_http_replies(bodies: Vec<String>) -> (String, JoinHandle<Vec<String>>) {
+    serve_as(None, bodies.into_iter().map(|b| ("200 OK", b)).collect()).await
+}
+
 /// Serves `responses` in order. `GET /api/version` (the Ollama check) and
 /// `POST /api/show` are answered on the side without using a response: with
 /// 404 normally, or as Ollama when `ollama_show` is set.
@@ -121,8 +133,8 @@ pub async fn mock_stream(ollama: bool, pieces: Vec<(std::time::Duration, String)
         loop {
             let (mut sock, _) = listener.accept().await.unwrap();
             let request = read_request(&mut sock).await;
-            if request.starts_with("GET /api/version ") {
-                let (status, body) = if ollama { ("200 OK", r#"{"version":"0.12.0"}"#) } else { ("404 Not Found", "404 page not found") };
+            if request.starts_with("GET /api/version ") || request.starts_with("POST /api/show ") {
+                let (status, body) = if ollama && request.starts_with("GET") { ("200 OK", r#"{"version":"0.12.0"}"#) } else { ("404 Not Found", "404 page not found") };
                 let resp = format!("HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
                 sock.write_all(resp.as_bytes()).await.unwrap();
                 continue;

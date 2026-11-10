@@ -40,6 +40,12 @@ const IDLE_LIMIT: Duration = Duration::from_secs(60);
 const ANSWER_LIMIT: Duration = Duration::from_secs(600);
 /// A streamed answer larger than this is not an answer.
 const MAX_STREAM_BYTES: usize = 4 << 20;
+/// The most a first reply may use; it is also at most a quarter of the
+/// context window. Thinking models write their reasoning out of this too.
+const REPLY_CEILING: u64 = 8192;
+/// Added to the system prompt when an answer was cut off and AegisWin asks again.
+const ANSWER_ONLY_JSON: &str = "Answer with the JSON object only. No explanation, no reasoning, nothing before or after it.";
+const ANSWER_ONLY_TEXT: &str = "Answer directly and briefly. Do not explain your reasoning.";
 
 fn default_first_token_secs() -> u32 {
     DEFAULT_FIRST_TOKEN_SECS
@@ -324,49 +330,37 @@ impl LlmHandle {
         };
         let user = self.fit(system_prompt, user, options)?;
         let ollama = match ollama_root(&self.config.base_url).filter(|_| endpoint.is_lan) {
-            Some(root) if is_ollama(&self.client, &root).await => Some(root),
+            Some(root) if is_ollama(&self.client, &root).await => {
+                let think = ollama_think_off(&self.client, &root, &self.config.model).await;
+                Some(Ollama { root, think })
+            }
             _ => None,
         };
-        let messages = json!([
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user },
-        ]);
-        let reply = match &ollama {
-            // Ollama's OpenAI endpoint ignores the context size, so a long
-            // prompt would be cut silently. Its own API takes it.
-            Some(root) => {
-                let mut body = json!({
-                    "model": self.config.model,
-                    "stream": true,
-                    "messages": messages,
-                    "options": { "temperature": 0.2, "num_ctx": self.config.context_tokens, "num_predict": options.max_tokens },
-                });
-                if options.json {
-                    body["format"] = json!("json");
-                }
-                self.stream(&endpoint, format!("{root}/api/chat"), &body, Wire::Ndjson, progress).await?
-            }
+        let budget = self.reply_budget(system_prompt, &user, options.max_tokens, false);
+        let reply = self.ask(&endpoint, ollama.as_ref(), system_prompt, &user, budget, options.json, progress).await?;
+        let (text, reply) = match answer_text(&reply, options.json) {
+            Some(text) => (text, reply),
+            // Cut off, most often while thinking: ask once more for the answer
+            // alone, with the room the window has left.
             None => {
-                let body = json!({
-                    "model": self.config.model,
-                    "temperature": 0.2,
-                    "max_tokens": options.max_tokens,
-                    "stream": true,
-                    "messages": messages,
-                });
-                self.stream(&endpoint, api_url(&self.config.base_url, "chat/completions"), &body, Wire::Sse, progress).await?
+                let strict = format!("{system_prompt}\n\n{}", if options.json { ANSWER_ONLY_JSON } else { ANSWER_ONLY_TEXT });
+                let bigger = self.reply_budget(&strict, &user, options.max_tokens, true).max(budget);
+                let again = self.ask(&endpoint, ollama.as_ref(), &strict, &user, bigger, options.json, progress).await?;
+                let thought = reply.thought || again.thought;
+                match answer_text(&again, options.json) {
+                    Some(text) => (text, again),
+                    None => {
+                        let why = if thought { ", most of it spent thinking" } else { "" };
+                        return Err(llm_failed(
+                            &endpoint,
+                            &format!(
+                                "the model's answer was cut off at its {bigger}-token reply limit{why}, even after AegisWin asked again for the answer alone. The reply limit grows with the context window: raise Context window on the LLM tab (up to what the model supports) and try again."
+                            ),
+                        ));
+                    }
+                }
             }
         };
-        let text = reply.text.ok_or_else(|| llm_failed(&endpoint, "the response has no answer text"))?;
-        let text = strip_thinking(&text).filter(|_| !reply.cut_off).ok_or_else(|| {
-            llm_failed(
-                &endpoint,
-                &format!(
-                    "the model's answer was cut off at its {}-token limit. Try a model that answers more briefly, or one without a long thinking phase.",
-                    options.max_tokens
-                ),
-            )
-        })?;
         // A prompt that filled the whole window was most likely cut at the
         // start, which is where the instructions are.
         if options.must_fit && reply.prompt_tokens.is_some_and(|n| n + 16 >= u64::from(self.config.context_tokens)) {
@@ -386,6 +380,59 @@ impl LlmHandle {
             scrubbed: off_lan,
             prompt_tokens: reply.prompt_tokens,
         })
+    }
+
+    /// Tokens the model may write: what the context window has left after the
+    /// prompt (with the 10% margin), at least `floor`, and at most a quarter
+    /// of the window or [`REPLY_CEILING`]. A retry may use up to half the
+    /// window. Thinking models spend part of it reasoning before they answer,
+    /// and OpenAI-style servers count that reasoning against `max_tokens` too.
+    fn reply_budget(&self, system_prompt: &str, user: &str, floor: u32, retry: bool) -> u32 {
+        let context = u64::from(self.config.context_tokens);
+        let left = (context * 9 / 10).saturating_sub(estimate_tokens(system_prompt) + estimate_tokens(user));
+        let ceiling = if retry { (context / 2).min(2 * REPLY_CEILING) } else { (context / 4).min(REPLY_CEILING) };
+        u32::try_from(left.min(ceiling).max(u64::from(floor))).unwrap_or(u32::MAX)
+    }
+
+    /// Sends one chat request and reads the reply.
+    #[allow(clippy::too_many_arguments)]
+    async fn ask(&self, endpoint: &Endpoint, ollama: Option<&Ollama>, system_prompt: &str, user: &str, max_tokens: u32, json: bool, progress: &LlmProgress) -> AegisResult<Reply> {
+        let messages = json!([
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user },
+        ]);
+        match ollama {
+            // Ollama's OpenAI endpoint ignores the context size, so a long
+            // prompt would be cut silently. Its own API takes it.
+            Some(o) => {
+                let mut body = json!({
+                    "model": self.config.model,
+                    "stream": true,
+                    "messages": messages,
+                    "options": { "temperature": 0.2, "num_ctx": self.config.context_tokens, "num_predict": max_tokens },
+                });
+                if json {
+                    body["format"] = json!("json");
+                }
+                if let Some(think) = &o.think {
+                    body["think"] = think.clone();
+                }
+                self.stream(endpoint, format!("{}/api/chat", o.root), &body, Wire::Ndjson, progress).await
+            }
+            // Not every OpenAI-style server accepts a reasoning setting (OpenAI
+            // rejects one for models that do not reason), so none is sent: the
+            // reply budget leaves room for reasoning instead.
+            None => {
+                let body = json!({
+                    "model": self.config.model,
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                    "stream": true,
+                    "messages": messages,
+                });
+                self.stream(endpoint, api_url(&self.config.base_url, "chat/completions"), &body, Wire::Sse, progress).await
+            }
+        }
     }
 
     /// Keeps the request inside the context window: the system prompt, the
@@ -485,6 +532,32 @@ struct Reply {
     text: Option<String>,
     cut_off: bool,
     prompt_tokens: Option<u64>,
+    /// The model sent thinking (a `thinking`/`reasoning` field or `<think>`).
+    thought: bool,
+}
+
+/// An Ollama server, and what to send as `think` for the model.
+struct Ollama {
+    root: String,
+    think: Option<Value>,
+}
+
+/// The answer to use from a reply, without any thinking. `None` when it was
+/// cut off, unless a complete JSON object was already there when JSON was
+/// asked for (the rest is dropped).
+fn answer_text(reply: &Reply, json: bool) -> Option<String> {
+    let text = strip_thinking(reply.text.as_deref()?)?;
+    if !reply.cut_off {
+        return Some(text);
+    }
+    if !json {
+        return None;
+    }
+    let mut values = serde_json::Deserializer::from_str(&text).into_iter::<Value>();
+    match values.next() {
+        Some(Ok(v)) if v.is_object() => Some(text[..values.byte_offset()].to_owned()),
+        _ => None,
+    }
 }
 
 /// How a server streams its answer.
@@ -508,6 +581,7 @@ struct StreamParser {
     text: String,
     /// The model has sent something: thinking or answer text.
     active: bool,
+    thought: bool,
     cut_off: bool,
     prompt_tokens: Option<u64>,
     done: bool,
@@ -523,6 +597,7 @@ impl StreamParser {
             saw_stream: false,
             text: String::new(),
             active: false,
+            thought: false,
             cut_off: false,
             prompt_tokens: None,
             done: false,
@@ -610,6 +685,9 @@ impl StreamParser {
         if piece.is_some_and(|p| !p.is_empty()) || thinking.is_some_and(|t| !t.is_empty()) {
             self.active = true;
         }
+        if thinking.is_some_and(|t| !t.is_empty()) {
+            self.thought = true;
+        }
         if finish == Some("length") {
             self.cut_off = true;
         }
@@ -627,13 +705,16 @@ impl StreamParser {
         if !self.saw_stream {
             // The server ignored `stream` and answered in one piece.
             let v: Value = serde_json::from_slice(&self.whole).unwrap_or(Value::Null);
+            let text = v.pointer("/choices/0/message/content").or_else(|| v.pointer("/message/content")).and_then(Value::as_str).map(str::to_owned);
             return Ok(Reply {
-                text: v.pointer("/choices/0/message/content").or_else(|| v.pointer("/message/content")).and_then(Value::as_str).map(str::to_owned),
+                thought: text.as_deref().is_some_and(|t| t.contains("<think>")),
+                text,
                 cut_off: v.pointer("/choices/0/finish_reason").or_else(|| v.get("done_reason")).and_then(Value::as_str) == Some("length"),
                 prompt_tokens: v.pointer("/usage/prompt_tokens").or_else(|| v.get("prompt_eval_count")).and_then(Value::as_u64),
             });
         }
-        Ok(Reply { text: Some(self.text), cut_off: self.cut_off, prompt_tokens: self.prompt_tokens })
+        let thought = self.thought || self.text.contains("<think>");
+        Ok(Reply { text: Some(self.text), cut_off: self.cut_off, prompt_tokens: self.prompt_tokens, thought })
     }
 }
 
@@ -738,6 +819,19 @@ async fn is_ollama(client: &reqwest::Client, root: &str) -> bool {
     response.status().is_success() && response.json::<Value>().await.is_ok_and(|v| v.get("version").is_some_and(Value::is_string))
 }
 
+/// What to send as Ollama's `think` for `model`: `false` for a model that
+/// thinks before answering (its `/api/show` capabilities list "thinking",
+/// Ollama 0.9 and later), so the reply budget goes to the answer. gpt-oss
+/// cannot turn thinking off and takes a level, so it gets "low". `None` for
+/// other models: Ollama rejects `think` for a model that cannot think. Sends
+/// only the model name.
+async fn ollama_think_off(client: &reqwest::Client, root: &str, model: &str) -> Option<Value> {
+    let show = client.post(format!("{root}/api/show")).timeout(Duration::from_secs(10)).json(&json!({ "model": model.trim() })).send().await.ok()?;
+    let show: Value = show.error_for_status().ok()?.json().await.ok()?;
+    let thinks = show.get("capabilities")?.as_array()?.iter().any(|c| c.as_str() == Some("thinking"));
+    thinks.then(|| if model.to_ascii_lowercase().contains("gpt-oss") { json!("low") } else { json!(false) })
+}
+
 /// What Test connection learns beyond the model list.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -789,8 +883,9 @@ fn context_limit(show: &Value) -> Option<u32> {
 /// Per-call request options.
 #[derive(Debug, Clone, Copy)]
 pub struct LlmOptions {
-    /// The most tokens the model may write. Without a cap a looping model runs
-    /// until the request times out.
+    /// The fewest tokens the model may write. AegisWin gives more when the
+    /// context window has room (see `LlmHandle::reply_budget`), but always
+    /// caps it: without a cap a looping model runs until the request times out.
     pub max_tokens: u32,
     /// Ask for a JSON object (Ollama's `format: "json"`).
     pub json: bool,
@@ -997,15 +1092,118 @@ long</think>
 {\"ok\":true}").await;
         let answer = handle(&base, false).complete_with("sys", json!({}), LlmOptions { max_tokens: 1024, ..LlmOptions::default() }).await.unwrap();
         assert_eq!(answer.text, "{\"ok\":true}");
-        assert!(server.await.unwrap().contains("\"max_tokens\":1024"));
+        // 1024 is the floor; a quarter of the default 8192-token window is more.
+        assert!(server.await.unwrap().contains("\"max_tokens\":2048"));
+    }
+
+    fn body_of(request: &str) -> Value {
+        serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+    }
+
+    #[test]
+    fn the_reply_budget_follows_the_context_window() {
+        let budget = |context: u32, prompt: usize, floor: u32, retry: bool| sized("http://127.0.0.1:9/v1", context).reply_budget("", &"x".repeat(prompt), floor, retry);
+        // A quarter of the window, at most 8192; a retry up to half, at most 16384.
+        assert_eq!(budget(32768, 300, 2048, false), 8192);
+        assert_eq!(budget(32768, 300, 2048, true), 16384);
+        assert_eq!(budget(16384, 300, 2048, false), 4096);
+        assert_eq!(budget(131_072, 300, 2048, false), 8192);
+        // What the window has left after a long prompt (90% of it, 3 characters a token).
+        assert_eq!(budget(32768, 75_000, 2048, true), 32768 * 9 / 10 - 25_000);
+        // Never under the floor.
+        assert_eq!(budget(4096, 300, 2048, false), 2048);
+        assert_eq!(budget(32768, 90_000, 2048, false), 2048);
     }
 
     #[tokio::test]
-    async fn a_cut_off_answer_is_reported_as_such() {
-        let body = json!({ "choices": [{ "message": { "content": "{\"a\":" }, "finish_reason": "length" }] }).to_string();
-        let (base, _server) = crate::testing::mock_http("200 OK", body).await;
+    async fn a_cut_off_answer_is_asked_for_again_then_reported_with_advice() {
+        let cut = json!({ "choices": [{ "message": { "content": "{\"a\":" }, "finish_reason": "length" }] }).to_string();
+        let (base, server) = crate::testing::mock_http_replies(vec![cut.clone(), cut]).await;
         let err = handle(&base, false).complete("sys", json!({})).await.unwrap_err();
-        assert!(err.message.contains("cut off at its 2048-token limit"), "{}", err.message);
+        assert!(err.message.contains("cut off at its 4096-token reply limit, even after AegisWin asked again"), "{}", err.message);
+        assert!(err.message.contains("raise Context window on the LLM tab"), "{}", err.message);
+        assert!(!err.message.contains("Try a model"), "{}", err.message);
+        let requests = server.await.unwrap();
+        let (first, second) = (body_of(&requests[0]), body_of(&requests[1]));
+        assert_eq!((first["max_tokens"].as_u64(), second["max_tokens"].as_u64()), (Some(2048), Some(4096)));
+        assert_eq!(second["messages"][0]["content"], format!("sys\n\n{ANSWER_ONLY_TEXT}"));
+    }
+
+    fn thinking_show(context_length: u64) -> Value {
+        json!({ "capabilities": ["completion", "thinking"], "model_info": { "general.architecture": "qwen3", "qwen3.context_length": context_length } })
+    }
+
+    fn ndjson(lines: &[Value]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn named(base: &str, model: &str, context_tokens: u32) -> LlmHandle {
+        LlmHandle::new(http_client(), LlmConfig { base_url: base.into(), model: model.into(), context_tokens, ..LlmConfig::default() }, "usage-monitor", false)
+    }
+
+    #[tokio::test]
+    async fn a_long_think_cut_off_at_the_limit_is_asked_again_with_thinking_off() {
+        // A thinking model that thought until the limit, then answers on the second try.
+        let mut first: Vec<Value> = (0..400).map(|i| json!({ "message": { "content": "", "thinking": format!("step {i}: let me reconsider the whole thing again. ") }, "done": false })).collect();
+        first.push(json!({ "message": { "content": "" }, "done": true, "done_reason": "length", "prompt_eval_count": 900 }));
+        let second = vec![
+            json!({ "message": { "content": "", "thinking": "brief" }, "done": false }),
+            json!({ "message": { "content": "{\"reply\":" }, "done": false }),
+            json!({ "message": { "content": "\"ok\"}" }, "done": false }),
+            json!({ "message": { "content": "" }, "done": true, "done_reason": "stop", "prompt_eval_count": 920 }),
+        ];
+        let (base, server) = crate::testing::mock_ollama_raw(thinking_show(40960), vec![ndjson(&first), ndjson(&second)]).await;
+        let options = LlmOptions { max_tokens: 2048, json: true, must_fit: true };
+        let answer = named(&base, "qwen3:8b", 32768).complete_with("sys", json!({ "q": 1 }), options).await.unwrap();
+        assert_eq!(answer.text, "{\"reply\":\"ok\"}");
+        assert_eq!(answer.prompt_tokens, Some(920));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let (a, b) = (body_of(&requests[0]), body_of(&requests[1]));
+        for body in [&a, &b] {
+            assert_eq!(body["think"], json!(false), "thinking is turned off");
+            assert_eq!(body["format"], "json");
+            assert_eq!(body["options"]["num_ctx"], 32768);
+        }
+        assert_eq!((a["options"]["num_predict"].as_u64(), b["options"]["num_predict"].as_u64()), (Some(8192), Some(16384)));
+        assert_eq!(a["messages"][0]["content"], "sys");
+        assert_eq!(b["messages"][0]["content"], format!("sys\n\n{ANSWER_ONLY_JSON}"));
+    }
+
+    #[tokio::test]
+    async fn a_model_that_keeps_thinking_is_reported_with_advice() {
+        let thinking = ndjson(&[
+            json!({ "message": { "content": "", "thinking": "hmm" }, "done": false }),
+            json!({ "message": { "content": "" }, "done": true, "done_reason": "length" }),
+        ]);
+        let (base, _server) = crate::testing::mock_ollama_raw(thinking_show(40960), vec![thinking.clone(), thinking]).await;
+        let options = LlmOptions { max_tokens: 2048, json: true, must_fit: true };
+        let err = named(&base, "deepseek-r1:8b", 32768).complete_with("sys", json!({}), options).await.unwrap_err();
+        assert!(err.message.contains("cut off at its 16384-token reply limit, most of it spent thinking"), "{}", err.message);
+        assert!(err.message.contains("raise Context window on the LLM tab"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn gpt_oss_gets_low_thinking_and_other_models_no_think_field() {
+        let done = ndjson(&[json!({ "message": { "content": "{}" }, "done": true, "done_reason": "stop" })]);
+        let (base, server) = crate::testing::mock_ollama_raw(thinking_show(131_072), vec![done]).await;
+        named(&base, "gpt-oss:20b", 32768).complete_with("sys", json!({}), LlmOptions { json: true, ..LlmOptions::default() }).await.unwrap();
+        assert_eq!(body_of(&server.await.unwrap()[0])["think"], "low");
+
+        // No "thinking" capability (or an Ollama too old to list them): no field, which Ollama would reject.
+        let (base, server) = crate::testing::mock_ollama(&["{}"], 8192).await;
+        sized(&base, 8192).complete_with("sys", json!({}), LlmOptions::default()).await.unwrap();
+        assert!(body_of(&server.await.unwrap()[0]).get("think").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_that_already_holds_its_json_is_used() {
+        // `<think>` inline, then the object, then the limit hit partway through more text.
+        let body = json!({ "choices": [{ "message": { "content": "<think>a b c</think>\n{\"a\":1} and then som" }, "finish_reason": "length" }] }).to_string();
+        let (base, server) = crate::testing::mock_http_replies(vec![body]).await;
+        let answer = handle(&base, false).complete_with("sys", json!({}), LlmOptions { json: true, ..LlmOptions::default() }).await.unwrap();
+        assert_eq!(answer.text, "{\"a\":1}");
+        assert_eq!(server.await.unwrap().len(), 1, "no second request");
     }
 
     #[test]
@@ -1029,7 +1227,8 @@ long</think>
         let request = server.await.unwrap().remove(0);
         assert!(request.starts_with("POST /api/chat "), "{request}");
         let body: Value = serde_json::from_str(&request[request.find("\r\n\r\n").unwrap() + 4..]).unwrap();
-        assert_eq!(body["options"], json!({ "temperature": 0.2, "num_ctx": 16384, "num_predict": 1024 }));
+        // The reply gets a quarter of the window, more than the 1024 asked for at least.
+        assert_eq!(body["options"], json!({ "temperature": 0.2, "num_ctx": 16384, "num_predict": 4096 }));
         assert_eq!(body["format"], "json");
         assert_eq!(body["stream"], true);
     }
@@ -1102,8 +1301,10 @@ long</think>
             ],
         )
         .await;
-        let err = timed(&base, 30).complete("sys", json!({})).await.unwrap_err();
-        assert!(err.message.contains("cut off at its 2048-token limit"), "{}", err.message);
+        // Cut off at the limit, but the JSON answer was already complete.
+        let answer = timed(&base, 30).complete_with("sys", json!({}), LlmOptions { json: true, ..LlmOptions::default() }).await.unwrap();
+        assert_eq!(answer.text, "{\"a\":1}");
+        assert_eq!(answer.prompt_tokens, Some(50));
     }
 
     #[tokio::test]
