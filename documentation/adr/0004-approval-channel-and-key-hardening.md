@@ -303,6 +303,16 @@ The same results are written into the record as `integrity` events the next time
 - It writes `finished` from that copy, instead of looking the ticket up in the store (which lock clears).
 - While locked, the write uses the cached public key and the locked-period MAC session (§4.2).
 
+**As built (Phase 3, `security/approval-record`).** §4.1 to §4.7 are done (`aegis_core::chain`, format 2 history files). Choices made while building:
+- **The MAC is not a JSON field.** A frame's plaintext is the record's JSON followed by the 32-byte MAC, so checking never depends on re-serializing JSON. `prev` is the SHA-256 of that whole plaintext. Records also carry `sess` and `mi` (session and step), so a reader knows which key to ratchet to.
+- **`open` and `close` are frames in the chain** with their own `seq`; the close frame's `prev` is the last record's hash and it counts the frames before it. A purge's new chain therefore starts with an `open` frame, then `purged`.
+- **The writer carries on from disk or checkpoint, whichever is further on**, at the first unlock of a run; only frames whose MAC checks out count as the disk's tail, so a planted file cannot move the chain.
+- **A `pruned` record says "everything up to `to` is gone"**, with `to`'s hash. Retention removes the oldest files first, so a gap at the start of the record is authorised when some `pruned` record ends just before it and names the hash the next record links to.
+- **Format 1 files after a chained one fail the check**, since they could only have been sealed with the public key outside AegisWin.
+- **Retention runs at unlock and when the owner changes the days** (new **Keep for … (PIN)** setting on the record card), never while locked, since it needs the private key to read what it removes.
+- **Held events** (§4.6) live in memory, at most 1,000. They are written in order before any later event; a `purge` drops them, since they belonged to the deleted record.
+- **A 16 MB margin above the 256 MB limit** lets decisions, outcomes and integrity notes for requests already made still be written once new agent requests are refused.
+
 ## 5. Repair tools: bind what runs to what was shown
 
 - **Commands are described by a pure function.**

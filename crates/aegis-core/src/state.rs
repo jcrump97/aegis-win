@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::chain::ChainVault;
 use crate::history::{Retention, StreamKey};
 use crate::llm::LlmConfig;
 use crate::registry::GatePolicy;
@@ -60,6 +61,8 @@ pub struct VaultState {
     pub history_keys: BTreeMap<String, StreamKey>,
     /// History stream → retention, when the owner changed the default.
     pub history_retention: BTreeMap<String, Retention>,
+    /// Chained stream → its MAC session keys and last checkpoint (ADR 0004 §4.2, §4.3).
+    pub history_chains: BTreeMap<String, ChainVault>,
     /// Plugin id → what it runs while locked: the copy each runtime file is
     /// checked against on unlock (`history_service::RuntimeFile::plugin`).
     pub runtime: BTreeMap<String, Value>,
@@ -80,6 +83,7 @@ impl Default for VaultState {
             plugin_data: BTreeMap::new(),
             history_keys: BTreeMap::new(),
             history_retention: BTreeMap::new(),
+            history_chains: BTreeMap::new(),
             runtime: BTreeMap::new(),
         }
     }

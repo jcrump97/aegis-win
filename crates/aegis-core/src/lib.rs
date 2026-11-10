@@ -2,6 +2,7 @@
 //! without a window; `src-tauri` is a thin command layer on top.
 
 pub mod autostart;
+pub mod chain;
 pub mod engine;
 pub mod error;
 pub mod executor;

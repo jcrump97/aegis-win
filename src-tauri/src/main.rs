@@ -370,6 +370,12 @@ async fn delete_approval_record(engine: EngineState<'_>, pin: String) -> Cmd<usi
     Ok(engine.delete_approval_record(&pin).await?)
 }
 
+/// Keeps the approval record for 1-90 days (ADR 0004 §4.5). Needs the PIN.
+#[tauri::command]
+async fn set_approval_retention(engine: EngineState<'_>, pin: String, days: u32) -> Cmd<aegis_core::history::Retention> {
+    Ok(engine.set_approval_retention(&pin, days).await?)
+}
+
 /// Closes the banner about the gap before a resume at launch.
 #[tauri::command]
 async fn dismiss_resume_notice(engine: EngineState<'_>, plugin_id: String) -> Cmd<()> {
@@ -552,6 +558,7 @@ fn main() {
             dismiss_resume_notice,
             read_approval_record,
             delete_approval_record,
+            set_approval_retention,
             get_autostart,
             enable_autostart,
             disable_autostart,

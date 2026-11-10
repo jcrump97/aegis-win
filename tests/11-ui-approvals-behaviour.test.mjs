@@ -78,13 +78,14 @@ let reviews = [];
 let notices = [];
 let needsPassphrase = false;
 let thisPcPin = false;
+let recordFull = false;
 const keyCalls = [];
 let autostart = { state: 'off', shortcut: 'C:\Startup\AegisWin Monitor.lnk', wanted: true };
 const autostartCalls = [];
 const recordCalls = [];
 let recordEvents = [
   { at: '2026-11-08T10:05:00Z', event: 'finished', ticketId: 'one-3aaaaaaa', status: 'execution_failed', reason: 'Step 2 failed: broke' },
-  { at: '2026-11-08T10:04:00Z', event: 'change_finished', ticketId: 'one-3aaaaaaa', tool: 'windows-health__sfc_scan', outcome: 'succeeded', step: 1 },
+  { at: '2026-11-08T10:04:00Z', event: 'change_finished', ticketId: 'one-3aaaaaaa', tool: 'windows-health__sfc_scan', outcome: 'succeeded', step: 1, unverified: true },
   { at: '2026-11-08T10:01:00Z', event: 'decided', ticketId: 'one-3aaaaaaa', approved: true, via: 'browser', comment: 'go', lockedOut: false },
   { at: '2026-11-08T10:00:00Z', event: 'created', ticketId: 'one-3aaaaaaa', origin: 'mcp plan', toolName: 'Action plan (2 steps)', plan: { hash: 'cd'.repeat(32), title: 'Fix <b>it</b>', titleLabel: 'Supplied by the requesting agent', steps: [] } },
 ];
@@ -93,7 +94,7 @@ function backend(cmd, args) {
   calls.push(cmd);
   switch (cmd) {
     case 'status':
-      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews, resumeNotices: notices, needsPassphrase, thisPcPin };
+      return { vaultExists: true, unlocked: true, firstRunCompleted: true, elevated: true, version: '1.0.0', dataDir: 'C:\\x\\data', pinLockoutSeconds: 0, uiScale: 100, change: { running: 'Action plan (2 steps)', queued: 1 }, runtimeReviews: reviews, resumeNotices: notices, needsPassphrase, thisPcPin, approvalRecordFull: recordFull, unwrittenRecords: 0 };
     case 'change_passphrase':
       keyCalls.push({ cmd, ...args });
       needsPassphrase = false;
@@ -114,7 +115,18 @@ function backend(cmd, args) {
       return autostart;
     case 'read_approval_record':
       recordCalls.push({ cmd, ...args });
-      return { days: args.days, retention: { maxDays: 90, maxMb: 64 }, events: recordEvents, omitted: 0, files: [{ name: 'seg-1.bin', status: 'ok' }] };
+      return {
+        days: args.days,
+        retention: { maxDays: 90, maxMb: 64 },
+        events: recordEvents,
+        omitted: 0,
+        files: [{ name: 'seg-1.bin', status: 'ok' }],
+        integrity: { ok: false, line: 'File seg-1.bin failed its check (changed or forged); its 1 event is shown in red.', problems: ['File seg-1.bin failed its check (changed or forged); its 1 event is shown in red.'], verified: 3, legacy: 0 },
+      };
+    case 'set_approval_retention':
+      recordCalls.push({ cmd, ...args });
+      recordFull = false;
+      return { maxDays: args.days, maxMb: 64 };
     case 'delete_approval_record':
       recordCalls.push({ cmd, ...args });
       recordEvents = [];
@@ -319,6 +331,8 @@ test('the approval record needs the PIN to show and to delete, and shows supplie
   assert.ok(text.includes('execution failed. Step 2 failed: broke'), text);
   assert.ok(text.includes('titled "Fix <b>it</b>" (Supplied by the requesting agent)'), 'the supplied title is shown as text with its label');
   assert.ok(!card().querySelectorAll('b').length, 'no markup from a record is rendered');
+  assert.ok(text.includes('failed its check (changed or forged); its 1 event is shown in red.'), 'the integrity line is shown');
+  assert.equal(card().querySelectorAll('tr').filter((r) => r.className === 'unverified').length, 1, 'the event that failed is marked');
 
   // Re-rendering the tab (the poll does this every 2 seconds) keeps what is shown.
   nav(document, 'approvals').click();
@@ -369,4 +383,28 @@ test('a vault with a short PIN gets a banner until a passphrase is chosen, and c
   for (const poll of intervals) await poll();
   await settle();
   assert.ok(!banner().textContent.includes('can be guessed'), 'the banner goes once a passphrase is set');
+});
+
+test('a full approval record shows a banner, and a shorter retention is set with the PIN', async () => {
+  const { document, intervals } = app;
+  const banner = () => document.querySelector('main').childNodes[0];
+  recordFull = true;
+  for (const poll of intervals) await poll();
+  await settle();
+  assert.ok(banner().textContent.includes('The approval record is full, so agent requests are refused.'), banner().textContent);
+  banner().querySelectorAll('button').find((b) => b.textContent === 'Open the approval record').click();
+  await settle();
+  const card = document.querySelectorAll('section').find((s) => s.id === 'approval-record');
+  assert.ok(card, 'the record card is shown');
+  card.querySelectorAll('select').find((s) => s.id === 'record-keep').value = '30';
+  card.querySelectorAll('button').find((b) => b.textContent === 'Keep (PIN)').click();
+  await settle();
+  const dialog = document.querySelectorAll('dialog').find((d) => d.open);
+  dialog.querySelector('input').value = '246810';
+  dialog.querySelector('form').dispatchEvent({ type: 'submit', defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
+  await settle();
+  assert.deepEqual(recordCalls.at(-1), { cmd: 'set_approval_retention', pin: '246810', days: 30 });
+  for (const poll of intervals) await poll();
+  await settle();
+  assert.ok(!banner().textContent.includes('is full'), 'the banner goes once there is room');
 });

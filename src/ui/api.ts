@@ -40,6 +40,10 @@ export interface Status {
   needsPassphrase: boolean;
   /** A short PIN on this PC can unlock (ADR 0004 §3.3). Known while locked. */
   thisPcPin: boolean;
+  /** The approval record is full, so agent requests are refused (ADR 0004 §4.5). */
+  approvalRecordFull: boolean;
+  /** Approval record events not written yet; they go in before the next one (§4.6). */
+  unwrittenRecords: number;
 }
 
 /** A guide for a passphrase being typed; the rule enforced is the length. */
@@ -66,7 +70,21 @@ export interface ApprovalRecordEvent {
   event: 'created' | 'decided' | 'change_started' | 'change_finished' | 'finished' | 'cancelled' | 'cancel_requested' | string;
   at: string;
   ticketId?: string | null;
+  /** Its event number in the record (ADR 0004 §4.1); missing for events from before integrity checks. */
+  seq?: number;
+  /** It failed the integrity check: shown in red. */
+  unverified?: boolean;
   [field: string]: unknown;
+}
+
+/** What checking the whole record found (ADR 0004 §4.4). */
+export interface RecordIntegrity {
+  ok: boolean;
+  /** The one line shown above the table. */
+  line: string;
+  problems: string[];
+  verified: number;
+  legacy: number;
 }
 
 export interface ApprovalRecord {
@@ -75,6 +93,7 @@ export interface ApprovalRecord {
   events: ApprovalRecordEvent[];
   omitted: number;
   files: { name: string; status: string }[];
+  integrity?: RecordIntegrity;
 }
 
 /** The Startup shortcut (`AegisWin Monitor.lnk`), app only. */
@@ -315,6 +334,7 @@ export const api = {
   dismissResumeNotice: (pluginId: string) => call<void>('dismiss_resume_notice', { pluginId }),
   readApprovalRecord: (pin: string, days: number) => call<ApprovalRecord>('read_approval_record', { pin, days }),
   deleteApprovalRecord: (pin: string) => call<number>('delete_approval_record', { pin }),
+  setApprovalRetention: (pin: string, days: number) => call<{ maxDays: number; maxMb: number }>('set_approval_retention', { pin, days }),
   getAutostart: () => call<AutostartView>('get_autostart'),
   enableAutostart: (pin: string, replace: boolean) => call<AutostartView>('enable_autostart', { pin, replace }),
   disableAutostart: () => call<AutostartView>('disable_autostart'),

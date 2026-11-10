@@ -459,11 +459,19 @@ function updateShellBadges(): void {
 }
 
 /** Runtime files the unlock check set aside (ADR 0002 §5): nothing resumes from them until the owner rewrites them. */
+/** Goes to the approval record card. */
+function openRecord(): void {
+  selectTab('approvals');
+  document.getElementById('approval-record')?.scrollIntoView({ block: 'start' });
+}
+
 function updateRuntimeReviews(host: HTMLElement): void {
   const reviews = status.runtimeReviews ?? [];
   const notices = status.resumeNotices ?? [];
   const signature = [
     status.needsPassphrase ? 'needs-passphrase' : '',
+    status.approvalRecordFull ? 'record-full' : '',
+    status.unwrittenRecords ? `unwritten:${status.unwrittenRecords}` : '',
     ...reviews.map((r) => `${r.pluginId}:${r.differences.join(',')}`),
     ...notices.map((n) => `gap:${n.pluginId}:${n.from ?? ''}:${n.to}`),
   ].join('|');
@@ -483,6 +491,23 @@ function updateRuntimeReviews(host: HTMLElement): void {
           h('p', {}, h('strong', {}, 'Your PIN can be guessed in hours if someone copies your AegisWin folder.')),
           h('p', { class: 'hint' }, 'Choose a passphrase to protect the folder. You can keep typing your current PIN on this PC if you like. Everything keeps working until you choose.'),
           h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => choose('passphrase') }, 'Set a passphrase'), h('button', { onclick: () => choose('pc') }, 'Keep a short PIN on this PC only')),
+        )
+      : null,
+    status.approvalRecordFull
+      ? h(
+          'div',
+          { class: 'notice error', role: 'alert' },
+          h('p', {}, h('strong', {}, 'The approval record is full, so agent requests are refused.')),
+          h('p', { class: 'hint' }, 'Delete the record, or keep it for fewer days, on the Approvals tab. Both need your PIN.'),
+          h('div', { class: 'row' }, h('button', { class: 'primary', onclick: openRecord }, 'Open the approval record')),
+        )
+      : null,
+    status.unwrittenRecords
+      ? h(
+          'div',
+          { class: 'notice error', role: 'alert' },
+          h('p', {}, h('strong', {}, `AegisWin couldn't write ${status.unwrittenRecords} event(s) to its approval record.`)),
+          h('p', { class: 'hint' }, 'It writes them before the next event. Until then, approvals and changes that cannot be recorded are refused. Check that the disk has space.'),
         )
       : null,
     ...notices.map((n) => {
@@ -878,6 +903,9 @@ const RECORD_LABELS: Record<string, string> = {
   finished: 'Ended',
   cancelled: 'Cancelled',
   cancel_requested: 'Stop asked',
+  pruned: 'Removed by retention',
+  purged: 'Record deleted',
+  integrity: 'Integrity problem',
 };
 
 const asText = (v: unknown): string => (typeof v === 'string' ? v : v == null ? '' : JSON.stringify(v));
@@ -899,6 +927,12 @@ function recordText(e: ApprovalRecordEvent): string {
       return `${asText(e.status).replace('_', ' ')}${e.reason ? `. ${asText(e.reason)}` : ''}`;
     case 'cancelled':
       return `from ${asText(e.from)}${e.reason ? `. ${asText(e.reason)}` : ''}`;
+    case 'pruned':
+      return e.to ? `${asText(e.segment)}: events ${asText(e.from)} to ${asText(e.to)}, past the days kept` : `${asText(e.segment)}, from before integrity checks`;
+    case 'purged':
+      return `${asText(e.files)} file(s) deleted with your PIN; the record starts again here`;
+    case 'integrity':
+      return asText(e.problem);
     default:
       return '';
   }
@@ -917,8 +951,18 @@ function approvalRecordCard(): HTMLElement {
     try {
       const v = await busy(show, () => api.readApprovalRecord(pin, Number(days.value)));
       const problems = v.files.filter((f) => f.status !== 'ok');
+      const check = v.integrity;
+      setKeep(v.retention.maxDays);
       replace(
         result,
+        check
+          ? h(
+              'div',
+              { class: check.ok ? 'notice ok' : 'notice error', role: check.ok ? 'status' : 'alert' },
+              h('p', {}, check.line),
+              check.problems.length > 1 ? h('ul', {}, ...check.problems.map((p) => h('li', {}, p))) : null,
+            )
+          : null,
         h('p', { class: 'hint' }, `The last ${v.days} day(s), newest first. Kept for ${v.retention.maxDays} days.`),
         problems.length ? h('div', { class: 'notice error' }, `${problems.length} record file(s) could not be read fully: ${problems.map((f) => `${f.name} (${f.status})`).join(', ')}.`) : null,
         v.events.length === 0 ? h('p', {}, 'Nothing recorded in this period.') : null,
@@ -926,11 +970,32 @@ function approvalRecordCard(): HTMLElement {
           ? h(
               'table',
               {},
-              h('tbody', {}, ...v.events.map((e) => h('tr', {}, h('td', {}, new Date(e.at).toLocaleString()), h('td', {}, RECORD_LABELS[e.event] ?? e.event), h('td', { class: 'mono' }, asText(e.ticketId).slice(0, 8)), h('td', {}, recordText(e))))),
+              h('tbody', {}, ...v.events.map((e) => h('tr', e.unverified ? { class: 'unverified', title: 'Failed the integrity check' } : {}, h('td', {}, new Date(e.at).toLocaleString()), h('td', {}, RECORD_LABELS[e.event] ?? e.event), h('td', { class: 'mono' }, asText(e.ticketId).slice(0, 8)), h('td', {}, recordText(e))))),
             )
           : null,
         v.omitted ? h('p', { class: 'hint' }, `${v.omitted} older event(s) not shown.`) : null,
       );
+    } catch (e) {
+      replace(result, errorNotice(asError(e)));
+    }
+  });
+  const keepDays = [7, 14, 30, 60, 90];
+  const keep = h('select', { id: 'record-keep' }, ...keepDays.map((d) => h('option', { value: d }, `${d} days`)));
+  keep.value = '90';
+  const setKeep = (days: number): void => {
+    if (!keepDays.includes(days)) keep.append(h('option', { value: days }, `${days} days`));
+    keep.value = String(days);
+  };
+  const saveKeep = h('button', {}, 'Keep (PIN)');
+  saveKeep.addEventListener('click', async () => {
+    const days = Number(keep.value);
+    const pin = await askPin(`Keep the approval record for ${days} days?`, 'Older files are removed now. The record notes what was removed, so the gap is not reported as tampering.', 'Keep');
+    if (!pin) return;
+    try {
+      const kept = await busy(saveKeep, () => api.setApprovalRetention(pin, days));
+      toast(`The approval record is kept for ${kept.maxDays} days.`);
+      status = await api.status();
+      updateShellBadges();
     } catch (e) {
       replace(result, errorNotice(asError(e)));
     }
@@ -959,7 +1024,7 @@ function approvalRecordCard(): HTMLElement {
     ),
     h('div', { class: 'row' }, h('label', { for: 'record-days' }, 'Show'), days, show),
     result,
-    h('div', { class: 'row' }, purge),
+    h('div', { class: 'row' }, h('label', { for: 'record-keep' }, 'Keep for'), keep, saveKeep, purge),
   );
   return recordCard;
 }

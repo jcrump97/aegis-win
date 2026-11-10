@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -14,10 +14,11 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use crate::chain::{self, Head, MacCheck, Session};
 use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
-use crate::history::{Retention, StreamKey, StreamRead};
-use crate::history_service::{self, ChangeWindow, HistoryHandle, HistoryService, RuntimeFile, RuntimeReview, APPROVALS_STREAM, MAX_RUNTIME_BYTES, RUNTIME_VERSION};
+use crate::history::{self, Retention, StreamKey, StreamRead};
+use crate::history_service::{self, Append, AppendError, ChangeWindow, HistoryHandle, HistoryService, RuntimeFile, RuntimeReview, APPROVALS_STREAM, MAX_RUNTIME_BYTES, RUNTIME_VERSION};
 use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
@@ -81,7 +82,26 @@ pub struct Engine {
     device_tripped: AtomicBool,
     /// When agents last asked for approval, newest last (ADR 0004 §1.3).
     agent_requests: Mutex<VecDeque<Instant>>,
+    /// Approval record events that could not be written yet, oldest first.
+    /// Written before the next record (ADR 0004 §4.6).
+    unwritten: Mutex<Vec<Value>>,
+    /// Size at which the approval record refuses new agent requests (§4.5).
+    record_full_bytes: AtomicU64,
+    /// Size past which no approval record event is written.
+    record_hard_bytes: AtomicU64,
+    /// Held events dropped because too many were waiting; noted in the record once it can be written.
+    unwritten_lost: AtomicU64,
 }
+
+/// The approval record refuses new agent requests at this size (ADR 0004 §4.5).
+pub const APPROVAL_RECORD_FULL_BYTES: u64 = 256 * 1024 * 1024;
+/// Past this, no approval record event is written at all, so a flood can
+/// never fill the disk; what fails then follows ADR 0004 §4.6.
+const APPROVAL_RECORD_HEADROOM: u64 = 16 * 1024 * 1024;
+/// Unwritten events held in memory at most; the oldest go first.
+const MAX_UNWRITTEN: usize = 1000;
+/// What an agent sees when the approval record is full.
+pub const RECORD_FULL: &str = "The approval record is full. Open AegisWin.";
 
 /// Agent requests that may wait for the owner at once (plans included).
 pub const MAX_AGENT_PENDING: usize = 10;
@@ -139,6 +159,12 @@ pub struct Status {
     pub needs_passphrase: bool,
     /// A short PIN on this PC can unlock (ADR 0004 §3.3). Known while locked.
     pub this_pc_pin: bool,
+    /// The approval record reached its size limit, so agent requests are
+    /// refused (ADR 0004 §4.5). False while locked.
+    pub approval_record_full: bool,
+    /// Approval record events that could not be written yet (§4.6). They
+    /// are written before the next event.
+    pub unwritten_records: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +354,10 @@ impl Engine {
             device_misses: Mutex::new(VecDeque::new()),
             device_tripped: AtomicBool::new(false),
             agent_requests: Mutex::new(VecDeque::new()),
+            unwritten: Mutex::new(Vec::new()),
+            record_full_bytes: AtomicU64::new(APPROVAL_RECORD_FULL_BYTES),
+            record_hard_bytes: AtomicU64::new(APPROVAL_RECORD_FULL_BYTES + APPROVAL_RECORD_HEADROOM),
+            unwritten_lost: AtomicU64::new(0),
             data_dir,
             registry,
             vault: Mutex::new(None),
@@ -392,6 +422,8 @@ impl Engine {
     // ---- lifecycle -------------------------------------------------------
 
     pub fn status(&self) -> Status {
+        let full = self.approval_record_full();
+        let unwritten = lock(&self.unwritten).len();
         let reviews = self.runtime_reviews();
         let notices: Vec<ResumeNoticeView> =
             lock(&self.resume_notices).iter().map(|(id, n)| ResumeNoticeView { plugin_id: id.clone(), notice: n.clone() }).collect();
@@ -411,6 +443,8 @@ impl Engine {
             resume_notices: if state.is_some() { notices } else { Vec::new() },
             needs_passphrase: guard.as_ref().is_some_and(|v| !v.meets_passphrase_rule()),
             this_pc_pin: guard.as_ref().map_or_else(|| vault::this_pc_exists(&self.vault_path()), |v| v.has_this_pc()),
+            approval_record_full: state.is_some() && full,
+            unwritten_records: unwritten,
         }
     }
 
@@ -475,6 +509,9 @@ impl Engine {
             }
         }
         self.load_history_keys();
+        // If this fails the record is not chained, and agent requests and
+        // approvals are refused until it works (ADR 0004 §4.6).
+        let _ = self.turn_approval_session(true);
         self.check_runtime_files();
         for (id, components) in installed {
             if let Some(plugin) = self.registry.plugin(&id) {
@@ -658,6 +695,9 @@ impl Engine {
                 "reason": "AegisWin locked. A change already running finishes; its outcome is recorded.",
             }));
         }
+        // While the vault key is still here: close the file, checkpoint, and
+        // store the key of the session that covers the locked period (ADR 0004 §4.2).
+        let _ = self.turn_approval_session(false);
         let reviews: BTreeSet<String> = lock(&self.runtime_reviews).keys().cloned().collect();
         let taken = lock(&self.vault).take().map(|v| (v.state.installed_plugins.clone(), v.state.runtime.clone()));
         // Waiting changes never resume after unlock; a running one finishes.
@@ -1210,16 +1250,132 @@ impl Engine {
         Ok(removed)
     }
 
-    // ---- approval record (ADR 0003 §7) -------------------------------------
+    // ---- approval record (ADR 0003 §7, ADR 0004 §4) -----------------------
 
-    /// Appends to the engine's own `approvals` stream. Best effort: a full
-    /// disk or a locked vault must not block a decision or a repair. The
-    /// PIN is never part of a record.
-    fn record_approval(&self, record: Value) {
-        let _ = self.history_append(APPROVALS_STREAM, record);
+    /// Starts a new MAC session for the approval record, with its key in the
+    /// vault before any record uses it, then checkpoints (ADR 0004 §4.2,
+    /// §4.3). Runs at unlock (`prune`: retention too) and just before lock,
+    /// while the vault key is in memory. The first time in a run, the chain
+    /// carries on from the files or the checkpoint, whichever is further on:
+    /// a checkpoint ahead of the files means records were removed, and
+    /// carrying on from it keeps that gap visible.
+    fn turn_approval_session(&self, prune: bool) -> AegisResult<()> {
+        if !self.history.knows(APPROVALS_STREAM) {
+            self.ensure_history_key(APPROVALS_STREAM)?;
+        }
+        let today = chrono::Utc::now().date_naive().to_string();
+        let (session, id, stored) = Session::start(&today);
+        let (key, chain) = self.mutate(|s| {
+            let chain = s.history_chains.entry(APPROVALS_STREAM.to_owned()).or_default();
+            chain.add_session(id, stored, &today);
+            let chain = chain.clone();
+            Ok((s.history_keys.get(APPROVALS_STREAM).cloned(), chain))
+        })?;
+        let dir = self.history.dir(APPROVALS_STREAM);
+        self.history.turn_session(APPROVALS_STREAM, session, || {
+            let mut macs = MacCheck::new(Some(&chain));
+            let disk = match &key {
+                Some(key) => history::chain_tail(&dir, APPROVALS_STREAM, key, &mut macs).map_err(|e| AegisError::new(ErrorCode::Internal, format!("history: {e}")))?,
+                None => None,
+            };
+            let saved = chain.checkpoint.as_ref().map(Head::from);
+            Ok(match (disk, saved) {
+                (Some(disk), Some(saved)) if saved.seq > disk.seq => saved,
+                (disk, saved) => disk.or(saved).unwrap_or_else(Head::genesis),
+            })
+        })?;
+        self.checkpoint_approvals(prune)
     }
 
-    fn record_created(&self, view: &TicketView, origin: &str) {
+    /// Applies retention to the approval record when `prune` (each removed
+    /// file leaves a `pruned` record), then stores the chain's head in the
+    /// vault and forgets session keys whose records have all aged out.
+    fn checkpoint_approvals(&self, prune: bool) -> AegisResult<()> {
+        let now = chrono::Utc::now();
+        let (key, retention) = self.with_state(|s| (s.history_keys.get(APPROVALS_STREAM).cloned(), Self::retention_of(s, APPROVALS_STREAM)))?;
+        let oldest = now.date_naive() - chrono::Days::new(u64::from(retention.max_days.saturating_sub(1)));
+        if let Some(key) = key.filter(|_| prune) {
+            self.history.prune_chained(APPROVALS_STREAM, &key, oldest, now)?;
+        }
+        let head = self.history.chain_head(APPROVALS_STREAM);
+        let oldest = oldest.to_string();
+        self.mutate(|s| {
+            let chain = s.history_chains.entry(APPROVALS_STREAM.to_owned()).or_default();
+            if let Some(head) = &head {
+                chain.checkpoint = Some(head.checkpoint());
+            }
+            chain.forget_sessions_before(&oldest);
+            Ok(())
+        })
+    }
+
+    fn approval_record_full(&self) -> bool {
+        self.history.bytes(APPROVALS_STREAM).is_some_and(|b| b >= self.record_full_bytes.load(Ordering::SeqCst))
+    }
+
+    /// Sets the approval record's size limits: full for new requests, and
+    /// for every event. Tests only.
+    #[doc(hidden)]
+    pub fn set_approval_record_limits(&self, full: u64, hard: u64) {
+        self.record_full_bytes.store(full, Ordering::SeqCst);
+        self.record_hard_bytes.store(hard, Ordering::SeqCst);
+    }
+
+    fn append_approval(&self, record: &Value, new_request: bool, sync: bool) -> Result<(), AppendError> {
+        let limit = if new_request { &self.record_full_bytes } else { &self.record_hard_bytes }.load(Ordering::SeqCst);
+        self.history.append_with(APPROVALS_STREAM, record, chrono::Utc::now(), Append { limit: Some(limit), sync, chained: true })
+    }
+
+    /// Writes the held events first, oldest first, so the record keeps its order.
+    fn write_held(&self, held: &mut Vec<Value>) -> Result<(), AppendError> {
+        let lost = self.unwritten_lost.load(Ordering::SeqCst);
+        if lost > 0 {
+            let note = Self::stamped(json!({ "event": "integrity", "problem": format!("{} events could not be written in time and were lost.", chain::thousands(lost)) }));
+            self.append_approval(&note, false, false)?;
+            self.unwritten_lost.fetch_sub(lost, Ordering::SeqCst);
+        }
+        while let Some(record) = held.first() {
+            self.append_approval(record, false, false)?;
+            held.remove(0);
+        }
+        Ok(())
+    }
+
+    fn stamped(mut record: Value) -> Value {
+        if let Value::Object(fields) = &mut record {
+            fields.entry("at").or_insert_with(|| Value::String(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)));
+        }
+        record
+    }
+
+    /// An event whose loss must not block anything: one that cannot be
+    /// written is held in memory and written before the next, and the app
+    /// shows a banner meanwhile (ADR 0004 §4.6). The PIN is never part of a record.
+    fn record_approval(&self, record: Value) {
+        let record = Self::stamped(record);
+        let mut held = lock(&self.unwritten);
+        if self.write_held(&mut held).is_ok() && self.append_approval(&record, false, false).is_ok() {
+            return;
+        }
+        if held.len() >= MAX_UNWRITTEN {
+            held.remove(0);
+            self.unwritten_lost.fetch_add(1, Ordering::SeqCst);
+        }
+        held.push(record);
+    }
+
+    /// An event that must be on disk before AegisWin acts on it (§4.6).
+    fn record_required(&self, record: Value, new_request: bool, sync: bool, refused: &str) -> AegisResult<()> {
+        let record = Self::stamped(record);
+        let mut held = lock(&self.unwritten);
+        self.write_held(&mut held).and_then(|()| self.append_approval(&record, new_request, sync)).map_err(|e| match e {
+            AppendError::Full if new_request => AegisError::new(ErrorCode::Conflict, RECORD_FULL),
+            _ => AegisError::new(ErrorCode::Internal, format!("AegisWin couldn't write its approval record, so {refused}.")),
+        })
+    }
+
+    /// Records a new request; if that fails the request is refused (§4.6).
+    fn record_created(&self, view: &TicketView, origin: &str) -> AegisResult<()> {
         let mut record = json!({
             "event": "created",
             "ticketId": view.ticket_id,
@@ -1241,11 +1397,26 @@ impl Engine {
                 record["args"] = capped_args(&view.args);
             }
         }
-        self.record_approval(record);
+        let refused = self.record_required(record, origin.starts_with("mcp"), false, "the request was refused");
+        if refused.is_err() {
+            lock(&self.tickets).remove(&view.ticket_id);
+        }
+        refused
     }
 
-    fn record_decided(&self, id: &str, approved: bool, via: &str, comment: Option<&str>, locked_out: bool) {
-        self.record_approval(json!({ "event": "decided", "ticketId": id, "approved": approved, "via": via, "comment": comment, "lockedOut": locked_out }));
+    fn decided(id: &str, approved: bool, via: &str, comment: Option<&str>, locked_out: bool) -> Value {
+        json!({ "event": "decided", "ticketId": id, "approved": approved, "via": via, "comment": comment, "lockedOut": locked_out })
+    }
+
+    /// A decline or a lockout: it happens even if it cannot be recorded (§4.6).
+    fn record_declined(&self, id: &str, via: &str, comment: Option<&str>, locked_out: bool) {
+        self.record_approval(Self::decided(id, false, via, comment, locked_out));
+    }
+
+    /// `finished` for a request the store no longer holds: AegisWin locked
+    /// while it ran, so the task records from what it knows (ADR 0004 §4.7).
+    fn record_finished_as(&self, id: &str, status: TicketStatus, reason: Option<&str>) {
+        self.record_approval(json!({ "event": "finished", "ticketId": id, "status": status, "reason": reason.map(cut_text), "afterLock": true }));
     }
 
     /// Records how a request ended, once it has. Call with the ticket store unlocked.
@@ -1269,7 +1440,8 @@ impl Engine {
         let tool = registry::mcp_tool_name(&prepared.plugin.manifest().id, &prepared.tool.id);
         let mut started = json!({ "event": "change_started", "tool": tool, "toolName": prepared.tool.name, "args": capped_args(&prepared.args) });
         merge(&mut started, &by);
-        self.record_approval(started);
+        // On disk before the change runs; if it cannot be, the change does not run (§4.6).
+        self.record_required(started, false, true, &format!("{} did not run", prepared.tool.name))?;
         let result = prepared.plugin.call(&prepared.tool.id, prepared.args, prepared.ctx).await;
         let outcome = match &result {
             Ok(v) if v.get("success") == Some(&Value::Bool(false)) => "reported_failure",
@@ -1290,24 +1462,108 @@ impl Engine {
         }
     }
 
-    /// Deletes the approval record and replaces its key. App only, after the PIN.
+    /// Deletes the approval record and replaces its key. A new chain starts,
+    /// whose first event after its `open` frame is `purged` (ADR 0004 §4.3).
+    /// App only, after the PIN.
     pub fn purge_approvals(&self) -> AegisResult<usize> {
-        self.purge_stream(APPROVALS_STREAM, false)
+        let removed = self.purge_stream(APPROVALS_STREAM, false)?;
+        let today = chrono::Utc::now().date_naive().to_string();
+        let (session, id, stored) = Session::start(&today);
+        self.mutate(|s| {
+            let mut chain = chain::ChainVault::default();
+            chain.add_session(id, stored, &today);
+            s.history_chains.insert(APPROVALS_STREAM.to_owned(), chain);
+            Ok(())
+        })?;
+        self.history.restart_chain(APPROVALS_STREAM, session)?;
+        // Events waiting to be written belonged to the deleted record.
+        lock(&self.unwritten).clear();
+        self.unwritten_lost.store(0, Ordering::SeqCst);
+        self.record_required(json!({ "event": "purged", "files": removed }), false, true, "the deletion was not recorded")?;
+        self.checkpoint_approvals(false)?;
+        Ok(removed)
     }
 
     /// The owner's view of the approval record: the last `days` days (1-90),
-    /// newest first. Needs the PIN. App only, never MCP.
+    /// newest first, with an integrity line for the whole record (ADR 0004
+    /// §4.4). Problems found are also written into the record, once each.
+    /// Needs the PIN. App only, never MCP.
     pub async fn approval_record(&self, pin: &str, days: u32) -> AegisResult<Value> {
         self.check_pin(pin).await?;
         let days = days.clamp(1, APPROVAL_RECORD_MAX_DAYS);
-        let since = chrono::Utc::now().date_naive() - chrono::Days::new(u64::from(days - 1));
-        let retention = self.with_state(|s| Self::retention_of(s, APPROVALS_STREAM))?;
-        let read = self.read_approvals(Some(since))?;
-        let mut events: Vec<&Value> = read.records.iter().filter(|r| r.get("at").and_then(Value::as_str).is_some_and(|at| at >= since.to_string().as_str())).collect();
+        let since = (chrono::Utc::now().date_naive() - chrono::Days::new(u64::from(days - 1))).to_string();
+        let (key, chain, retention) = self.with_state(|s| {
+            (s.history_keys.get(APPROVALS_STREAM).cloned(), s.history_chains.get(APPROVALS_STREAM).cloned(), Self::retention_of(s, APPROVALS_STREAM))
+        })?;
+        let mut macs = MacCheck::new(chain.as_ref());
+        let (files, current) = match &key {
+            Some(key) => self.history.read_files(APPROVALS_STREAM, key, None, &mut macs)?,
+            None => (Vec::new(), None),
+        };
+        let integrity = chain::verify(&files, chain.as_ref().and_then(|c| c.checkpoint.as_ref()), current.as_deref());
+        let noted: BTreeSet<&str> = files
+            .iter()
+            .flat_map(|f| &f.frames)
+            .filter(|f| f.record.get("event").and_then(Value::as_str) == Some("integrity"))
+            .filter_map(|f| f.record.get("problem").and_then(Value::as_str))
+            .collect();
+        let problems: Vec<String> = integrity.problems.iter().map(chain::Problem::text).collect();
+        for problem in problems.iter().filter(|p| !noted.contains(p.as_str())) {
+            self.record_approval(json!({ "event": "integrity", "problem": problem }));
+        }
+        let mut events: Vec<Value> = files
+            .iter()
+            .flat_map(|f| {
+                let failed = f.chained || integrity.failed_files.contains(&f.name);
+                f.frames.iter().map(move |frame| (failed, frame))
+            })
+            .filter(|(_, f)| !matches!(f.record.get("event").and_then(Value::as_str), Some("open" | "close")))
+            .filter(|(_, f)| f.record.get("at").and_then(Value::as_str).is_some_and(|at| at >= since.as_str()))
+            .map(|(checked, f)| {
+                let mut record = f.record.clone();
+                if let Value::Object(fields) = &mut record {
+                    for chain_field in ["prev", "sess", "mi"] {
+                        fields.remove(chain_field);
+                    }
+                    if checked && f.mac_ok != Some(true) {
+                        fields.insert("unverified".into(), Value::Bool(true));
+                    }
+                }
+                record
+            })
+            .collect();
         events.reverse();
         let omitted = events.len().saturating_sub(APPROVAL_RECORD_LIMIT);
         events.truncate(APPROVAL_RECORD_LIMIT);
-        Ok(json!({ "days": days, "retention": retention, "events": events, "omitted": omitted, "files": read.files }))
+        let reports: Vec<history::FileReport> = files.iter().map(history::FileRead::report).collect();
+        Ok(json!({
+            "days": days,
+            "retention": retention,
+            "events": events,
+            "omitted": omitted,
+            "files": reports,
+            "integrity": { "ok": integrity.ok(), "line": integrity.line(), "problems": problems, "verified": integrity.verified, "legacy": integrity.legacy },
+        }))
+    }
+
+    /// Keeps the approval record for `days` (1-90) and applies it now,
+    /// recording what it removes. Needs the PIN. App only, never MCP.
+    pub async fn set_approval_retention(&self, pin: &str, days: u32) -> AegisResult<Retention> {
+        self.check_pin(pin).await?;
+        if !Retention::DAYS.contains(&days) {
+            return Err(AegisError::invalid(format!("Keep the approval record for {} to {} days.", Retention::DAYS.start(), Retention::DAYS.end())));
+        }
+        let (retention, key) = self.mutate(|s| {
+            let mut r = Self::retention_of(s, APPROVALS_STREAM);
+            r.max_days = days;
+            s.history_retention.insert(APPROVALS_STREAM.to_owned(), r);
+            Ok((r, s.history_keys.get(APPROVALS_STREAM).map(StreamKey::public)))
+        })?;
+        if let Some(key) = key {
+            self.history.set_key(APPROVALS_STREAM, key, retention);
+        }
+        self.checkpoint_approvals(true)?;
+        Ok(retention)
     }
 
     /// Deletes the whole approval record. Needs the PIN. App only, never MCP.
@@ -1560,7 +1816,7 @@ impl Engine {
                         Instant::now(),
                     );
                     drop(store);
-                    self.record_created(&ticket, "mcp");
+                    self.record_created(&ticket, "mcp")?;
                     Ok(RunOutcome::PendingApproval { ticket: Box::new(ticket) })
                 }
             },
@@ -1744,7 +2000,7 @@ impl Engine {
             ticket.status = TicketStatus::LockedOut;
             ticket.decided_via = Some(via);
             drop(store);
-            self.record_decided(id, false, via, None, true);
+            self.record_declined(id, via, None, true);
         }
         error(left)
     }
@@ -1763,7 +2019,7 @@ impl Engine {
             ticket.status = TicketStatus::Declined;
             let view = ticket.view();
             drop(store);
-            self.record_decided(id, false, via, comment.as_deref(), false);
+            self.record_declined(id, via, comment.as_deref(), false);
             return Ok(view);
         }
         let calls: Vec<(String, String, Value)> = if ticket.plan.is_some() {
@@ -1809,6 +2065,15 @@ impl Engine {
             }
             return Err(ticket_conflict(status));
         }
+        // On disk before the ticket changes: an approval that is not
+        // recorded is not applied, and the ticket stays pending (ADR 0004 §4.6).
+        if let Err(e) = self.record_required(Self::decided(id, true, via, comment.as_deref(), false), false, false, "the approval was not applied") {
+            drop(store);
+            if let Some(place) = place {
+                self.executor.withdraw(place);
+            }
+            return Err(e);
+        }
         ticket.comment = comment.clone();
         ticket.decided_via = Some(via);
         match prepared {
@@ -1823,7 +2088,6 @@ impl Engine {
                 ticket.error = Some(e);
                 let view = ticket.view();
                 drop(store);
-                self.record_decided(id, true, via, comment.as_deref(), false);
                 self.record_finished(id);
                 Ok(view)
             }
@@ -1833,7 +2097,6 @@ impl Engine {
                 ticket.status = if waits { TicketStatus::Queued } else { TicketStatus::Running };
                 let view = ticket.view();
                 drop(store);
-                self.record_decided(id, true, via, comment.as_deref(), false);
                 let id = id.to_owned();
                 tokio::spawn(async move { engine.run_ticket(&id, place, prepared).await });
                 Ok(self.with_position(view))
@@ -1844,7 +2107,8 @@ impl Engine {
     /// Runs an approved ticket, in its turn when it changes the system.
     async fn run_ticket(&self, id: &str, place: Option<Place>, mut steps: Vec<Prepared>) {
         let finish = |result: AegisResult<Value>, failed: TicketStatus| {
-            if let Some(ticket) = lock(&self.tickets).get_mut(id, Instant::now()) {
+            let mut store = lock(&self.tickets);
+            if let Some(ticket) = store.get_mut(id, Instant::now()) {
                 // Cancelled while it waited: leave it so.
                 if ticket.status.is_final() {
                     return;
@@ -1866,8 +2130,12 @@ impl Engine {
                     }
                 }
             } else {
-                return;
+                drop(store);
+                // Locked meanwhile, which cleared the store (ADR 0004 §4.7).
+                let status = if result.is_ok() { TicketStatus::Approved } else { failed };
+                return self.record_finished_as(id, status, result.as_ref().err().map(|e| e.message.as_str()));
             }
+            drop(store);
             self.record_finished(id);
         };
         let failed = TicketStatus::ExecutionFailed;
@@ -1925,7 +2193,7 @@ impl Engine {
             }
         };
         let end = |status: TicketStatus, reason: String, from: usize, rest: StepStatus| {
-            update(&mut |t| {
+            let kept = update(&mut |t| {
                 t.status = status;
                 for step in t.steps.iter_mut().skip(from) {
                     step.status = rest;
@@ -1934,13 +2202,17 @@ impl Engine {
                     plan.stop_reason = Some(reason.clone());
                 }
             });
-            self.record_finished(id);
+            if kept {
+                self.record_finished(id);
+            } else {
+                self.record_finished_as(id, status, Some(&reason));
+            }
         };
         for (i, step) in steps.iter().enumerate() {
             let n = i + 1;
             let mut cancelled = false;
             if !update(&mut |t| cancelled = t.cancel_requested || t.status.is_final()) {
-                return;
+                return self.record_finished_as(id, TicketStatus::Cancelled, Some(&format!("AegisWin locked, so step {n} did not start.")));
             }
             if cancelled {
                 return end(TicketStatus::Cancelled, format!("Cancelled before step {n}."), i, StepStatus::Cancelled);
@@ -1986,8 +2258,11 @@ impl Engine {
                 return end(TicketStatus::ExecutionFailed, format!("Step {n} failed: {}", e.message), n, StepStatus::Skipped);
             }
         }
-        update(&mut |t| t.status = TicketStatus::Approved);
-        self.record_finished(id);
+        if update(&mut |t| t.status = TicketStatus::Approved) {
+            self.record_finished(id);
+        } else {
+            self.record_finished_as(id, TicketStatus::Approved, None);
+        }
     }
 
     /// Withdraws a pending or waiting request, or stops a running plan before
@@ -2141,7 +2416,7 @@ impl Engine {
             Instant::now(),
         );
         drop(store);
-        self.record_created(&view, if origin == PlanOrigin::Agent { "mcp plan" } else { "app plan" });
+        self.record_created(&view, if origin == PlanOrigin::Agent { "mcp plan" } else { "app plan" })?;
         Ok(view)
     }
 

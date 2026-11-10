@@ -19,7 +19,8 @@ use serde_json::Value;
 
 use crate::engine::Engine;
 use crate::error::{AegisError, AegisResult, ErrorCode};
-use crate::history::{self, PublicStreamKey, Retention, SegmentWriter, StreamKey, StreamRead};
+use crate::chain::{ChainWriter, Head, MacCheck, Session};
+use crate::history::{self, FileRead, PublicStreamKey, Retention, SegmentWriter, StreamKey, StreamRead};
 
 /// `./data/history/<stream>/` holds a stream's segment files.
 pub const HISTORY_DIR: &str = "history";
@@ -144,6 +145,37 @@ struct Slot {
     writer: Option<SegmentWriter>,
 }
 
+impl Slot {
+    fn writer(&mut self, dir: PathBuf, stream: &str) -> &mut SegmentWriter {
+        self.writer.get_or_insert_with(|| SegmentWriter::new(dir, stream, self.key.clone(), self.retention))
+    }
+}
+
+/// How one record is written.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Append {
+    /// Refuse the record once the stream holds this many bytes.
+    pub limit: Option<u64>,
+    /// Force it to disk before returning.
+    pub sync: bool,
+    /// Refuse it unless the stream is chained (its MAC session is set).
+    pub chained: bool,
+}
+
+/// Why a record was not written.
+#[derive(Debug)]
+pub(crate) enum AppendError {
+    /// The stream reached [`Append::limit`].
+    Full,
+    Failed(AegisError),
+}
+
+impl From<AegisError> for AppendError {
+    fn from(e: AegisError) -> Self {
+        Self::Failed(e)
+    }
+}
+
 /// Segment writers and cached public keys, by stream.
 pub(crate) struct HistoryService {
     data_dir: PathBuf,
@@ -198,11 +230,70 @@ impl HistoryService {
 
     /// Seals one record. Fails if the stream has no key yet.
     pub(crate) fn append(&self, stream: &str, record: &Value, now: DateTime<Utc>) -> AegisResult<()> {
+        self.append_with(stream, record, now, Append::default()).map_err(|e| match e {
+            AppendError::Full => AegisError::new(ErrorCode::Conflict, "this history stream is full"),
+            AppendError::Failed(e) => e,
+        })
+    }
+
+    /// Seals one record as `how` says.
+    pub(crate) fn append_with(&self, stream: &str, record: &Value, now: DateTime<Utc>, how: Append) -> Result<(), AppendError> {
         let mut streams = self.streams();
         let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet; unlock AegisWin once"))?;
-        let dir = self.dir(stream);
-        let writer = slot.writer.get_or_insert_with(|| SegmentWriter::new(dir, stream, slot.key.clone(), slot.retention));
-        writer.append(record, now).map_err(io_err)
+        let writer = slot.writer(self.dir(stream), stream);
+        if how.chained && !writer.is_chained() {
+            return Err(AppendError::Failed(AegisError::new(ErrorCode::VaultLocked, "the approval record is not ready; unlock AegisWin once")));
+        }
+        if let Some(limit) = how.limit {
+            if writer.stream_bytes().map_err(io_err)? >= limit {
+                return Err(AppendError::Full);
+            }
+        }
+        writer.append(record, now).map_err(io_err)?;
+        if how.sync {
+            writer.sync().map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Bytes in a stream's files, when it has a writer.
+    pub(crate) fn bytes(&self, stream: &str) -> Option<u64> {
+        self.streams().get_mut(stream)?.writer.as_mut()?.stream_bytes().ok()
+    }
+
+    /// The chain's last record, when the stream is chained in this run.
+    pub(crate) fn chain_head(&self, stream: &str) -> Option<Head> {
+        let mut streams = self.streams();
+        Some(streams.get_mut(stream)?.writer.as_mut()?.chain_mut()?.head().clone())
+    }
+
+    /// Closes the stream's file and moves to a new MAC session. A stream
+    /// not yet chained in this run starts from `head`, worked out under the
+    /// same lock so no record lands in between. Returns the chain's head.
+    pub(crate) fn turn_session(&self, stream: &str, session: Session, head: impl FnOnce() -> AegisResult<Head>) -> AegisResult<Head> {
+        let mut streams = self.streams();
+        let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet"))?;
+        let writer = slot.writer(self.dir(stream), stream);
+        writer.close().map_err(io_err)?;
+        match writer.chain_mut() {
+            Some(chain) => {
+                chain.set_session(session);
+                Ok(chain.head().clone())
+            }
+            None => {
+                let head = head()?;
+                writer.set_chain(ChainWriter::new(head.clone(), session));
+                Ok(head)
+            }
+        }
+    }
+
+    /// Starts the stream's chain again from nothing (after a purge).
+    pub(crate) fn restart_chain(&self, stream: &str, session: Session) -> AegisResult<()> {
+        let mut streams = self.streams();
+        let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet"))?;
+        slot.writer(self.dir(stream), stream).set_chain(ChainWriter::new(Head::genesis(), session));
+        Ok(())
     }
 
     /// Forces every stream's pending frames to disk once 30 seconds have passed.
@@ -216,9 +307,10 @@ impl HistoryService {
 
     /// Syncs and closes every open file. Called on lock, so the HPKE
     /// context in memory while locked never covers frames written before.
+    /// The writers stay, so a chained stream carries on from where it was.
     pub(crate) fn close_all(&self) {
         for slot in self.streams().values_mut() {
-            if let Some(mut w) = slot.writer.take() {
+            if let Some(w) = slot.writer.as_mut() {
                 let _ = w.close();
             }
         }
@@ -233,6 +325,53 @@ impl HistoryService {
         history::read_stream_since(&self.dir(stream), stream, key, since).map_err(io_err)
     }
 
+    /// Reads a stream file by file, checking MACs with `macs`. Also names
+    /// the file still open, which has no `close` frame yet.
+    pub(crate) fn read_files(&self, stream: &str, key: &StreamKey, since: Option<NaiveDate>, macs: &mut MacCheck) -> AegisResult<(Vec<FileRead>, Option<String>)> {
+        let mut streams = self.streams();
+        let writer = streams.get_mut(stream).and_then(|s| s.writer.as_mut());
+        let current = match writer {
+            Some(w) => {
+                w.sync().map_err(io_err)?;
+                w.current_name().map(str::to_owned)
+            }
+            None => None,
+        };
+        Ok((history::read_files(&self.dir(stream), stream, key, since, Some(macs)).map_err(io_err)?, current))
+    }
+
+    /// Retention for a chained stream (ADR 0004 §4.3): each file started
+    /// before `oldest` is read, a `pruned` record naming its range and last
+    /// hash is written and synced, and only then is the file deleted.
+    pub(crate) fn prune_chained(&self, stream: &str, key: &StreamKey, oldest: NaiveDate, now: DateTime<Utc>) -> AegisResult<usize> {
+        let mut streams = self.streams();
+        let dir = self.dir(stream);
+        let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet"))?;
+        let writer = slot.writer(dir.clone(), stream);
+        if !writer.is_chained() {
+            return Ok(0);
+        }
+        let keep = writer.current_name().map(str::to_owned);
+        let mut removed = 0;
+        for name in history::files_before(&dir, oldest, keep.as_deref()).map_err(io_err)? {
+            let file = history::read_named(&dir, &name, stream, key, None).map_err(io_err)?;
+            let last = file.frames.iter().filter_map(|f| Some((f.record.get("seq")?.as_u64()?, f))).max_by_key(|(seq, _)| *seq);
+            let first = file.frames.iter().filter_map(|f| f.record.get("seq")?.as_u64()).min();
+            let mut record = serde_json::json!({ "event": "pruned", "segment": name, "records": file.frames.len(), "at": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) });
+            if let (Some(from), Some((to, frame))) = (first, last) {
+                record["from"] = from.into();
+                record["to"] = to.into();
+                record["lastHash"] = hex::encode(frame.hash).into();
+            }
+            writer.append(&record, now).map_err(io_err)?;
+            writer.sync().map_err(io_err)?;
+            std::fs::remove_file(dir.join(&name)).map_err(io_err)?;
+            writer.forget_size();
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Switches the stream to `key` and deletes every file, in one step, so
     /// no record lands in between under the old key.
     pub(crate) fn purge(&self, stream: &str, key: PublicStreamKey, retention: Retention) -> AegisResult<usize> {
@@ -245,6 +384,10 @@ impl HistoryService {
     /// Applies retention to every stream with a known key (at startup and unlock).
     pub(crate) fn enforce_retention(&self, now: DateTime<Utc>) {
         for (stream, slot) in self.streams().iter() {
+            // A chained stream is pruned by the engine, which records what it removes.
+            if stream == APPROVALS_STREAM || slot.writer.as_ref().is_some_and(SegmentWriter::is_chained) {
+                continue;
+            }
             let keep = slot.writer.as_ref().and_then(|w| w.current_file()).map(Path::to_path_buf);
             let _ = history::enforce_retention(&self.dir(stream), slot.retention, now, keep.as_deref());
         }

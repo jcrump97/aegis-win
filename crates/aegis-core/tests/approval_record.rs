@@ -136,7 +136,10 @@ async fn reading_and_deleting_the_record_need_the_pin() {
     assert_eq!(record(&f).await.len(), 2);
 
     assert!(f.engine.delete_approval_record(PIN).await.unwrap() >= 1);
-    assert!(record(&f).await.is_empty(), "deleted");
+    let events = record(&f).await;
+    assert_eq!(events.len(), 1, "deleted, leaving only the note that it was: {events:?}");
+    assert_eq!(events[0]["event"], "purged");
+    assert!(integrity(&f).await["ok"].as_bool().unwrap(), "a purge is an authorised gap");
     // Recording goes on, under the new key.
     let t = mcp_fix(&f, "y").await;
     assert_eq!(of(&record(&f).await, &t.ticket_id), ["created"]);
@@ -162,8 +165,12 @@ async fn locking_records_the_requests_it_forgets() {
     let events = record(&f).await;
     assert_eq!(of(&events, &pending.ticket_id), ["created", "cancelled"]);
     assert_eq!(find(&events, &pending.ticket_id, "cancelled")["from"], "lock");
-    assert_eq!(of(&events, &running.ticket_id), ["created", "decided", "change_started", "cancelled", "change_finished"]);
+    assert_eq!(of(&events, &running.ticket_id), ["created", "decided", "change_started", "cancelled", "change_finished", "finished"]);
     assert_eq!(find(&events, &running.ticket_id, "change_finished")["outcome"], "succeeded");
+    // Written by the run task from its own copy, after lock cleared the store (ADR 0004 §4.7).
+    let finished = find(&events, &running.ticket_id, "finished");
+    assert_eq!((finished["status"].as_str(), finished["afterLock"].as_bool()), (Some("approved"), Some(true)));
+    assert!(integrity(&f).await["ok"].as_bool().unwrap(), "records written while locked carry valid MACs");
 }
 
 #[tokio::test]
@@ -173,6 +180,136 @@ async fn a_large_argument_is_recorded_by_size() {
     let events = record(&f).await;
     let args = &find(&events, &t.ticket_id, "created")["args"];
     assert!(args["omitted"].as_str().unwrap().ends_with("bytes of arguments"), "{args}");
+}
+
+/// The integrity part of the record's view.
+async fn integrity(f: &Fixture) -> Value {
+    f.engine.approval_record(PIN, 90).await.unwrap()["integrity"].clone()
+}
+
+fn approvals_dir(f: &Fixture) -> std::path::PathBuf {
+    f.engine.data_dir().join("history").join("approvals")
+}
+
+fn segment_files(f: &Fixture) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(approvals_dir(f)).unwrap().map(|e| e.unwrap().path()).collect();
+    files.sort();
+    files
+}
+
+/// Locks and unlocks, which closes the record's file and checkpoints it.
+async fn relock(f: &Fixture) {
+    f.engine.lock().await;
+    f.engine.unlock(PIN.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_record_verifies_and_says_when_a_file_was_deleted() {
+    let f = ready().await;
+    for note in ["a", "b", "c"] {
+        let t = mcp_fix(&f, note).await;
+        f.engine.cancel_ticket(&t.ticket_id).unwrap();
+        relock(&f).await;
+    }
+    let v = integrity(&f).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v["line"].as_str().unwrap().starts_with("Verified: "), "{v}");
+    let view = f.engine.approval_record(PIN, 1).await.unwrap();
+    let events = view["events"].as_array().unwrap();
+    assert!(events.iter().all(|e| e["seq"].is_u64() && e.get("prev").is_none() && e.get("mi").is_none()), "seq is shown, the chain's other fields are not");
+    assert!(events.iter().all(|e| e["event"] != "open" && e["event"] != "close"), "file frames are not events");
+
+    // A whole closed file deleted outside AegisWin: a gap in the middle.
+    let files = segment_files(&f);
+    assert_eq!(files.len(), 3, "{files:?}");
+    std::fs::remove_file(&files[1]).unwrap();
+    let v = integrity(&f).await;
+    assert_eq!(v["ok"], false);
+    let line = v["line"].as_str().unwrap();
+    assert!(line.starts_with("Events ") && line.ends_with(" are missing (removed outside AegisWin)."), "{line}");
+
+    // The finding is written into the record once, for later readers.
+    let noted = |events: &[Value]| events.iter().filter(|e| e["event"] == "integrity").count();
+    assert_eq!(noted(&record(&f).await), 1);
+    assert_eq!(noted(&record(&f).await), 1, "not again on the next read");
+}
+
+#[tokio::test]
+async fn cutting_the_record_short_after_the_last_checkpoint_shows() {
+    let f = ready().await;
+    let t = mcp_fix(&f, "a").await;
+    f.engine.cancel_ticket(&t.ticket_id).unwrap();
+    f.engine.lock().await;
+    // While locked, the newest file goes: the vault's checkpoint still knows its last event.
+    let files = segment_files(&f);
+    std::fs::remove_file(files.last().unwrap()).unwrap();
+    f.engine.unlock(PIN.into()).await.unwrap();
+    let v = integrity(&f).await;
+    let line = v["line"].as_str().unwrap();
+    assert!(line.contains("missing") || line.contains("cut short"), "{line}");
+    assert_eq!(v["ok"], false);
+}
+
+#[tokio::test]
+async fn retention_records_what_it_removes() {
+    let f = ready().await;
+    let t = mcp_fix(&f, "old").await;
+    f.engine.cancel_ticket(&t.ticket_id).unwrap();
+    relock(&f).await;
+    let t = mcp_fix(&f, "new").await;
+    f.engine.cancel_ticket(&t.ticket_id).unwrap();
+    // Make the first file 100 days old: its name carries its day.
+    let first = segment_files(&f)[0].clone();
+    let old_day = (Utc::now().date_naive() - chrono::Days::new(100)).format("%Y%m%d");
+    std::fs::rename(&first, approvals_dir(&f).join(format!("seg-{old_day}-001.bin"))).unwrap();
+
+    let kept = f.engine.set_approval_retention(PIN, 30).await.unwrap();
+    assert_eq!(kept.max_days, 30);
+    assert_eq!(f.engine.set_approval_retention("000000", 30).await.unwrap_err().code, ErrorCode::PinInvalid);
+    assert_eq!(f.engine.set_approval_retention(PIN, 0).await.unwrap_err().code, ErrorCode::InvalidArguments);
+    assert!(!segment_files(&f).iter().any(|p| p.to_string_lossy().contains(&old_day.to_string())), "the old file is gone");
+    let events = record(&f).await;
+    let pruned = events.iter().find(|e| e["event"] == "pruned").expect("a pruned record");
+    assert!(pruned["to"].as_u64().unwrap() >= 2 && pruned["lastHash"].is_string(), "{pruned}");
+    let v = integrity(&f).await;
+    assert_eq!(v["ok"], true, "a gap retention recorded is not tampering: {v}");
+    assert_eq!(f.engine.approval_record(PIN, 1).await.unwrap()["retention"]["maxDays"], 30);
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_written_fails_closed_for_changes() {
+    let f = ready().await;
+    let waiting = mcp_fix(&f, "held").await;
+    let other = mcp_fix(&f, "other").await;
+
+    // Full for new requests: agents are refused, and the app says why.
+    f.engine.set_approval_record_limits(0, u64::MAX);
+    let err = f.engine.run_tool(Origin::Mcp, "demo", "fix", json!({ "note": "x" })).await.unwrap_err();
+    assert_eq!(err.message, "The approval record is full. Open AegisWin.");
+    assert!(f.engine.status().approval_record_full);
+    assert_eq!(f.engine.list_tickets().len(), 2, "the refused request is not kept");
+
+    // Nothing can be written now.
+    f.engine.set_approval_record_limits(0, 0);
+    let err = f.engine.decide_ticket(&waiting.ticket_id, true, PIN.into(), None, "app").await.unwrap_err();
+    assert!(err.message.contains("approval record"), "{err:?}");
+    assert_eq!(f.engine.ticket(&waiting.ticket_id).unwrap().status, TicketStatus::PendingApproval, "an approval not recorded is not applied");
+    let err = f.engine.run_tool(Origin::Ui { pin: Some(PIN.into()) }, "demo", "fix", json!({ "note": "direct" })).await.unwrap_err();
+    assert!(err.message.contains("did not run"), "{err:?}");
+    assert!(f.plugin.started.lock().unwrap().is_empty(), "the change did not run");
+    // A decline still happens, and waits in memory to be written.
+    f.engine.decide_ticket(&other.ticket_id, false, PIN.into(), None, "app").await.unwrap();
+    assert_eq!(f.engine.ticket(&other.ticket_id).unwrap().status, TicketStatus::Declined);
+    assert_eq!(f.engine.status().unwritten_records, 1);
+
+    // Writable again: the held event goes in first.
+    f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    f.engine.cancel_ticket(&waiting.ticket_id).unwrap();
+    assert_eq!(f.engine.status().unwritten_records, 0);
+    let events = record(&f).await;
+    assert_eq!(of(&events, &other.ticket_id), ["created", "decided"]);
+    assert_eq!(of(&events, &waiting.ticket_id), ["created", "cancelled"]);
+    assert!(integrity(&f).await["ok"].as_bool().unwrap());
 }
 
 fn t(h: u32, m: u32) -> DateTime<Utc> {

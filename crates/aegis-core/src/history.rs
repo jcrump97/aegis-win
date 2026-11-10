@@ -13,6 +13,13 @@
 //! reordered. One HPKE context covers one file and is dropped when the file
 //! closes; the writer closes the file on lock, so the context held while
 //! locked never covers frames written before.
+//!
+//! A chained stream (the `approvals` record, ADR 0004 §4) writes format 2
+//! files: each frame's plaintext is the record's JSON with its chain fields,
+//! followed by a 32-byte MAC ([`crate::chain`]). Such a file starts with an
+//! `open` frame and, when closed cleanly, ends with a `close` frame. Format 1
+//! files (plain JSON frames) are still read, as records from before the
+//! integrity checks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -29,6 +36,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::chain::{self, ChainWriter, Head, MacCheck};
 use crate::secret::Secret;
 
 type Kem = X25519HkdfSha256;
@@ -39,7 +47,10 @@ type PrivateKey = <Kem as hpke::Kem>::PrivateKey;
 type EncappedKey = <Kem as hpke::Kem>::EncappedKey;
 
 const MAGIC: &[u8; 4] = b"AGHS";
-const FORMAT_VERSION: u8 = 1;
+/// Plain JSON frames.
+const FORMAT_PLAIN: u8 = 1;
+/// Chained frames: JSON with `seq`, `prev`, `sess` and `mi`, then a MAC.
+const FORMAT_CHAINED: u8 = 2;
 const KEY_ID_LEN: usize = 8;
 const ENC_LEN: usize = 32;
 const HEADER_LEN: usize = MAGIC.len() + 1 + KEY_ID_LEN + ENC_LEN;
@@ -117,7 +128,9 @@ fn invalid(msg: &str) -> io::Error {
 
 /// HPKE `info`: binds a file's context to its stream and key.
 fn info(stream: &str, key_id: &str) -> Vec<u8> {
-    format!("aegis-win history v{FORMAT_VERSION}|{stream}|{key_id}").into_bytes()
+    // Both formats share this label; the header, which holds the version,
+    // is bound into every frame's additional data.
+    format!("aegis-win history v1|{stream}|{key_id}").into_bytes()
 }
 
 fn frame_aad(header_hash: &[u8; 32], index: u64) -> [u8; 40] {
@@ -213,6 +226,7 @@ fn segments(dir: &Path) -> io::Result<Vec<(SegmentName, PathBuf, u64)>> {
 struct OpenSegment {
     file: File,
     path: PathBuf,
+    name: String,
     day: NaiveDate,
     ctx: AeadCtxS<Aead, Kdf, Kem>,
     header_hash: [u8; 32],
@@ -229,11 +243,48 @@ pub struct SegmentWriter {
     retention: Retention,
     open: Option<OpenSegment>,
     last_sync: Instant,
+    /// Set for a chained stream, which also skips retention here: the
+    /// engine prunes it while unlocked, recording what it removed.
+    chain: Option<ChainWriter>,
+    /// Bytes in the stream's files, counted once and then kept up to date.
+    total: Option<u64>,
+}
+
+fn stamp(now: DateTime<Utc>) -> String {
+    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl SegmentWriter {
     pub fn new(dir: impl Into<PathBuf>, stream: &str, key: PublicStreamKey, retention: Retention) -> Self {
-        Self { dir: dir.into(), stream: stream.to_owned(), key, retention, open: None, last_sync: Instant::now() }
+        Self { dir: dir.into(), stream: stream.to_owned(), key, retention, open: None, last_sync: Instant::now(), chain: None, total: None }
+    }
+
+    /// Makes this a chained stream, continuing from `chain`'s head.
+    pub fn set_chain(&mut self, chain: ChainWriter) {
+        self.chain = Some(chain);
+    }
+
+    pub fn chain_mut(&mut self) -> Option<&mut ChainWriter> {
+        self.chain.as_mut()
+    }
+
+    pub fn is_chained(&self) -> bool {
+        self.chain.is_some()
+    }
+
+    /// Bytes in the stream's files, including frames not yet synced.
+    pub fn stream_bytes(&mut self) -> io::Result<u64> {
+        if let Some(total) = self.total {
+            return Ok(total);
+        }
+        let total = segments(&self.dir)?.iter().map(|(.., b)| b).sum();
+        self.total = Some(total);
+        Ok(total)
+    }
+
+    /// Counts the files again next time (after files were deleted).
+    pub fn forget_size(&mut self) {
+        self.total = None;
     }
 
     pub fn key(&self) -> &PublicStreamKey {
@@ -247,23 +298,37 @@ impl SegmentWriter {
     /// Seals one record. Starts a new file on a new UTC day, when the file is
     /// full, or after [`Self::close`]; retention runs whenever a file starts.
     pub fn append(&mut self, record: &Value, now: DateTime<Utc>) -> io::Result<()> {
-        let plaintext = Zeroizing::new(serde_json::to_vec(record).map_err(|e| invalid(&e.to_string()))?);
-        if plaintext.len() > MAX_RECORD_BYTES {
+        if serde_json::to_vec(record).map_err(|e| invalid(&e.to_string()))?.len() > MAX_RECORD_BYTES {
             return Err(invalid("history record is too large"));
         }
         let day = now.date_naive();
         let rotate = self.open.as_ref().is_none_or(|o| o.day != day || o.bytes >= MAX_SEGMENT_BYTES);
         if rotate {
             self.close()?;
-            self.open = Some(self.start(day, now)?);
+            self.start(day, now)?;
         }
-        let seg = self.open.as_mut().expect("a segment was just opened");
+        self.write(record)?;
+        if self.last_sync.elapsed() >= SYNC_EVERY {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Seals one frame into the open file. A chained stream's state moves on
+    /// only once the frame is written, so a failed write leaves no gap.
+    fn write(&mut self, record: &Value) -> io::Result<()> {
+        let seg = self.open.as_mut().ok_or_else(|| invalid("no history file is open"))?;
+        let sealed = self.chain.as_ref().map(|c| c.seal(record)).transpose()?;
+        let plaintext = match &sealed {
+            Some(s) => s.plaintext.clone(),
+            None => Zeroizing::new(serde_json::to_vec(record).map_err(|e| invalid(&e.to_string()))?),
+        };
         let aad = frame_aad(&seg.header_hash, seg.index);
-        let sealed = seg.ctx.seal(&plaintext, &aad).map_err(|e| invalid(&format!("sealing failed: {e}")))?;
-        let len = u32::try_from(sealed.len()).map_err(|_| invalid("frame too large"))?;
-        let mut frame = Vec::with_capacity(4 + sealed.len());
+        let ciphertext = seg.ctx.seal(&plaintext, &aad).map_err(|e| invalid(&format!("sealing failed: {e}")))?;
+        let len = u32::try_from(ciphertext.len()).map_err(|_| invalid("frame too large"))?;
+        let mut frame = Vec::with_capacity(4 + ciphertext.len());
         frame.extend_from_slice(&len.to_le_bytes());
-        frame.extend_from_slice(&sealed);
+        frame.extend_from_slice(&ciphertext);
         if let Err(e) = seg.file.write_all(&frame) {
             // A partly written frame would misalign every later one: drop
             // this file (its tail reads as torn) and start a new one next time.
@@ -273,13 +338,16 @@ impl SegmentWriter {
         seg.index += 1;
         seg.bytes += frame.len() as u64;
         seg.dirty = true;
-        if self.last_sync.elapsed() >= SYNC_EVERY {
-            self.sync()?;
+        if let Some(total) = self.total.as_mut() {
+            *total += frame.len() as u64;
+        }
+        if let (Some(chain), Some(sealed)) = (self.chain.as_mut(), sealed) {
+            chain.commit(sealed);
         }
         Ok(())
     }
 
-    fn start(&mut self, day: NaiveDate, now: DateTime<Utc>) -> io::Result<OpenSegment> {
+    fn start(&mut self, day: NaiveDate, now: DateTime<Utc>) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         let next = segments(&self.dir)?.iter().filter(|(n, ..)| n.day == day).map(|(n, ..)| n.n + 1).max().unwrap_or(1);
         let name = SegmentName { day, n: next };
@@ -289,7 +357,7 @@ impl SegmentWriter {
             .map_err(|e| invalid(&format!("HPKE setup failed: {e}")))?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
-        header.push(FORMAT_VERSION);
+        header.push(if self.chain.is_some() { FORMAT_CHAINED } else { FORMAT_PLAIN });
         header.extend_from_slice(&hex::decode(&self.key.key_id).map_err(|_| invalid("key id is not hex"))?);
         header.extend_from_slice(&enc.to_bytes());
         debug_assert_eq!(header.len(), HEADER_LEN);
@@ -297,9 +365,20 @@ impl SegmentWriter {
         file.write_all(&header)?;
         file.sync_data()?;
         let header_hash: [u8; 32] = Sha256::digest(&header).into();
-        // Retention never removes the file just started.
-        let _ = enforce_retention(&self.dir, self.retention, now, Some(&path));
-        Ok(OpenSegment { file, path, day, ctx, header_hash, index: 0, bytes: HEADER_LEN as u64, dirty: false })
+        if let Some(total) = self.total.as_mut() {
+            *total += HEADER_LEN as u64;
+        }
+        if self.chain.is_none() {
+            // Retention never removes the file just started.
+            let _ = enforce_retention(&self.dir, self.retention, now, Some(&path));
+            self.forget_size();
+        }
+        let name = name.file_name();
+        self.open = Some(OpenSegment { file, path, name: name.clone(), day, ctx, header_hash, index: 0, bytes: HEADER_LEN as u64, dirty: false });
+        if self.chain.is_some() {
+            self.write(&serde_json::json!({ "event": "open", "segment": name, "at": stamp(now) }))?;
+        }
+        Ok(())
     }
 
     /// Syncs when [`SYNC_EVERY`] has passed since the last sync, so frames
@@ -322,8 +401,13 @@ impl SegmentWriter {
     }
 
     /// Syncs and closes the current file, dropping its HPKE context. The
-    /// next record starts a new file.
+    /// next record starts a new file. A chained file gets its `close` frame
+    /// first; if that cannot be written, the file reads as not closed.
     pub fn close(&mut self) -> io::Result<()> {
+        if let Some(seg) = self.open.as_ref().filter(|_| self.chain.is_some()) {
+            let close = serde_json::json!({ "event": "close", "segment": seg.name, "records": seg.index, "at": stamp(Utc::now()) });
+            let _ = self.write(&close);
+        }
         let result = self.sync();
         self.open = None;
         result
@@ -332,6 +416,11 @@ impl SegmentWriter {
     /// The file being written, if any.
     pub fn current_file(&self) -> Option<&Path> {
         self.open.as_ref().map(|s| s.path.as_path())
+    }
+
+    /// The name of the file being written, if any.
+    pub fn current_name(&self) -> Option<&str> {
+        self.open.as_ref().map(|s| s.name.as_str())
     }
 }
 
@@ -367,6 +456,34 @@ pub struct FileReport {
     pub bytes: u64,
 }
 
+/// One record as read, with what the integrity check needs.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub record: Value,
+    /// SHA-256 of the frame's whole plaintext (the next record's `prev`).
+    pub hash: [u8; 32],
+    /// Whether a chained frame's MAC checked out; `None` for format 1, or
+    /// when read without the session keys.
+    pub mac_ok: Option<bool>,
+}
+
+/// One file as read.
+#[derive(Debug, Clone)]
+pub struct FileRead {
+    pub name: String,
+    pub status: FileStatus,
+    /// A format 2 (chained) file.
+    pub chained: bool,
+    pub bytes: u64,
+    pub frames: Vec<Frame>,
+}
+
+impl FileRead {
+    pub fn report(&self) -> FileReport {
+        FileReport { name: self.name.clone(), status: self.status, records: self.frames.len(), bytes: self.bytes }
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamRead {
@@ -383,61 +500,117 @@ pub fn read_stream(dir: &Path, stream: &str, key: &StreamKey) -> io::Result<Stre
 /// Like [`read_stream`], but skips files started before `since` (UTC day).
 /// A file holds records from its own day only, so nothing later is missed.
 pub fn read_stream_since(dir: &Path, stream: &str, key: &StreamKey, since: Option<NaiveDate>) -> io::Result<StreamRead> {
-    let sk = key.private()?;
     let mut out = StreamRead::default();
-    for (name, path, bytes) in segments(dir)? {
-        if since.is_some_and(|day| name.day < day) {
-            continue;
-        }
-        let (status, records) = match fs::read(&path) {
-            Ok(raw) => read_segment(&raw, stream, key, &sk),
-            Err(_) => (FileStatus::Unreadable, Vec::new()),
-        };
-        out.files.push(FileReport { name: name.file_name(), status, records: records.len(), bytes });
-        out.records.extend(records);
+    for file in read_files(dir, stream, key, since, None)? {
+        out.files.push(file.report());
+        out.records.extend(file.frames.into_iter().map(|f| f.record));
     }
     Ok(out)
 }
 
-fn read_segment(raw: &[u8], stream: &str, key: &StreamKey, sk: &PrivateKey) -> (FileStatus, Vec<Value>) {
-    if raw.len() < HEADER_LEN || &raw[..4] != MAGIC || raw[4] != FORMAT_VERSION {
-        return (FileStatus::Unreadable, Vec::new());
+/// Reads every file of a stream (from `since`), file by file, checking
+/// chained frames' MACs when `macs` is given.
+pub fn read_files(dir: &Path, stream: &str, key: &StreamKey, since: Option<NaiveDate>, mut macs: Option<&mut MacCheck>) -> io::Result<Vec<FileRead>> {
+    let sk = key.private()?;
+    let mut out = Vec::new();
+    for (name, path, bytes) in segments(dir)? {
+        if since.is_some_and(|day| name.day < day) {
+            continue;
+        }
+        out.push(read_file(&path, name.file_name(), bytes, stream, key, &sk, macs.as_deref_mut()));
     }
+    Ok(out)
+}
+
+fn read_file(path: &Path, name: String, bytes: u64, stream: &str, key: &StreamKey, sk: &PrivateKey, macs: Option<&mut MacCheck>) -> FileRead {
+    let (status, chained, frames) = match fs::read(path) {
+        Ok(raw) => read_segment(&raw, stream, key, sk, macs),
+        Err(_) => (FileStatus::Unreadable, false, Vec::new()),
+    };
+    FileRead { name, status, chained, bytes, frames }
+}
+
+/// The last record of a chained stream whose MAC checks out, newest file
+/// first, so the writer can carry on from it after a restart.
+pub fn chain_tail(dir: &Path, stream: &str, key: &StreamKey, macs: &mut MacCheck) -> io::Result<Option<Head>> {
+    let sk = key.private()?;
+    for (name, path, bytes) in segments(dir)?.into_iter().rev() {
+        let file = read_file(&path, name.file_name(), bytes, stream, key, &sk, Some(macs));
+        if !file.chained {
+            continue;
+        }
+        let tail = file.frames.iter().rev().filter(|f| f.mac_ok == Some(true)).find_map(|f| Some(Head { seq: f.record.get("seq")?.as_u64()?, hash: hex::encode(f.hash) }));
+        if tail.is_some() {
+            return Ok(tail);
+        }
+    }
+    Ok(None)
+}
+
+/// Segment files of a stream started before `oldest` (UTC day), oldest
+/// first, except `keep`.
+pub fn files_before(dir: &Path, oldest: NaiveDate, keep: Option<&str>) -> io::Result<Vec<String>> {
+    Ok(segments(dir)?.into_iter().filter(|(n, ..)| n.day < oldest).map(|(n, ..)| n.file_name()).filter(|n| Some(n.as_str()) != keep).collect())
+}
+
+/// Reads one named file of a stream.
+pub fn read_named(dir: &Path, name: &str, stream: &str, key: &StreamKey, macs: Option<&mut MacCheck>) -> io::Result<FileRead> {
+    let sk = key.private()?;
+    let path = dir.join(name);
+    let bytes = fs::metadata(&path)?.len();
+    Ok(read_file(&path, name.to_owned(), bytes, stream, key, &sk, macs))
+}
+
+fn read_segment(raw: &[u8], stream: &str, key: &StreamKey, sk: &PrivateKey, mut macs: Option<&mut MacCheck>) -> (FileStatus, bool, Vec<Frame>) {
+    if raw.len() < HEADER_LEN || &raw[..4] != MAGIC || !matches!(raw[4], FORMAT_PLAIN | FORMAT_CHAINED) {
+        return (FileStatus::Unreadable, false, Vec::new());
+    }
+    let chained = raw[4] == FORMAT_CHAINED;
     if hex::encode(&raw[5..5 + KEY_ID_LEN]) != key.key_id {
-        return (FileStatus::OtherKey, Vec::new());
+        return (FileStatus::OtherKey, chained, Vec::new());
     }
     let header = &raw[..HEADER_LEN];
     let Ok(enc) = EncappedKey::from_bytes(&header[5 + KEY_ID_LEN..]) else {
-        return (FileStatus::Unreadable, Vec::new());
+        return (FileStatus::Unreadable, chained, Vec::new());
     };
     let Ok(mut ctx) = hpke::setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, sk, &enc, &info(stream, &key.key_id)) else {
-        return (FileStatus::Unreadable, Vec::new());
+        return (FileStatus::Unreadable, chained, Vec::new());
     };
     let header_hash: [u8; 32] = Sha256::digest(header).into();
-    let mut records = Vec::new();
+    let mut records: Vec<Frame> = Vec::new();
     let mut at = HEADER_LEN;
     let mut index = 0u64;
     while at < raw.len() {
         let rest = &raw[at..];
         if rest.len() < 4 {
-            return (FileStatus::Truncated, records);
+            return (FileStatus::Truncated, chained, records);
         }
         let len = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
         if rest.len() - 4 < len {
-            return (FileStatus::Truncated, records);
+            return (FileStatus::Truncated, chained, records);
         }
         let last = rest.len() - 4 == len;
         let opened = ctx.open(&rest[4..4 + len], &frame_aad(&header_hash, index)).ok().map(Zeroizing::new);
-        let record = opened.and_then(|plain| serde_json::from_slice::<Value>(&plain).ok());
-        match record {
-            Some(record) => records.push(record),
-            None if last => return (FileStatus::Truncated, records),
-            None => return (FileStatus::Corrupt, records),
+        let frame = opened.and_then(|plain| {
+            let hash: [u8; 32] = Sha256::digest(plain.as_slice()).into();
+            if chained {
+                let (body, tag) = chain::split_frame(&plain)?;
+                let record = serde_json::from_slice::<Value>(body).ok()?;
+                let mac_ok = macs.as_deref_mut().map(|m| m.check(&record, body, tag));
+                Some(Frame { record, hash, mac_ok })
+            } else {
+                Some(Frame { record: serde_json::from_slice::<Value>(&plain).ok()?, hash, mac_ok: None })
+            }
+        });
+        match frame {
+            Some(frame) => records.push(frame),
+            None if last => return (FileStatus::Truncated, chained, records),
+            None => return (FileStatus::Corrupt, chained, records),
         }
         at += 4 + len;
         index += 1;
     }
-    (FileStatus::Ok, records)
+    (FileStatus::Ok, chained, records)
 }
 
 /// Deletes the oldest files until the stream is within its limits. Needs no
@@ -653,6 +826,45 @@ mod tests {
         for bad in ["seg-2026110-001.bin", "seg-20261108-.bin", "seg-20261108-0a1.bin", "x.bin", "seg-20261340-001.bin"] {
             assert!(SegmentName::parse(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_chained_stream_writes_open_and_close_frames_and_macs_check_against_the_vault() {
+        use crate::chain::{ChainVault, Session};
+        let dir = tempfile::tempdir().unwrap();
+        let key = StreamKey::generate();
+        let (session, id, stored) = Session::start("2026-11-08");
+        let mut vault = ChainVault::default();
+        vault.add_session(id, stored, "2026-11-08");
+        let mut w = SegmentWriter::new(dir.path(), "approvals", key.public(), Retention::APPROVALS_DEFAULT);
+        w.set_chain(ChainWriter::new(Head::genesis(), session));
+        w.append(&json!({ "event": "created" }), at(8, 10)).unwrap();
+        w.close().unwrap();
+        w.append(&json!({ "event": "decided" }), at(8, 11)).unwrap();
+        assert_eq!(w.current_name(), Some("seg-20261108-002.bin"));
+
+        let files = read_files(dir.path(), "approvals", &key, None, Some(&mut MacCheck::new(Some(&vault)))).unwrap();
+        let events: Vec<Vec<&str>> = files.iter().map(|f| f.frames.iter().map(|fr| fr.record["event"].as_str().unwrap()).collect()).collect();
+        assert_eq!(events, [vec!["open", "created", "close"], vec!["open", "decided"]]);
+        assert!(files.iter().all(|f| f.chained && f.frames.iter().all(|fr| fr.mac_ok == Some(true))));
+        assert_eq!(files[0].frames[2].record["records"], 2, "close counts the frames before it");
+        let integrity = crate::chain::verify(&files, Some(&w.chain_mut().unwrap().head().checkpoint()), w.current_name());
+        assert!(integrity.ok(), "{integrity:?}");
+        assert_eq!(chain_tail(dir.path(), "approvals", &key, &mut MacCheck::new(Some(&vault))).unwrap().map(|h| h.seq), Some(5));
+
+        // Someone with only the public key seals a file: it does not check out.
+        let (forger, ..) = Session::start("2026-11-08");
+        let mut f = SegmentWriter::new(dir.path(), "approvals", key.public(), Retention::APPROVALS_DEFAULT);
+        f.set_chain(ChainWriter::new(Head { seq: 5, hash: crate::chain::GENESIS_HASH.into() }, forger));
+        f.append(&json!({ "event": "created" }), at(8, 12)).unwrap();
+        f.close().unwrap();
+        let files = read_files(dir.path(), "approvals", &key, None, Some(&mut MacCheck::new(Some(&vault)))).unwrap();
+        assert!(files[2].frames.iter().all(|fr| fr.mac_ok == Some(false)));
+        assert!(matches!(crate::chain::verify(&files, None, None).problems.as_slice(), [crate::chain::Problem::Unclosed { .. }, crate::chain::Problem::Forged { events: 3, .. }]));
+        // The tail ignores forged frames.
+        assert_eq!(chain_tail(dir.path(), "approvals", &key, &mut MacCheck::new(Some(&vault))).unwrap().map(|h| h.seq), Some(5));
+        // Format 1 files still read, as before.
+        assert_eq!(read_stream(dir.path(), "approvals", &key).unwrap().records.len(), 8);
     }
 
     /// Known-answer test for exactly our suite: the CFRG HPKE test vector for

@@ -358,6 +358,11 @@ impl TicketStore {
     pub fn clear(&mut self) {
         self.tickets.clear();
     }
+
+    /// Forgets a request that was never recorded (ADR 0004 §4.6).
+    pub fn remove(&mut self, id: &str) {
+        self.tickets.remove(id);
+    }
 }
 
 #[cfg(test)]

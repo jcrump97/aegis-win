@@ -127,6 +127,7 @@ label.inline { display: flex; align-items: center; gap: 0.5rem; font-weight: 500
 
 .notice { border-left: 3px solid var(--warn); background: #1f1a0e; padding: 0.6rem 0.8rem; border-radius: 6px; }
 .notice.error { border-color: var(--danger); background: #230f12; }
+tr.unverified td { color: var(--danger); }
 .notice.ok { border-color: var(--ok); background: #0d2019; }
 
 /* Tool cards and results */
