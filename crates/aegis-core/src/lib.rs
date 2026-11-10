@@ -8,6 +8,7 @@ pub mod executor;
 pub mod history;
 pub mod history_service;
 pub mod llm;
+pub mod notify;
 pub mod mcp;
 pub mod os;
 pub mod plan;

@@ -107,6 +107,8 @@ Rules for the code:
 
 §1.3 is done on `security/request-limits`, with `Stop::Cancelled`: a place given up while it waited is told apart from a lock by the executor's epoch.
 
+The notices are done on `security/approval-notify`. Tauri does not expose the tray icon's Windows ID, so the balloon finds it with `Shell_NotifyIconGetRect` (a read-only lookup) on the icon's own window, then sets `NIF_INFO`. The tray tooltip now counts waiting requests and is cut to 127 UTF-16 units: before, a long running-tool name could fill all 128 units of `szTip` and leave no terminating zero.
+
 ### 1.3 Limits on how many requests agents can make
 
 Today there is one MCP bearer token per install. The limits apply per token, so they still work if more tokens are added later.

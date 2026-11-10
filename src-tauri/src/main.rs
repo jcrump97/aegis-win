@@ -15,7 +15,8 @@ use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
 use aegis_core::registry::{ExitReason, GatePolicy, Launch, Plugin, Registry};
 use aegis_core::plan::PlanOrigin;
-use aegis_core::tickets::TicketView;
+use aegis_core::notify::{self, Notifier};
+use aegis_core::tickets::{TicketStatus, TicketView};
 use aegis_core::{AegisError, ErrorCode};
 use serde::Serialize;
 use serde_json::Value;
@@ -59,15 +60,51 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+/// The tray tooltip: state, what runs, and how many requests wait. Cut to
+/// what Windows can show, since a long tool name would otherwise overflow it.
 fn tray_text(engine: &Engine) -> String {
     let unlocked = engine.status().unlocked;
     let state = if unlocked { "unlocked" } else { "locked" };
     let paused = if engine.monitoring_paused() { ", monitoring paused" } else { "" };
-    match engine.change_running() {
-        Some(tool) => format!("AegisWin: {state}, running {tool}{paused}"),
-        None if unlocked && engine.background_active() => format!("AegisWin: unlocked, monitors running{paused}"),
+    let waiting = match waiting_requests(engine).len() {
+        0 => String::new(),
+        1 => ", 1 request waiting".into(),
+        n => format!(", {n} requests waiting"),
+    };
+    notify::fit_tooltip(&match engine.change_running() {
+        Some(tool) => format!("AegisWin: {state}{waiting}{paused}, running {tool}"),
+        None if unlocked && engine.background_active() => format!("AegisWin: unlocked{waiting}, monitors running{paused}"),
         None if engine.locked_monitoring() => format!("AegisWin: locked, monitoring{paused}"),
-        None => format!("AegisWin: {state}{paused}"),
+        None => format!("AegisWin: {state}{waiting}{paused}"),
+    })
+}
+
+/// Agent requests waiting for the owner (not the owner's own plans).
+fn waiting_requests(engine: &Engine) -> Vec<String> {
+    engine
+        .list_tickets()
+        .into_iter()
+        .filter(|t| t.status == TicketStatus::PendingApproval && t.plan.as_ref().is_none_or(|p| p.origin == PlanOrigin::Agent))
+        .map(|t| t.ticket_id)
+        .collect()
+}
+
+/// Tells the owner about new requests when the window is not in front: a
+/// tray balloon while it is hidden or minimised, and a taskbar flash while it
+/// is not focused. The app's own toast and badge cover the rest.
+fn notify_waiting(app: &AppHandle, engine: &Engine, notifier: &mut Notifier) {
+    let Some(count) = notifier.tick(&waiting_requests(engine), Instant::now()) else { return };
+    let Some(window) = app.get_webview_window("main") else { return };
+    let hidden = !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false);
+    if hidden {
+        if let Some(tray) = app.tray_by_id("main") {
+            let text = notify::waiting_text(count);
+            let _ = tray.with_inner_tray_icon(move |inner| os::tray_balloon(inner.window_handle() as isize, "AegisWin: approval needed", &text));
+        }
+    }
+    if hidden || !window.is_focused().unwrap_or(false) {
+        // FlashWindowEx until the window comes to the front.
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
     }
 }
 
@@ -135,10 +172,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Every 5 seconds: idle auto-lock, and the tray tooltip shows the state.
+/// Every 5 seconds: idle auto-lock, notices about waiting requests, and the
+/// tray tooltip shows the state.
 fn start_idle_watch(app: AppHandle, engine: Arc<Engine>) {
+    let mut notifier = Notifier::default();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(5));
+        notify_waiting(&app, &engine, &mut notifier);
         tauri::async_runtime::block_on(engine.lock_if_idle(Instant::now()));
         // Flushes history frames to disk every 30 seconds, even when nothing new is written.
         engine.history_tick();

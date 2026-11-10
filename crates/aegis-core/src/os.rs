@@ -281,6 +281,34 @@ pub fn confirm(title: &str, text: &str) -> bool {
     unsafe { MessageBoxW(None, &text, &title, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
 }
 
+/// Shows a balloon from the tray icon that `tray_window` (the icon's own
+/// hidden window) owns. Windows only lets the owner of an icon show its
+/// balloon, and the tray library keeps the icon's ID private, so the ID is
+/// found with a read-only lookup first. Returns false when nothing was shown.
+/// Balloons need no Start-menu shortcut, unlike toasts (ADR 0004 §1.1).
+pub fn tray_balloon(tray_window: isize, title: &str, text: &str) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER};
+
+    fn fill<const N: usize>(dst: &mut [u16; N], text: &str) {
+        // Leaves room for the terminating zero; Windows cuts longer text anyway.
+        for (d, c) in dst.iter_mut().zip(text.encode_utf16().take(N - 1)) {
+            *d = c;
+        }
+    }
+
+    let hwnd = HWND(tray_window as *mut std::ffi::c_void);
+    let found = (0u32..64).find(|&id| {
+        let ident = NOTIFYICONIDENTIFIER { cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32, hWnd: hwnd, uID: id, ..Default::default() };
+        unsafe { Shell_NotifyIconGetRect(&ident) }.is_ok()
+    });
+    let Some(id) = found else { return false };
+    let mut data = NOTIFYICONDATAW { cbSize: size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: id, uFlags: NIF_INFO, dwInfoFlags: NIIF_INFO, ..Default::default() };
+    fill(&mut data.szInfoTitle, title);
+    fill(&mut data.szInfo, text);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool()
+}
+
 /// A short, stable name for an install: FNV-1a of its folder, case-insensitive.
 pub fn install_key(dir: &std::path::Path) -> String {
     let hash = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
@@ -677,6 +705,12 @@ pub mod eventlog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_balloon_needs_an_icon_of_its_own_window() {
+        // No window, so no icon is found and nothing is shown.
+        assert!(!tray_balloon(0, "AegisWin", "test"));
+    }
 
     #[test]
     fn a_second_copy_of_an_install_wakes_the_first_and_steps_aside() {
