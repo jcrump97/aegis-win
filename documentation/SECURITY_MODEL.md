@@ -88,7 +88,7 @@ AegisWin always starts `asInvoker`. Tools that need administrator rights report 
 - **Removal.** Turning it off deletes the file. Once the last monitor is deleted (in the app or by an approved agent request), the 5-second shell check deletes it within seconds, but only if it starts this copy. A copy whose folder was deleted cannot clean up after itself; Settings says how to remove it in Task Manager.
 - **What a sign-in launch does.** `--background` opens no window and resumes only what the runtime files declare, locked (§10); it exits at once if nothing resumes. Nothing it does needs or reveals the PIN.
 
-## 12. Known Gaps ([ADR 0004](adr/0004-approval-channel-and-key-hardening.md), proposed)
+## 12. Known Gaps ([ADR 0004](adr/0004-approval-channel-and-key-hardening.md), accepted)
 Found by the independent reviews of 2026-11-08. They are true of the current code until ADR 0004's phases land:
 - **LAN mode is plain HTTP.** On the LAN address, the bearer token, every request, and any PIN typed into an approval page cross the network unencrypted. Use LAN mode only on a network you trust.
 - **The approval page asks for the vault PIN, and the agent supplies its link.** A look-alike page from an agent, or anyone sniffing the LAN, can capture the PIN, and the PIN is the vault key.

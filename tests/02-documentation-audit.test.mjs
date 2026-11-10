@@ -101,3 +101,12 @@ test('Documentation Audit: ADRs 0002 and 0003 are accepted and keep their trust 
     assert.doesNotMatch(doc, /\*Recommendation:/, 'every open question records its decision');
   }
 });
+
+test('Documentation Audit: ADR 0004 is accepted and records every owner decision', () => {
+  const adr = fs.readFileSync('documentation/adr/0004-approval-channel-and-key-hardening.md', 'utf8');
+  assert.match(adr, /\*\*Status\*\*: Accepted/);
+  for (const d of ['D1', 'D2', 'D3', 'D4', 'D5', 'D6']) assert.ok(adr.includes(`- **${d}. `) && new RegExp(String.raw`\*\*` + d + String.raw`\. [^*]+: \([ab]\)\.\*\*`).test(adr), `${d} is decided`);
+  // The vault PIN never goes to a web page, and approval codes stay out of the vault lockout.
+  assert.match(adr, /The vault PIN is never sent to a web page\./);
+  assert.match(adr, /Wrong codes never count towards `PinGuard`\./);
+});

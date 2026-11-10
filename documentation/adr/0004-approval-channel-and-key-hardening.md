@@ -1,6 +1,6 @@
 # ADR 0004: Approval channel and key hardening
 
-- **Status**: Proposed (2026-11-08). Design only; nothing here is implemented. The open decisions in §7 need the owner before Phase 1 starts.
+- **Status**: Accepted (2026-11-10). The owner accepted every recommended decision in §7. Implementation follows the phases in §6, one branch per phase.
 - **Date**: 2026-11-08
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) §5 (encrypted history), [ADR 0003](0003-action-plans.md) §3 and §7 (plan binding, approval record), [SECURITY_MODEL](../SECURITY_MODEL.md) §3, §4, §10
 - **Supersedes, once implemented**: ADR 0003 §3's rule that the browser page "always requires the PIN". Under this ADR the browser page never asks for the vault PIN.
@@ -316,25 +316,14 @@ Each phase is its own branch, stacked on this one, with a review and isolated CI
 
 Phases 1 and 2 come first: together they mean the vault key never goes to a web page and survives a copied folder. Phase 3 is independent of them, so it can go in parallel if the owner wants.
 
-## 7. Decisions needed from the owner
+## 7. Decisions (accepted by the owner, 2026-11-10)
 
-- **D1. What the device code is for.** As written, the device code needs the PC's screen, which limits its value (§1.2). Options:
-  - **(a)** Keep it as specified, and defer a paired phone until there is a bring-your-own certificate. *Recommended.*
-  - **(b)** Drop device approval entirely, so approval happens in the app only.
-  - **(c)** Build the paired phone now, allowed only with Option D.
-- **D2. Existing short PINs.** At the first unlock after Phase 2, options:
-  - **(a)** Require a choice: set a passphrase, or keep the short PIN on this PC only. *Recommended.*
-  - **(b)** Only warn, and let a short PIN keep protecting a portable vault.
-- **D3. When the approval record is full (256 MB).**
-  - **(a)** Refuse new agent requests until the owner acts. *Recommended.*
-  - **(b)** Evict the oldest files, which brings back the flooding problem.
-- **D4. Integrity checks for monitor history too?**
-  - **(a)** The approval record only, in Phase 3, and `usage-monitor` later. *Recommended.*
-  - **(b)** Both at once.
-- **D5. Embedding the EFF large wordlist.** It is licensed CC BY 3.0 and needs a credit in the README. **(a)** Yes. *Recommended.*
-- **D6. HTTPS default for LAN mode.**
-  - **(a)** Self-signed (Option A) by default, with plain HTTP only through the compatibility toggle. *Recommended.*
-  - **(b)** Plain HTTP by default, with HTTPS as an option.
+- **D1. Device approval: (a).** Approval is in the app only by default. The opt-in device code of §1.2 is built as specified. The paired phone of §2.4 is deferred until a bring-your-own certificate exists.
+- **D2. Existing short PINs: (a).** At the first unlock after Phase 2, the owner must choose: set a passphrase, or keep the short PIN on this PC only (§3.3). The vault stays usable until they choose, but the choice can't be dismissed.
+- **D3. A full approval record: (a).** At 256 MB, new agent requests are refused until the owner acts (§4.5).
+- **D4. Integrity checks: (a).** The approval record first, in Phase 3. `usage-monitor` history follows later.
+- **D5. The EFF large wordlist: (a).** It is embedded, with the CC BY 3.0 credit in the README.
+- **D6. HTTPS for LAN mode: (a).** Self-signed (Option A) by default. Plain HTTP only through the compatibility toggle.
 
 ## Consequences
 
