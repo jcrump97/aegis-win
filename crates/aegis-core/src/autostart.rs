@@ -41,8 +41,10 @@ fn io_err(e: std::io::Error) -> AegisError {
 }
 
 /// The same file however it is spelled: a shortcut stores the long, normal
-/// form, but this exe may have been started through an 8.3 short name, `..`,
-/// a junction, or a `subst` drive. Paths that do not exist compare as text.
+/// form, but this exe may have been started through an 8.3 short name or a
+/// path with `..` (both tested). Junctions and `subst` drives should match
+/// too, since `canonicalize` resolves them to the final path, but that is not
+/// tested. Paths that do not exist compare as text.
 fn same_path(a: &Path, b: &Path) -> bool {
     let text_eq = |x: &Path, y: &Path| x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy());
     text_eq(a, b) || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if text_eq(&x, &y))
