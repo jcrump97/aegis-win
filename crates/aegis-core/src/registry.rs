@@ -66,6 +66,22 @@ pub struct PluginManifest {
     #[serde(default)]
     pub sub_components: Vec<SubComponent>,
     pub tools: Vec<ToolManifest>,
+    /// Read-only health checks for Diagnose (ADR 0005), run by [`Plugin::run_checks`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckManifest>,
+}
+
+/// One Diagnose check, declared in `manifest.json` (ADR 0005 §2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckManifest {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// The only tools (`plugin:tool`) this check's findings may suggest. Each
+    /// must exist and be `planEligible`; the engine drops any other step.
+    #[serde(default)]
+    pub next_tools: Vec<String>,
 }
 
 impl PluginManifest {
@@ -121,6 +137,25 @@ impl PluginManifest {
             if let Some(component) = &tool.component {
                 if !self.sub_components.iter().any(|c| &c.id == component) {
                     return Err(format!("{at}: unknown component '{component}'"));
+                }
+            }
+        }
+        let mut checks = std::collections::HashSet::new();
+        for check in &self.checks {
+            let at = format!("{}.{}", self.id, check.id);
+            if check.id.is_empty() || !check.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                return Err(format!("{at}: check id must be lowercase letters, digits and '_'"));
+            }
+            if !checks.insert(check.id.as_str()) {
+                return Err(format!("{at}: duplicate check id"));
+            }
+            for next in &check.next_tools {
+                let Some((plugin_id, tool_id)) = next.split_once(':') else {
+                    return Err(format!("{at}: nextTools entry '{next}' must be plugin:tool"));
+                };
+                // Another plugin's tools are checked by `Registry::new`, which sees them all.
+                if plugin_id == self.id && !self.tool(tool_id).is_some_and(|t| t.plan_eligible) {
+                    return Err(format!("{at}: nextTools entry '{next}' must be a planEligible tool"));
                 }
             }
         }
@@ -348,6 +383,13 @@ pub trait Plugin: Send + Sync {
     fn saved_background_work(&self) -> Option<bool> {
         Some(false)
     }
+
+    /// Read-only health checks for Diagnose (ADR 0005), one result per check
+    /// declared in the manifest. Must not change Windows or AegisWin: the
+    /// context has no store, history, or LLM on purpose.
+    async fn run_checks(&self, _ctx: &crate::diagnose::CheckContext) -> Vec<crate::diagnose::CheckResult> {
+        Vec::new()
+    }
 }
 
 pub struct Registry {
@@ -366,7 +408,18 @@ impl Registry {
                 return Err(format!("duplicate plugin id '{}'", p.manifest().id));
             }
         }
-        Ok(Self { plugins })
+        let registry = Self { plugins };
+        for p in &registry.plugins {
+            for check in &p.manifest().checks {
+                for next in &check.next_tools {
+                    let eligible = next.split_once(':').and_then(|(pid, tid)| registry.tool(pid, tid)).is_some_and(|(_, t)| t.plan_eligible);
+                    if !eligible {
+                        return Err(format!("{}.{}: nextTools entry '{next}' must be a planEligible tool of a compiled plugin", p.manifest().id, check.id));
+                    }
+                }
+            }
+        }
+        Ok(registry)
     }
 
     pub fn plugins(&self) -> &[Arc<dyn Plugin>] {
@@ -507,6 +560,21 @@ mod tests {
         let mut m = manifest();
         m.tools[0].plan_eligible = true;
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn checks_need_plain_unique_ids_and_eligible_next_tools() {
+        let check = |id: &str, next: &[&str]| CheckManifest { id: id.into(), name: "n".into(), description: "d".into(), next_tools: next.iter().map(|s| s.to_string()).collect() };
+        let mut m = manifest();
+        m.tools[1].plan_eligible = true;
+        // Another plugin's tool is left to Registry::new, which sees every plugin.
+        m.checks = vec![check("crash_2", &["demo-plugin:fix_it", "other:tool"])];
+        m.validate().unwrap();
+        for bad in [vec![check("Crash", &[])], vec![check("a.b", &[])], vec![check("", &[])], vec![check("x", &[]), check("x", &[])], vec![check("x", &["demo-plugin:read_it"])], vec![check("x", &["fix_it"])]] {
+            let mut broken = m.clone();
+            broken.checks = bad;
+            assert!(broken.validate().is_err());
+        }
     }
 
     #[test]

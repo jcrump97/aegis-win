@@ -1,6 +1,6 @@
 # ADR 0005: Diagnose this PC
 
-- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase.
+- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase. Phase 1a (the engine and model) is done.
 - **Date**: 2026-11-11
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (AI replies as untrusted input, code-written descriptions), [ADR 0003](0003-action-plans.md) (plans), [ADR 0004 §8](0004-approval-channel-and-key-hardening.md) (security scope), [PLUGIN_SPEC](../PLUGIN_SPEC.md), [SECURITY_MODEL](../SECURITY_MODEL.md)
 

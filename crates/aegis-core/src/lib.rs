@@ -3,6 +3,7 @@
 
 pub mod autostart;
 pub mod chain;
+pub mod diagnose;
 pub mod engine;
 pub mod error;
 pub mod executor;
