@@ -40,8 +40,12 @@ fn io_err(e: std::io::Error) -> AegisError {
     AegisError::failed(format!("Startup shortcut: {e}"))
 }
 
+/// The same file however it is spelled: a shortcut stores the long, normal
+/// form, but this exe may have been started through an 8.3 short name, `..`,
+/// a junction, or a `subst` drive. Paths that do not exist compare as text.
 fn same_path(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    let text_eq = |x: &Path, y: &Path| x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy());
+    text_eq(a, b) || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if text_eq(&x, &y))
 }
 
 impl Autostart {
@@ -161,6 +165,19 @@ mod tests {
         assert!(matches!(other.state(), AutostartState::Different { .. }));
         assert!(a.remove_if_ours().unwrap());
         assert_eq!(a.state(), AutostartState::Off);
+    }
+
+    #[test]
+    fn the_same_exe_by_another_spelling_is_still_this_copy() {
+        // GitHub's runner keeps TEMP under an 8.3 name (RUNNER~1) while a
+        // shortcut reads back the long one; `..` stands in for any spelling
+        // that differs from what the shortcut stores.
+        let (dir, a, startup) = setup();
+        a.enable(false).unwrap();
+        let respelled = dir.path().join("copy-a").join("..").join("copy-a").join("aegis-win.exe");
+        let b = Autostart::new(&startup, &respelled);
+        assert_eq!(b.state(), AutostartState::On);
+        assert!(b.remove_if_ours().unwrap());
     }
 
     #[test]
