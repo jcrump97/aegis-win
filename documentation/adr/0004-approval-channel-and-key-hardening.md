@@ -1,6 +1,6 @@
 # ADR 0004: Approval channel and key hardening
 
-- **Status**: Accepted (2026-11-10). The owner accepted every recommended decision in §7. Implementation follows the phases in §6, one branch per phase.
+- **Status**: Accepted (2026-11-10). The owner accepted every recommended decision in §7. Implementation follows the phases in §6, one branch per phase. All phases are done; §8 sets the security scope from here (2026-11-11).
 - **Date**: 2026-11-08
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) §5 (encrypted history), [ADR 0003](0003-action-plans.md) §3 and §7 (plan binding, approval record), [SECURITY_MODEL](../SECURITY_MODEL.md) §3, §4, §10
 - **Supersedes, once implemented**: ADR 0003 §3's rule that the browser page "always requires the PIN". Under this ADR the browser page never asks for the vault PIN.
@@ -377,6 +377,22 @@ Phases 1 and 2 come first: together they mean the vault key never goes to a web 
 - **D4. Integrity checks: (a).** The approval record first, in Phase 3. `usage-monitor` history follows later.
 - **D5. The EFF large wordlist: (a).** It is embedded, with the CC BY 3.0 credit in the README.
 - **D6. HTTPS for LAN mode: (a).** Self-signed (Option A) by default. Plain HTTP only through the compatibility toggle.
+
+## 8. Security scope after this ADR (decided by the owner, 2026-11-11)
+
+Phases 0-6 are done and merged into `main` (PR #6). **Security hardening is complete for 0.x.** `SECURITY_MODEL.md` as it stands is the baseline, and work goes to diagnostics: the gate guards four repairs and the monitor settings, and the risk left is in what AegisWin can find and fix, not in the gate.
+
+New security work starts only for one of these:
+
+1. **A finding.** A bug, review result, or report against a boundary in `SECURITY_MODEL.md` §1. It is fixed like any bug, with a regression test. Open findings are tracked as GitHub issues (for example #13).
+2. **New attack surface.** A feature that adds a state-changing tool, a network listener, a new kind of data leaving the PC, or a new place secrets are kept. That feature's PR or ADR has a security section and reuses what exists: the gate and `pin_required`, `describe` and the command hash, plans, the serial executor, the plugin's `LlmHandle` (Off-LAN trust and scrubbing), the plugin store, and history streams. A new mechanism needs its own ADR.
+3. **An outside security review.** Its findings are triaged as in 1.
+
+Deferred until one of those applies, not abandoned:
+- the paired phone (§2.4, D1);
+- integrity checks for `usage-monitor` history (D4);
+- the elevation job bridge (ADR 0001, amendment item 10);
+- signing the executable, which is release work, not hardening.
 
 ## Consequences
 

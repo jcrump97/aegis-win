@@ -1,5 +1,7 @@
 # AegisWin Security & Threat Model
 
+> **Scope**: this model is the security baseline for 0.x. New security work starts only from a finding, new attack surface, or an outside review ([ADR 0004 §8](adr/0004-approval-channel-and-key-hardening.md)).
+
 ## 1. Threat Boundaries
 1. **Untrusted / Semi-Trusted MCP Agents**: External or local AI agents connected via MCP HTTP must never execute destructive or state-changing tools without human authorization, and must never access the user's PIN or raw API keys.
 2. **Off-LAN LLM Providers**: Cloud LLM endpoints receive diagnostic snippets only after the user explicitly marks the calling plugin as trusted for Off-LAN transmission.

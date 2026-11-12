@@ -109,4 +109,9 @@ test('Documentation Audit: ADR 0004 is accepted and records every owner decision
   // The vault PIN never goes to a web page, and approval codes stay out of the vault lockout.
   assert.match(adr, /The vault PIN is never sent to a web page\./);
   assert.match(adr, /Wrong codes never count towards `PinGuard`\./);
+  // §8: hardening is complete for 0.x; new security work needs a finding, new attack surface, or an outside review.
+  assert.match(adr, /## 8\. Security scope after this ADR/);
+  assert.match(adr, /\*\*Security hardening is complete for 0\.x\.\*\*/);
+  for (const trigger of ['**A finding.**', '**New attack surface.**', '**An outside security review.**']) assert.ok(adr.includes(trigger), `§8 lists ${trigger}`);
+  assert.match(fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8'), /security baseline for 0\.x\. .*\[ADR 0004 §8\]\(adr\/0004-approval-channel-and-key-hardening\.md\)/, 'SECURITY_MODEL points to the scope rule');
 });
