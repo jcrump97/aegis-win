@@ -12,13 +12,27 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, E_ACCESSDENIED, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Globalization::{GetOEMCP, MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, CREATE_NO_WINDOW};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, GetCurrentProcess, OpenEventW, OpenProcessToken, SetEvent, WaitForSingleObject, CREATE_NO_WINDOW, EVENT_MODIFY_STATE, INFINITE,
+};
 use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_YESNO, SW_SHOWNORMAL,
+};
+
+/// Makes later `LoadLibrary` calls without a full path look only in
+/// System32, never in the exe's folder or the current directory, so a DLL
+/// planted next to a portable exe (a Downloads folder, a USB stick) is not
+/// loaded. Call it first thing in `main`. The linker flag
+/// `/DEPENDENTLOADFLAG:0x800` does the same for the exe's own imports.
+pub fn restrict_dll_search() -> io::Result<()> {
+    use windows::Win32::System::LibraryLoader::{SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }.map_err(|e| io::Error::other(e.message()))
+}
 
 /// True when this process runs with an elevated (administrator) token.
 pub fn is_elevated() -> bool {
@@ -217,6 +231,227 @@ pub fn relaunch_elevated() -> io::Result<()> {
     })
 }
 
+/// Proof that this process is the one running copy of AegisWin for an
+/// install (ADR 0002 §4). Dropping it lets another copy start, which the
+/// elevated restart needs.
+pub struct SingleInstance {
+    mutex: isize,
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(HANDLE(self.mutex as *mut _)) };
+    }
+}
+
+pub enum Instance {
+    First(SingleInstance),
+    /// Another copy holds this install; it was asked to show its window
+    /// (unless it runs as administrator and this copy does not, which
+    /// Windows does not allow).
+    AlreadyRunning,
+}
+
+/// Claims `key` (one per install, e.g. derived from the data folder) for this
+/// process. The first copy gets `on_second_launch` called, on its own
+/// thread, each time another copy starts.
+pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) -> io::Result<Instance> {
+    let mutex_name = HSTRING::from(format!(r"Local\AegisWin-{key}-instance"));
+    let event_name = HSTRING::from(format!(r"Local\AegisWin-{key}-show"));
+    // Only this user may open either object (ADR 0004 Phase 6).
+    let only_user = Attributes::from_sddl(&user_only_sddl()?)?;
+    let mutex = match unsafe { CreateMutexW(Some(&only_user.attributes), false, PCWSTR(mutex_name.as_ptr())) } {
+        Ok(handle) => handle,
+        // Created by an elevated copy: this copy may not even open it.
+        Err(e) if e.code() == E_ACCESSDENIED => return Ok(Instance::AlreadyRunning),
+        Err(e) => return Err(io::Error::other(e.message())),
+    };
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let _ = unsafe { CloseHandle(mutex) };
+        if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_name.as_ptr())) } {
+            let _ = unsafe { SetEvent(event) };
+            let _ = unsafe { CloseHandle(event) };
+        }
+        return Ok(Instance::AlreadyRunning);
+    }
+    let guard = SingleInstance { mutex: mutex.0 as isize };
+    // Auto-reset: one wake-up per second launch. The handle lives as long as the process.
+    let event = unsafe { CreateEventW(Some(&only_user.attributes), false, false, PCWSTR(event_name.as_ptr())) }.map_err(|e| io::Error::other(e.message()))?.0 as isize;
+    std::thread::Builder::new().name("aegis-single-instance".into()).spawn(move || loop {
+        if unsafe { WaitForSingleObject(HANDLE(event as *mut _), INFINITE) } != WAIT_OBJECT_0 {
+            return;
+        }
+        on_second_launch();
+    })?;
+    Ok(Instance::First(guard))
+}
+
+/// Asks a Yes/No question in a Windows warning box; true on Yes. No is the
+/// default, so pressing Enter keeps things as they are.
+pub fn confirm(title: &str, text: &str) -> bool {
+    let (title, text) = (HSTRING::from(title), HSTRING::from(text));
+    unsafe { MessageBoxW(None, &text, &title, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
+}
+
+/// Shows a balloon from the tray icon that `tray_window` (the icon's own
+/// hidden window) owns. Windows only lets the owner of an icon show its
+/// balloon, and the tray library keeps the icon's ID private, so the ID is
+/// found with a read-only lookup first. Returns false when nothing was shown.
+/// Balloons need no Start-menu shortcut, unlike toasts (ADR 0004 §1.1).
+pub fn tray_balloon(tray_window: isize, title: &str, text: &str) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER};
+
+    fn fill<const N: usize>(dst: &mut [u16; N], text: &str) {
+        // Leaves room for the terminating zero; Windows cuts longer text anyway.
+        for (d, c) in dst.iter_mut().zip(text.encode_utf16().take(N - 1)) {
+            *d = c;
+        }
+    }
+
+    let hwnd = HWND(tray_window as *mut std::ffi::c_void);
+    let found = (0u32..64).find(|&id| {
+        let ident = NOTIFYICONIDENTIFIER { cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32, hWnd: hwnd, uID: id, ..Default::default() };
+        unsafe { Shell_NotifyIconGetRect(&ident) }.is_ok()
+    });
+    let Some(id) = found else { return false };
+    let mut data = NOTIFYICONDATAW { cbSize: size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: id, uFlags: NIF_INFO, dwInfoFlags: NIIF_INFO, ..Default::default() };
+    fill(&mut data.szInfoTitle, title);
+    fill(&mut data.szInfo, text);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool()
+}
+
+/// Extra input mixed into every DPAPI blob, so a blob made for another
+/// program as this user is not accepted as AegisWin's.
+const DPAPI_ENTROPY: &[u8] = b"aegis-win-thispc";
+
+/// Runs one DPAPI call (current user, no UI) and copies out the result.
+fn dpapi(data: &[u8], protect: bool) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB};
+
+    let input = CRYPT_INTEGER_BLOB { cbData: u32::try_from(data.len()).ok()?, pbData: data.as_ptr().cast_mut() };
+    let entropy = CRYPT_INTEGER_BLOB { cbData: DPAPI_ENTROPY.len() as u32, pbData: DPAPI_ENTROPY.as_ptr().cast_mut() };
+    let mut out = CRYPT_INTEGER_BLOB::default();
+    let result = unsafe {
+        if protect {
+            CryptProtectData(&input, PCWSTR::null(), Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        } else {
+            CryptUnprotectData(&input, None, Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
+        }
+    };
+    if result.is_err() || out.pbData.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
+    unsafe {
+        // Clear the plaintext copy Windows made before handing it back.
+        if !protect {
+            std::ptr::write_bytes(out.pbData, 0, out.cbData as usize);
+        }
+        LocalFree(Some(HLOCAL(out.pbData.cast())));
+    }
+    Some(zeroize::Zeroizing::new(bytes))
+}
+
+/// Encrypts `data` so only this Windows account on this PC can read it
+/// (DPAPI, current user). ADR 0004 §3.3.
+pub fn dpapi_protect(data: &[u8]) -> Option<Vec<u8>> {
+    dpapi(data, true).map(|b| b.to_vec())
+}
+
+/// Reverses [`dpapi_protect`]; `None` on another PC or account, or if damaged.
+pub fn dpapi_unprotect(blob: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    dpapi(blob, false)
+}
+
+/// A short, stable name for an install: FNV-1a of its folder, case-insensitive.
+pub fn install_key(dir: &std::path::Path) -> String {
+    let hash = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    match instance_suffix(dir) {
+        Some(suffix) => format!("{hash:016x}-{suffix}"),
+        None => format!("{hash:016x}"),
+    }
+}
+
+/// The file in the data folder that holds this install's random suffix.
+pub const INSTANCE_ID_FILE: &str = "instance-id";
+
+/// 16 random bytes, hex, kept in `dir\instance-id` (made at the first
+/// launch), so other programs cannot guess the single-instance names and
+/// take them first. `None` when the folder cannot be written (a read-only
+/// copy), which leaves the path-only name.
+fn instance_suffix(dir: &std::path::Path) -> Option<String> {
+    let path = dir.join(INSTANCE_ID_FILE);
+    let valid = |s: &str| (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase());
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        return valid(existing.trim());
+    }
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let suffix = hex::encode(bytes);
+    std::fs::create_dir_all(dir).ok()?;
+    // `create_new`: when two copies start at once, the second one reads the first one's.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(suffix.as_bytes()).ok()?;
+            Some(suffix)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => valid(std::fs::read_to_string(&path).ok()?.trim()),
+        Err(_) => None,
+    }
+}
+
+/// An SDDL security descriptor that lets only this process's user open an
+/// object: `D:P(A;;GA;;;<user SID>)`, protected so nothing is inherited.
+pub fn user_only_sddl() -> io::Result<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{TokenUser, TOKEN_USER};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(|e| io::Error::other(e.message()))?;
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buffer = vec![0u64; (len as usize).div_ceil(8)];
+        let got = GetTokenInformation(token, TokenUser, Some(buffer.as_mut_ptr().cast()), len, &mut len);
+        let _ = CloseHandle(token);
+        got.map_err(|e| io::Error::other(e.message()))?;
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut sid = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut sid).map_err(|e| io::Error::other(e.message()))?;
+        let text = sid.to_string();
+        let _ = LocalFree(Some(HLOCAL(sid.0.cast())));
+        Ok(format!("D:P(A;;GA;;;{})", text.map_err(|e| io::Error::other(e.to_string()))?))
+    }
+}
+
+/// `SECURITY_ATTRIBUTES` built from an SDDL string; frees the descriptor on drop.
+struct Attributes {
+    attributes: windows::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+impl Attributes {
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
+        use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+        use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+        let text = HSTRING::from(sddl);
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(text.as_ptr()), SDDL_REVISION_1, &mut descriptor, None) }
+            .map_err(|e| io::Error::other(e.message()))?;
+        Ok(Self { attributes: SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor.0, bInheritHandle: false.into() } })
+    }
+}
+
+impl Drop for Attributes {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.attributes.lpSecurityDescriptor))) };
+    }
+}
+
 /// The private IPv4 address this PC uses to reach other networks, if any.
 /// `connect` on a UDP socket only picks a route; no packet is sent.
 pub fn primary_lan_ipv4() -> Option<std::net::Ipv4Addr> {
@@ -225,6 +460,94 @@ pub fn primary_lan_ipv4() -> Option<std::net::Ipv4Addr> {
     match socket.local_addr().ok()?.ip() {
         std::net::IpAddr::V4(ip) if ip.is_private() => Some(ip),
         _ => None,
+    }
+}
+
+/// Windows shortcuts (`.lnk`) through the Shell's `IShellLinkW` COM object,
+/// with no shell process (ADR 0002 §6).
+pub mod shortcut {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::{FOLDERID_Startup, IShellLinkW, SHGetKnownFolderPath, ShellLink, KF_FLAG_DEFAULT};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Shortcut {
+        pub target: PathBuf,
+        pub arguments: String,
+        pub working_dir: PathBuf,
+    }
+
+    fn win(e: windows::core::Error) -> io::Error {
+        io::Error::other(e.message())
+    }
+
+    /// The signed-in user's Startup folder (`FOLDERID_Startup`).
+    pub fn startup_folder() -> io::Result<PathBuf> {
+        unsafe {
+            let path = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, None).map_err(win)?;
+            let out = path.to_string();
+            CoTaskMemFree(Some(path.0 as *const _));
+            out.map(PathBuf::from).map_err(|e| io::Error::other(e.to_string()))
+        }
+    }
+
+    /// Runs `f` on a thread of its own with COM set up, so the caller's
+    /// thread (a Tokio worker, the UI thread) keeps its own COM state.
+    fn with_com<T: Send + 'static>(f: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<T> {
+        std::thread::spawn(move || {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.ok().map_err(win)?;
+            let out = f();
+            unsafe { CoUninitialize() };
+            out
+        })
+        .join()
+        .map_err(|_| io::Error::other("the shortcut thread stopped unexpectedly"))?
+    }
+
+    fn text(buf: &[u16]) -> String {
+        String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())])
+    }
+
+    /// Writes (or overwrites) the shortcut at `path`.
+    pub fn write(path: &Path, link: &Shortcut, description: &str) -> io::Result<()> {
+        let path = HSTRING::from(path.as_os_str());
+        let target = HSTRING::from(link.target.as_os_str());
+        let arguments = HSTRING::from(link.arguments.as_str());
+        let dir = HSTRING::from(link.working_dir.as_os_str());
+        let description = HSTRING::from(description);
+        with_com(move || unsafe {
+            let shell: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(win)?;
+            shell.SetPath(&target).map_err(win)?;
+            shell.SetArguments(&arguments).map_err(win)?;
+            shell.SetWorkingDirectory(&dir).map_err(win)?;
+            shell.SetDescription(&description).map_err(win)?;
+            shell.cast::<IPersistFile>().map_err(win)?.Save(&path, true).map_err(win)
+        })
+    }
+
+    /// Reads the shortcut at `path` without resolving it (no search for a
+    /// moved target). `None` when there is no file.
+    pub fn read(path: &Path) -> io::Result<Option<Shortcut>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let path = HSTRING::from(path.as_os_str());
+        with_com(move || unsafe {
+            let shell: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(win)?;
+            shell.cast::<IPersistFile>().map_err(win)?.Load(&path, STGM_READ).map_err(win)?;
+            let mut target = vec![0u16; 32_768];
+            shell.GetPath(&mut target, std::ptr::null_mut(), 0).map_err(win)?;
+            let mut arguments = vec![0u16; 4096];
+            shell.GetArguments(&mut arguments).map_err(win)?;
+            let mut dir = vec![0u16; 32_768];
+            shell.GetWorkingDirectory(&mut dir).map_err(win)?;
+            Ok(Some(Shortcut { target: PathBuf::from(text(&target)), arguments: text(&arguments), working_dir: PathBuf::from(text(&dir)) }))
+        })
     }
 }
 
@@ -504,8 +827,10 @@ pub mod eventlog {
                 assert!(e.time_created.ends_with('Z'), "{}", e.time_created);
                 assert!(!e.provider.is_empty());
             }
-            // Newest first.
-            assert!(events.windows(2).all(|w| w[0].time_created >= w[1].time_created));
+            // Newest first, in the order Windows wrote them: record ids go
+            // down. Times need not, since a provider can stamp an event with
+            // a time earlier than one written before it.
+            assert!(events.windows(2).all(|w| w[0].record_id > w[1].record_id), "{:?}", events.iter().map(|e| e.record_id).collect::<Vec<_>>());
         }
 
         #[test]
@@ -519,6 +844,65 @@ pub mod eventlog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dpapi_round_trips_and_rejects_damaged_blobs() {
+        let blob = dpapi_protect(b"wrapped key").unwrap();
+        assert!(!blob.windows(11).any(|w| w == b"wrapped key"));
+        assert_eq!(dpapi_unprotect(&blob).unwrap().as_slice(), b"wrapped key");
+        let mut bad = blob.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(dpapi_unprotect(&bad).is_none());
+        assert!(dpapi_unprotect(b"not a blob").is_none());
+    }
+
+    #[test]
+    fn a_balloon_needs_an_icon_of_its_own_window() {
+        // No window, so no icon is found and nothing is shown.
+        assert!(!tray_balloon(0, "AegisWin", "test"));
+    }
+
+    #[test]
+    fn a_second_copy_of_an_install_wakes_the_first_and_steps_aside() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let upper = data.to_string_lossy().to_uppercase();
+        assert_eq!(install_key(&data), install_key(std::path::Path::new(&upper)), "the same folder, however it is spelled");
+        assert_ne!(install_key(&data), install_key(&temp.path().join("other")));
+        let key = format!("test-{}-{}", std::process::id(), install_key(&data));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Instance::First(guard) = single_instance(&key, move || tx.send(()).unwrap()).unwrap() else { panic!("first copy") };
+        assert!(matches!(single_instance(&key, || {}).unwrap(), Instance::AlreadyRunning));
+        rx.recv_timeout(Duration::from_secs(5)).expect("the first copy is asked to show itself");
+        // Another install is independent.
+        assert!(matches!(single_instance(&format!("{key}-other"), || {}).unwrap(), Instance::First(_)));
+        // Once the first copy lets go (elevated restart), a new copy can start.
+        drop(guard);
+        assert!(matches!(single_instance(&key, || {}).unwrap(), Instance::First(_)));
+    }
+
+    #[test]
+    fn the_instance_names_carry_a_random_suffix_kept_in_the_data_folder() {
+        let a = tempfile::tempdir().unwrap();
+        let data = a.path().join("data");
+        let key = install_key(&data);
+        let (path_part, suffix) = key.split_once('-').expect("a suffix");
+        assert_eq!((path_part.len(), suffix.len()), (16, 32), "{key}");
+        assert_eq!(std::fs::read_to_string(data.join(INSTANCE_ID_FILE)).unwrap(), suffix);
+        assert_eq!(install_key(&data), key, "stable across launches");
+        let b = tempfile::tempdir().unwrap();
+        assert_ne!(install_key(b.path()).split_once('-').unwrap().1, suffix, "each install has its own");
+        std::fs::write(data.join(INSTANCE_ID_FILE), "not hex").unwrap();
+        assert_eq!(install_key(&data), path_part, "a damaged file falls back to the path-only name");
+    }
+
+    #[test]
+    fn the_instance_objects_are_for_this_user_only() {
+        let sddl = user_only_sddl().unwrap();
+        assert!(sddl.starts_with("D:P(A;;GA;;;S-1-5-") && sddl.ends_with(')'), "{sddl}");
+        assert!(Attributes::from_sddl(&sddl).is_ok());
+    }
 
     #[test]
     fn decodes_utf16_and_collapses_progress_redraws() {

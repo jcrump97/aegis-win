@@ -1,0 +1,327 @@
+# ADR 0002: AI-assisted monitor creator, background monitoring, and encrypted monitor history
+
+- **Status**: Accepted (2026-11-07). Phases 0-2 are implemented (Phase 0 in `8b7ad4b`; Phases 1-2 on the `feat/monitor-*` branches, ending with the in-app screen on `feat/monitor-ui`). Phase 3 is implemented on `feat/lifecycle` except the *locked, monitoring* state and tray *Pause monitoring*, which moved to Phase 4 (§4). Phase 4 is implemented on `feat/encrypted-history`. Phase 5 is implemented on `feat/resume-startup` (resume at launch, `--background`, the Startup shortcut).
+- **Date**: 2026-11-07
+- **Amends**: [ADR 0001](0001-rust-core.md) rejected-option row 13 (telemetry on disk), [GUIDING_PRINCIPLES §2](../GUIDING_PRINCIPLES.md)
+- **Plugin**: `usage-monitor` (the encrypted history writer in §5 is a shared `aegis-core` service)
+- **Related**: [ADR 0003](0003-action-plans.md) (multi-step action plans; supersedes the PIN grace window and batch approve, see §11)
+
+## Context
+
+`usage-monitor` has one global watch window: a daily time range, a CPU % and memory MB threshold, and an optional process list. A sampler thread runs every 5 seconds while the vault is unlocked. Today:
+
+| Behaviour | Today |
+| :--- | :--- |
+| Monitors | One, global, configured by hand or by `configure_watch_window` |
+| AI role | After the fact only: `analyze_clues_with_llm` explains a snapshot |
+| Close window | The process exits; exit locks the vault (`src-tauri/src/main.rs`, `RunEvent::Exit`) |
+| Lock | Stops the sampler and clears all telemetry and the watch settings |
+| Disk | Telemetry is never written to disk |
+| Tray, idle auto-lock, autostart, single instance | None |
+| `configure_watch_window` gate | `auto`, so an MCP agent can change what is recorded without the owner knowing (fixed in Phase 0: now `pin_required`) |
+
+Users want to say what they are chasing ("my game stutters around 9pm") and get a monitor that keeps collecting across window closes, locks, and reboots. Users place a great deal of trust in this app, so the AI must never be able to act on its own, and collected data must stay unreadable without the PIN.
+
+## Options considered
+
+1. **Template filler**: the AI fills fields of 3–4 fixed monitor types.
+2. **Small rule language**: the AI emits a monitor as JSON in a closed, bounded vocabulary that code validates.
+3. **AI-written scripts** (PowerShell, WMI queries).
+
+## Decision
+
+**Option 2.** Option 1 is a subset of it. Option 3 is rejected: it breaks [PLUGIN_SPEC §4](../PLUGIN_SPEC.md) (no shell), invites antivirus flags, and cannot be validated in a way a user could trust.
+
+The governing rule for every part of this design: **the AI proposes, code validates and describes, the owner approves with the PIN.** Monitors only observe and record.
+
+## 1. Rule language (version 1)
+
+```json
+{
+  "version": 1,
+  "name": "Game stutter in the evening",
+  "schedule": { "startTime": "20:30", "endTime": "23:30", "days": ["fri", "sat"] },
+  "trigger": {
+    "all": [
+      { "type": "process_cpu", "process": "game.exe", "atLeastPercent": 80, "forSeconds": 30 },
+      { "type": "event", "channel": "Application", "eventId": 1002 }
+    ]
+  },
+  "cooldownSeconds": 300,
+  "notify": "tray"
+}
+```
+
+| Condition `type` | Fields | Notes |
+| :--- | :--- | :--- |
+| `process_cpu` | `process`, `atLeastPercent` 1–100, `forSeconds` 5–3600 | Share of total CPU, as today |
+| `process_memory` | `process`, `atLeastMb` 64–1048576, `forSeconds` | |
+| `system_cpu` | `atLeastPercent`, `forSeconds` | |
+| `system_memory` | `atLeastPercent`, `forSeconds` | |
+| `event` | `channel` (`Application`, `System`, `Setup`), `eventId` 0–65535, optional `provider` ≤128 | Security is excluded in v1 (admin only). An event counts as "true" for 10 minutes after it occurs, matching the existing crash correlation window. |
+| `crash` | `process` | Application Error 1000 / Application Hang 1002 for that process |
+| `foreground` | `process` | Needs the `usage-monitor:active-window` component |
+
+- **Fields**: `process` is an executable name (≤260 characters, no path separators) or `"*"` for any process. `schedule.days` is optional (default every day), and equal start and end means all day, as today. `forSeconds` rounds up to the 5-second sample period. `notify` is `"tray"` or `"none"`.
+- **Combinators**: one level only, `all` or `any`, 1–8 conditions. No nesting in v1.
+- **Caps**: 20 monitors, a fixed 5-second sample period, `cooldownSeconds` 60–86400. One shared sampler evaluates every monitor; there are no per-monitor threads.
+- **What a monitor can do when it fires**: write a `monitor_hit` record and optionally change the tray icon. **There is no action, script, or tool call.** If actions are ever added, a hit may only open a normal approval ticket.
+- **Validation**: `aegis-core::schema` checks shape and ranges. Per-type rules it cannot express (field sets per `type`, process-name characters, components enabled) are checked in code, as PLUGIN_SPEC §2.2 already allows. A rule that needs a disabled component is rejected with the reason; a monitor never turns a component on.
+- **Privacy flags** shown on review: `foreground` conditions, `"*"` process scope, and all-day schedules.
+- ~~The existing watch window becomes a built-in rule named "Default" (Phase 1), so there is one model, not two.~~ **Dropped (2026-11-07).** The watch window does a job a rule cannot: it decides what the sampler records at all (spikes, the replay history, foreground changes), and it is the PIN-gated privacy boundary that keeps `propose_monitor` replay from showing an agent anything outside it. A rule only decides when something is worth flagging. A migration would also have needed answers to target lists longer than 8 conditions, foreground tracking that is not a threshold, and whether Default could be paused or deleted. So there are two models on purpose: the watch window says what is recorded, rules say what is a hit.
+
+**Activation takes the full rule (Phase 1c).** The first draft had `propose_monitor` return a `proposalId` that `activate_monitor` referenced. Instead, `activate_monitor` takes the whole rule, so the approval request shows exactly what will run and there is no proposal store to expire or clear. The rule is validated again when the approved call runs, against the components enabled at that moment. Monitor ids are `m1`, `m2`, … and are never reused.
+
+**Replay keeps a short, scoped history (Phase 1c).** The existing telemetry only records spikes above the watch thresholds, which is too little to replay an arbitrary rule. The sampler therefore keeps its last 30 minutes of samples in memory (360 ticks), with processes below the lowest thresholds a rule may use (1 % CPU, 64 MB) dropped, so nothing a rule could match is lost. It keeps only what the enabled components allow, and only inside the watch window: `propose_monitor` is an `auto` tool, so replay must not tell an agent more than `capture_diagnostic_snapshot` already can. The history is cleared on lock and by `purge_telemetry_history`, is never sent to the LLM, and is not shown directly: replay returns a count and the first five hits. Event conditions are replayed against the event logs read at proposal time.
+
+**Rule storage (Phase 1b).** Rules are kept with the new `aegis-core` plugin data store (`PLUGIN_SPEC.md` §5): records inside the encrypted vault, bound to the plugin's id, reachable only while unlocked and installed, capped at 256 KiB per plugin. Uninstalling `usage-monitor` keeps its rules but makes them unreachable until it is installed again; `purge_telemetry_history` does not delete rules. A one-line pointer in `SECURITY_MODEL.md` waits until the owner's pending edits to that file land.
+
+**Decided while implementing the rule language (Phase 1a, `plugins/usage-monitor/src/rules.rs`):**
+
+- **Strict parsing.** Unknown top-level, schedule, or condition fields are rejected, not ignored, so a rule cannot carry anything the description does not show. `HH:MM` must be exactly two-digit hours and minutes.
+- **Components.** `process_cpu`, `process_memory`, `system_cpu`, and `system_memory` need `usage-monitor:resource-spikes`. `event` and `crash` need `usage-monitor:crash-correlator`. `foreground` needs `usage-monitor:active-window`.
+- **`foreground` needs a named process.** `"*"` is rejected there, since "any app is in the foreground" is always true and only records usage.
+- **Hidden characters.** Names, process names, and providers reject control characters and invisible format characters (bidi overrides, zero-width marks), so the review text cannot read differently from the rule. Errors that echo input strip those characters and are length-capped.
+- **Names are names.** Process names also reject `\ / : * ? " < > |`. Matching is case-insensitive. A `crash` condition matches the process as a whole word in the event text, so `game.exe` does not match `mygame.exe`.
+- **Duration.** `forSeconds` means that many consecutive 5-second samples (rounded up, at least one). Any sample where the condition is false, a tick gap over 15 seconds (sleep, a stalled sampler), the clock moving backwards, or leaving the schedule resets the count. The sample after a gap starts a new count.
+- **Schedule.** Times are local. An overnight window belongs to the day it started on: with `days: ["fri"]` and 22:00–02:00, Saturday 01:00 is active and Saturday 23:00 is not.
+- **Cooldown.** Measured from the last hit. If the clock moves backwards, the cooldown ends rather than stretching.
+- **Duplicate conditions** in one trigger are rejected.
+
+### New and changed tools (`usage-monitor`)
+
+| Tool | Gate | readOnly | Purpose |
+| :--- | :--- | :--- | :--- |
+| `propose_monitor` | auto | true | Validates a rule. Returns the normalized rule, a code-generated description, privacy flags, and a replay result. Activates nothing and stores nothing. Takes an optional `reasoning` string from an MCP agent, returned cleaned, cut to 600 characters, and labelled "Supplied by the requesting agent". |
+| `activate_monitor` | **pin_required** | false | Saves and starts a rule, passed in full. An optional `replaceId` replaces an existing monitor's rule and keeps its id. |
+| `list_monitors` | auto | true | Active and paused monitors, with code-generated descriptions |
+| `delete_monitor`, `pause_monitor` | **pin_required** | false | Weakening monitoring could hide evidence, so it needs the PIN |
+| `read_monitor_history` | **pin_required** (open question 2) | true | Decrypted history, needs the vault unlocked |
+| `configure_watch_window` | **auto → pin_required** | false | Closes the gap where an agent could quietly change what is recorded (Phase 0). Kept: the "Default" migration was dropped (§1). |
+| `purge_telemetry_history` | pin_required (unchanged) | false | Now also deletes history files and replaces the monitor keypair (§6) |
+
+The approval portal and the in-app queue show the **code-generated description and privacy flags** for `activate_monitor`, not only the raw arguments. **Done (Phase 1):** through a new optional plugin hook, `review_call`, that every plugin can use; the description is stored on the ticket when it is opened, so it matches the arguments that will run. A rule that does not validate shows a warning that approving will fail. `pause_monitor` and `delete_monitor` keep the generic view (the monitor id).
+
+**None of these tools is ever plan-eligible** ([ADR 0003 §4](0003-action-plans.md)). Monitor management and purge keep their own single-ticket review, so a monitor can never be switched on or off as one step among others.
+
+## 2. Review screen and the AI's reasoning summary
+
+Each proposal shows two visually separate panels:
+
+1. **"What this monitor does"**: generated by AegisWin from the rule. This is the source of truth.
+2. **"Why the AI suggested this (AI-generated, may be wrong)"**: up to 3 bullets, 600 characters in total, rendered as plain text. For an MCP proposal this panel is labelled "Supplied by the requesting agent".
+
+- The reasoning is never parsed for settings.
+- It is a summary the model writes, not a dump of its step-by-step reasoning.
+- **Consistency check**: if the reasoning names a process or event ID that is not in the rule, the review shows "The AI's explanation mentions things this monitor does not watch." (Phase 2: a process is a word ending in `.exe`; an event ID is a number right after "event" or "ID". A `"*"` process covers every app, and a crash condition covers events 1000 and 1002. It also runs on reasoning an MCP agent passes to `propose_monitor`.)
+- **Before activating**, the owner can adjust fields in a form; each edit is validated again. A **replay** shows "this would have fired N times" against recorded history (unlocked only).
+
+## 3. Clarifying-question loop (in-app only)
+
+The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`) and the central LLM service under `usage-monitor`'s `LlmHandle`. External MCP agents do not use it; they hold their own conversation with the user and call `propose_monitor`.
+
+**Decision (Phase 2): the chat steps are `appOnly` plugin tools, not plugin-specific Tauri commands.** A tool marked `appOnly` ([PLUGIN_SPEC §2](../PLUGIN_SPEC.md)) is left out of MCP `tools/list`, and an MCP call to it gets the same error as a tool that does not exist. The app reaches it through the existing `run_tool` command, so the engine still binds the `LlmHandle` to `usage-monitor`'s id and Off-LAN trust, checks installation and components, and applies the gate, with no plugin code in the Tauri shell.
+
+- **Reply format.** Each AI turn must be exactly one of these, validated against a schema:
+  - `{ "questions": [ { "text", "choices"? } ] }`
+  - `{ "proposal": { "rule", "reasoning" } }`
+  - `{ "unsupported": { "reason" } }`, for requests outside the vocabulary such as GPU temperature
+
+  Invalid output gets one retry; a second failure ends the turn with "The AI gave an answer AegisWin could not use."
+
+  **Decided in Phase 2:** a fourth reply, `{ "requestRunningApps": { "reason" } }`, is how the AI asks for the one consented lookup below; it is allowed once per conversation. `reasoning` may be a string or 1-3 strings (bullets), cleaned of hidden characters and cut to 600 characters in total. Each reply is one JSON object with exactly one of these keys and no unknown fields; text around it or a code fence is tolerated.
+- **Limits:**
+  - at most 3 question rounds, after which the AI must propose or say the request is unsupported
+  - at most 3 questions per round, ≤200 characters each
+  - up to 4 answer choices per question, plus free text
+- **User controls:** the owner can skip any question, or press **Propose now** at any time.
+- **Allowed topics:** the monitor only. Which app, the symptom, when it happens, how long it lasts, how severe it is.
+- **Code filter.** It is a backstop; the main protection is that the AI cannot act. Questions (and single answer choices) are dropped, with a visible note, if they contain the following. The word lists are narrow on purpose, so fair questions such as "does it freeze when you click play?" get through:
+  - URLs
+  - requests for passwords, PINs, keys, tokens, or other secrets
+  - code or command text
+  - requests to run, install, download, or change anything
+- **Context.** The AI receives the rule vocabulary, the enabled components, the user's text, and the answers. **Never raw event-log messages**: process names and event text can be controlled by an attacker.
+- **One consented lookup.** The AI may request the list of running process names. The owner sees "Let the AI see running app names?" and nothing is sent without that click.
+- **Where data goes.** Each round shows whether answers go to an on-LAN or Off-LAN LLM. The existing trust gate and scrubbing ([SECURITY_MODEL §6](../SECURITY_MODEL.md)) apply.
+- **Storage.** The conversation lives in Rust memory only, within the LLM service's prompt-size cap, and is cleared on lock.
+
+**Decided in Phase 2 (backend):**
+- **Tools.** `monitor_chat_start { request }` (at most 1000 characters; a longer one is refused, not cut), `monitor_chat_reply { answers?, shareRunningApps?, proposeNow? }`, and `monitor_chat_cancel`. All three are `appOnly`, `auto`, and read-only: they save and start nothing, and a proposal comes back exactly as `propose_monitor` returns it (generated description, privacy flags, replay), with the AI's bullets under their own label.
+- **One conversation at a time.** Starting one replaces the last. Each conversation has a generation number that changes on start, cancel, and lock, so an AI answer that arrives late never lands in a newer conversation. When two replies are sent at once, only the first AI turn that finishes is applied.
+- **A failed turn can be retried.** After two unusable answers, the owner's answers stay recorded and replying again (or pressing **Propose now**) runs the turn again. A rule that does not validate against the enabled components counts as an unusable answer, and the retry tells the AI what was wrong.
+- **Consent.** After `requestRunningApps`, the next reply must say yes or no (`shareRunningApps`); **Propose now** counts as no. Yes sends up to 60 running process names, cleaned and checked like rule process names, once: apps the owner named in the description or answers come first, then the busiest by memory and CPU; Windows background processes (executables under the Windows folder and a fixed list such as `svchost.exe`) are left out unless named. A small local model gets the useful names instead of an alphabetical slice. No tells the AI the owner declined. Either way the AI may not ask again.
+- **Where data goes.** Every turn reports where it was sent (`sentTo`: host, model, Off-LAN, scrubbed) and where the next one would go (`nextSendGoesTo`), from the LLM service's preflight, without sending anything.
+
+## 4. App lifecycle: tray and locked-but-monitoring
+
+| State | Vault key | MCP server, tickets, LLM | Sampler + history writer | Can view data |
+| :--- | :--- | :--- | :--- | :--- |
+| Locked, idle | no | off | off | no |
+| **Locked, monitoring** | **no** | off | **on**, from the active rules in `runtime.json` | no |
+| Unlocked | yes | as configured | on | yes |
+
+- **Tray icon.** Its state shows: unlocked, locked + monitoring, or idle. Menu: Open, Lock, Pause monitoring, Quit. Uses Tauri's `tray-icon` feature.
+- **Closing the window** hides it to the tray when at least one monitor is active; otherwise it quits as today. The first hide shows a one-time notice.
+- **Lock** with active monitors goes to *locked, monitoring*: the key is dropped, MCP stops, the firewall rule is removed, and tickets are cleared. **Quit** writes a clean-stop record and exits.
+- **Pause monitoring** from the tray needs no PIN, because agents cannot reach the tray. It writes a `paused` record, so the gap is visible and attributed.
+- **Single instance per install.** A second launch focuses the running one. This matters for the Startup shortcut and the tray.
+- **Plugin trait.** It gains a monitoring-only lifecycle hook, because `on_lock` today means "stop everything".
+- **Notifications in v1** are the tray icon and the in-app list. Windows toasts for an unpackaged app usually need an AUMID registry entry, so they are deferred.
+
+**As built in Phase 3** (decided 2026-11-07, during implementation):
+
+- **The *locked, monitoring* state and tray *Pause monitoring* move to Phase 4.** Without the encrypted history, a hit made while locked would have to be dropped or kept in plaintext memory after lock, which breaks "telemetry is cleared on lock". So in Phase 3, **Lock stops every monitor** as before, and the plugin hook is `background_active` (is there work that should keep AegisWin in the tray?) rather than a locked-monitoring hook.
+- **Tray**: menu Open, Lock, Quit; a left click opens the window. The state (locked, unlocked, unlocked with monitors running) shows in the tooltip, not as different icons.
+- **Close to tray**: closing the window hides it only while a monitor is running (`background_active`); otherwise it quits. The one-time notice is a standing hint on the Usage Monitor screen, because there are no toasts.
+- **Single instance** is a named mutex plus an auto-reset event in the session namespace, both keyed on a hash of the install folder, so two portable copies in different folders run side by side. A second launch signals the first to show its window and exits. A standard-user launch while an elevated copy runs cannot open the elevated copy's objects, so it exits without focusing it. The elevated restart releases the claim just before it starts the elevated copy and takes it back if the prompt is cancelled. `tauri-plugin-single-instance` was not used: it is keyed on the app identifier, not the install.
+
+**As built in Phase 4** (2026-11-08, during implementation):
+
+- **The plugin hook** is `run_locked(&LockedContext)`, called *instead of* `on_lock`, so `on_lock` keeps meaning "stop everything". Its input is the vault's copy of the runtime section, not the file. A plugin without it stops on lock as before.
+- **Locked work is narrower than unlocked work.** Only the running monitors keep going; the components' own recording (spikes, foreground changes) and everything in memory stop at lock. Hits and heartbeats go to the history only.
+- **Not run locked:** a plugin whose runtime file waits for review, and a lock with no monitor running (it ends the session).
+- **Tray:** Pause monitoring / Resume monitoring. The pause stops the sampler without ending the session (`paused`, then `resumed`), holds across lock and unlock, and is kept in the runtime file's `paused` flag.
+- **Stop reasons:** `quit` for tray Quit, closing the window, and the elevated restart (which now stops monitoring in the old copy first); `shutdown` when the event loop ends without the owner asking (Windows ending the session). Still to confirm by hand with a real sign-out and shutdown (open question 7).
+
+### Idle auto-lock
+
+- **Timeout:** default 15 minutes. Options: 5, 15, 30, or 60 minutes. There is no "off".
+- **What counts as idle:** no interaction with the AegisWin window or the approval portal. **MCP agent activity does not keep the vault unlocked.**
+  - As built: clicks and key presses in the app window (reported at most every 30 seconds through `note_activity`), and any correct PIN in the app (since ADR 0004, no web page takes the PIN). Loading or using the device page does not count. Unlocking counts.
+  - The check runs every 5 seconds. Changing the timeout needs no PIN; it is a UI-only setting and only shortens or lengthens an already bounded wait.
+- **Running tools:** when auto-lock is due, no new queued item or plan step starts. Auto-lock waits for the running step only, then cancels everything queued ([ADR 0003 §5.1](0003-action-plans.md)). Pending, undecided tickets are cleared by the lock, as today.
+
+## 5. Encrypted monitor history on disk
+
+**Where it lives: a shared `aegis-core` history service.** The writer and reader are not part of `usage-monitor`; the plan audit trail in [ADR 0003 §7](0003-action-plans.md) uses them too.
+- **Streams**: the service holds named streams, each with **its own keypair and retention**: `usage-monitor` (this ADR) and `approvals` (ADR 0003). Purging or re-keying one stream never touches another.
+- **Handles**: the engine gives each plugin a `HistoryHandle` bound to its plugin id, the same pattern as `LlmHandle`. A plugin can only write and read its own stream.
+- **Locked writing**: only streams that write while locked (today only `usage-monitor`) keep their public key on disk, in `runtime.json`. Other streams take their public key from the vault while unlocked.
+
+**Scheme: write-only public-key encryption.**
+- **Keypair.** A monitor X25519 keypair. The **private key lives only inside the vault** (behind the PIN, zeroized on lock). The **public key** is in `runtime.json` and in the vault.
+- **Construction.** HPKE ([RFC 9180](https://www.rfc-editor.org/rfc/rfc9180)), base mode, X25519 + HKDF-SHA256 + AES-256-GCM, from an existing crate. No hand-rolled cryptography. The crate chosen (open question 4) has **no paid or formal audit**; see [SECURITY_MODEL §10](../SECURITY_MODEL.md).
+- **What this gives.** The locked writer can encrypt but never decrypt, so nothing on disk is readable without the PIN, including by AegisWin itself while locked.
+
+Rejected alternatives:
+- **DPAPI-protected monitor key**: any process running as the user could decrypt it, which bypasses the PIN.
+- **Keeping the vault key in memory while monitoring**: that means never truly locking.
+
+### Files
+
+| File | Contents | Protection |
+| :--- | :--- | :--- |
+| `./data/monitor/runtime.json` | Format version, `keyId`, the `usage-monitor` stream's public key, active rules, enabled components, paused flag, retention settings | Plaintext, written atomically like the vault. Reveals *what* is monitored, not what was collected. |
+| `./data/history/<stream>/seg-YYYYMMDD-NNN.bin` | Header (magic, version, `keyId`, HPKE encapsulated key), then length-prefixed sealed frames. Additional data = header hash + frame index. | Encrypted; one HPKE context per file, wiped from memory when the next file starts |
+
+- **Records**:
+  - `session_start`: launch kind (manual or autostart), boot time, app version
+  - `heartbeat`: every 60 seconds
+  - `session_stop`: reason quit, shutdown, or monitoring stopped
+  - `paused` and `resumed`
+  - `spike`, `crash`, `foreground`, and `monitor_hit`
+  - Raw 5-second samples are not written.
+- **Crash safety**: append-only; batches are forced to disk (`sync_data`) every **30 seconds** and on stop. After a power cut, reading stops at the last frame that authenticates and a torn final frame is dropped. Worst case loses about 30 seconds. A bad frame in the middle of an older file marks that file corrupt in the history view; reading continues with the next file.
+- **Rotation**: a new file daily or at 4 MB.
+- **Retention**: default **14 days or 64 MB**, whichever comes first, oldest files first. Adjustable within 1–90 days and 8–512 MB. Enforced at startup and on rotation; deleting needs no key, so this works while locked.
+- **Purge** (PIN): `purge_telemetry_history` deletes every `usage-monitor` file and **replaces that stream's keypair**, so a deleted file recovered from flash storage is useless. The `approvals` stream is untouched.
+- **Tamper detection**: on every unlock, the public key, `keyId`, and rules in `runtime.json` are compared with the vault's copies. On a mismatch the app warns, stops resuming from the file, and rewrites it from the vault after the owner reviews.
+- **Threat model.** Malware that can write to `./data` as the user can redirect future records or add observe-only rules. Preventing that is out of scope, since it already controls the session; *detection* at the next unlock is in scope. Someone who has only the files (e.g. a lost USB stick) sees the active rules, file dates, and sizes, but no collected data.
+
+**As built in Phase 4** (2026-11-08, during implementation):
+
+- **Runtime file path.** The history service is shared, so the runtime file is per plugin: `./data/runtime/<plugin>.json` (today only `usage-monitor.json`) rather than `./data/monitor/runtime.json`. It holds the format version, stream, key id, public key, retention, `paused`, and a plugin-defined section (for `usage-monitor`: its active rules and enabled components).
+- **Keys** are created in the vault the first time a stream is written while unlocked.
+- **Tamper check outcome.** A mismatching, unreadable, or unexpected runtime file is renamed to `<plugin>.rejected.json` (so it is never resumed from, also after a restart) and listed for the owner, who rewrites it from the vault in the app. Until then, plugin changes update the vault only. `paused` is not compared, because the tray sets it without the PIN. A missing file is rewritten from the vault without a warning: it cannot redirect anything.
+- **Records.** No `crash` record is written: crash and hang events stay in the Application log, and gaps take their evidence from the System log when history is read. `session_stop` with reason "monitoring stopped" also covers a change of monitoring settings, which restarts the sampler. The runtime file lists only running (not paused) monitors and is removed when nothing runs. `session_start` says `autostart` for a `--background` launch and `manual` otherwise (§6).
+- **In the app.** The History card reads, limits, and purges the stream (each needs the PIN). A set-aside runtime file shows a warning above every tab with a *Rewrite it from my saved settings* button, an app-only command that never reaches MCP.
+
+## 6. Restart and resume
+
+- **Always on (A):** every launch reads `runtime.json`. If monitors were active and not paused, it resumes them in *locked, monitoring*. After unlock, a banner says "Monitors were stopped from X to Y; the gap is recorded."
+- **Opt-in Startup shortcut (B)**, a toggle in Settings:
+  - **File**: `AegisWin Monitor.lnk` in the user's Startup folder (`FOLDERID_Startup`), created through the Shell `IShellLink` COM interface (no shell process). Target: the current exe's absolute path, arguments `--background`, working directory the exe's folder.
+  - **Enabling needs the PIN**; disabling does not, matching how revoking LLM trust works. The setting is UI-only and is never exposed over MCP.
+  - **Removal**: the shortcut is deleted when the toggle is turned off or the last monitor is deleted.
+  - **Wrong or dead target**: on each launch, if the shortcut exists but points to a different exe (the stick moved, a new drive letter, another copy), Settings shows **Update** or **Remove**. A shortcut left behind by an install that has since been deleted cannot be detected by that install, so the setting's help text says how to remove it via Task Manager's Startup tab.
+  - **If a shortcut from another copy exists**, enabling asks before replacing it.
+  - **`--background` launch**: single-instance check, no window, tray only, *locked, monitoring*.
+- **Rejected**: Task Scheduler and the HKCU Run key.
+
+**As built in Phase 5, resume** (2026-11-08, during implementation):
+
+- **`Engine::resume_at_launch(Launch)`** runs once, before the window opens. For each runtime file it calls `run_locked` with the file's section and `launch` set, and takes the stream's public key and retention from the file. Skipped: no vault yet, a file set aside for review (`.rejected.json` exists), a plugin not in this build, and a file with a wrong version, a mismatched stream, an invalid key, or retention out of range. The plugin validates the section again (`MonitorRuntime::from_runtime`), so a rule that needs a component the file does not list does not run.
+- **Unverified until unlock.** While locked the file cannot be checked against the vault, so a changed file runs until the next unlock (the §5 threat model: detected, not prevented). At unlock the tamper check sets it aside and the plugin reloads from the vault; work resumed for a plugin that is not installed is stopped. The history key switches to the vault's, closing the file written under the file's key.
+- **Pause.** A `paused` flag in any resumed file restores the tray pause (label and tooltip) at launch; plugins get it in `UnlockContext.paused` too.
+- **Gap banner.** `Plugin::resume_notice` is asked once after each unlock. After a resume at launch, `usage-monitor` reads the last 14 days of its history and returns the stop (or unexpected end) just before this launch's `session_start`. The app shows "monitors were stopped from X to Y; the gap is recorded" until dismissed (`dismiss_resume_notice`, app only; `Status.resumeNotices`, empty while locked). A gap older than 14 days is not shown in the banner; the history view still has it.
+- **`--background`** launch: no window (the hidden window opens from the tray or a second launch), `session_start` says `autostart`. If nothing resumes, the process exits at once, so a sign-in launch with nothing to monitor leaves no tray icon. A later manual launch while it runs shows its window.
+
+**As built in Phase 5, Startup shortcut** (2026-11-08, during implementation):
+
+- **Code.** `aegis_core::os::shortcut` wraps `IShellLinkW` + `IPersistFile` on a dedicated COM thread (STA); `aegis_core::autostart::Autostart` decides On / Off / Different (another target or arguments) / Unreadable. Paths are compared case-insensitively; the shortcut is read without `Resolve`, so Windows does not go looking for a moved target.
+- **Settings card *Start with Windows*.** Turn on (PIN), Turn off (no PIN), and for a shortcut that points elsewhere *Update to this copy* (PIN) and *Remove*. Enabling over a different or unreadable shortcut returns a conflict; the app then asks before calling it again with `replace`. Turning it on needs a saved monitor (`Engine::autostart_wanted`, from the new `Plugin::saved_background_work`; paused monitors count).
+- **Last monitor deleted.** The shell's 5-second check removes the shortcut when `autostart_wanted()` is `Some(false)` (unlocked and known), and only if the shortcut starts this copy. It is `None` while locked, so a locked copy never deletes it.
+- **Commands:** `get_autostart`, `enable_autostart(pin, replace)`, `disable_autostart`; app only, never MCP. Both use the registry and are well-known malware persistence techniques that antivirus watches.
+
+## 7. Gap recording
+
+Gaps are computed **when history is read** (unlocked), so no extra plaintext is needed:
+
+| Pattern in the records | Shown as |
+| :--- | :--- |
+| Heartbeats more than 2 minutes apart, same session | Sleep or hibernate (confirmed by Kernel-Power 42 and 107 when present) |
+| `session_stop` followed by a new `session_start` | Clean shutdown or quit, plus who started the restart (System 1074) |
+| No `session_stop`, then a new `session_start` | Crash or power loss (System 41 Kernel-Power, 6008) |
+| `paused` … `resumed` | Paused by the user |
+
+Timeline example: "Not monitoring 23:14–23:52 (unexpected shutdown, Kernel-Power 41)." Values are never filled in across a gap. Unexpected shutdowns also appear as diagnostic clues in their own right.
+
+**Known risk**: Tauri may not surface `WM_QUERYENDSESSION`/`WM_ENDSESSION`. If so, a hidden message window (through the `windows` crate) writes the `session_stop` record. Without it, a normal shutdown looks unclean, though System 1074 still shows it was intended.
+
+## 8. Documents to amend (during the phase that implements each part)
+
+| Document | Change |
+| :--- | :--- |
+| `adr/0001-rust-core.md` | Rejected-option row 13: note it is superseded by this ADR (the objection was *plaintext* on disk) |
+| `GUIDING_PRINCIPLES.md` | §2: telemetry is persisted encrypted under `./data/history/`; the opt-in Startup shortcut is the one file outside `./data/` |
+| `SECURITY_MODEL.md` | New sections: monitor key and HPKE files, *locked, monitoring* state, idle auto-lock, Startup shortcut, AI output treated as untrusted input, question filter. §1: add LLM output and a local attacker with `./data` write access as threat boundaries. §2.1: new PIN-taking commands (`activate_monitor`, enabling the shortcut) |
+| `ARCHITECTURE.md` | Tray and the shared history service in the system diagram, the app-state table, a propose → approve sequence diagram, `./data/monitor/` and `./data/history/` in the layout |
+| `PLUGIN_SPEC.md` | Plugin trait lifecycle hook for monitoring while locked; `HistoryHandle` (own stream only); monitor tools never set `planEligible` ([ADR 0003](0003-action-plans.md)). §5 plugin data in the vault: done in Phase 1b |
+| `plugins/usage-monitor/README.md`, `manifest.json`, `src/lib.rs` header | New tools, persistence and retention, new `purge_telemetry_history` description, `configure_watch_window` gate |
+| `README.md` | Feature list: AI monitor creator, tray, background monitoring, Startup shortcut |
+| `AUDIT_LEDGER.md` | One row per phase |
+| `tests/02-documentation-audit.test.mjs` | This ADR is in `REQUIRED_DOCS` (done when accepted) |
+
+## 9. Implementation plan
+
+Each phase is its own PR with tests, ledger row, and doc updates. Phases 0–2 ship value without any lifecycle or disk changes.
+
+| Phase | Scope | Depends on |
+| :--- | :--- | :--- |
+| **0. Gate fix** | `configure_watch_window` → `pin_required`; tests; docs | — |
+| **1. Rules without AI** | Rule schema and validation, shared evaluator in the sampler, code-generated descriptions, privacy flags, `propose`/`activate`/`list`/`pause`/`delete` tools, rules stored in the vault, ~~"Default" rule migration~~ (dropped, §1), approval page shows descriptions, manual rule editor in the UI, replay against in-memory data | 0 |
+| **2. AI creator** | Chat commands, reply schema, question loop and limits, question filter, reasoning panel and consistency check, process-list consent, LAN/Off-LAN labelling, tests against a loopback LLM mock | 1 |
+| **3. Lifecycle** | Tray, close-to-tray, *locked, monitoring* state and plugin hook, idle auto-lock, single instance, shutdown message handling | 1 |
+| **4. Encrypted history** | Shared `aegis-core` history service with per-stream keypairs and `HistoryHandle`, the `usage-monitor` stream, `runtime.json`, segment writer and reader, 30-second flush, retention, purge with key replacement, tamper check, history view, gap detection with System log classification | 3 |
+| **5. Resume and Startup shortcut** | Resume on every launch, `--background`, Settings toggle (PIN to enable), shortcut update and removal, replace prompt | 4 |
+
+## 10. Open questions
+
+Decided on 2026-11-07 by taking the written recommendation, except where marked open.
+
+1. **Hide to tray**: lock immediately, or rely on the 15-minute auto-lock? **Decided: rely on auto-lock**, so an owner who hides the window during an agent session is not interrupted.
+2. **`read_monitor_history` gate over MCP**: `auto` like `capture_diagnostic_snapshot`, or `pin_required` given up to 90 days of foreground history? **Decided: `pin_required`.**
+3. **Event conditions**: poll every 30 seconds with a bookmark through `aegis_core::os::eventlog`, or push through `EvtSubscribe`? **Decided: poll** (reuses existing code, simpler to test).
+4. **HPKE crate**: confirm the chosen crate meets the "audited, no hand-rolled cryptography" bar before Phase 4, or compose `x25519-dalek` + `hkdf` + `aes-gcm` exactly per RFC 9180. **Decided (2026-11-08, by the owner): the `hpke` crate (rozbb/rust-hpke), pinned to exactly 0.12.0, default features off, X25519 + HKDF-SHA256 + AES-256-GCM only.** It does not meet the "audited" half of the bar: it has no paid or formal audit (Cloudflare published an internal review of version 0.8; there is no NCC Group audit). It was chosen over composing the primitives, which would be hand-rolled HPKE. 0.12.0 shares `aes-gcm` 0.10.3 (past RUSTSEC-2023-0096), `sha2` 0.10 and `rand_core` 0.6 with the vault, so it adds the fewest new crates; later versions move to the next RustCrypto generation. A CFRG known-answer test for this exact suite runs in CI.
+5. **Caps**: confirm 20 monitors and 8 conditions per monitor. **Decided: 20 monitors, 8 conditions per monitor.**
+6. **Windows toast notifications**: stay deferred until there is a way to show them without a registry entry? **Decided: deferred**; v1 uses the tray icon and the in-app list only.
+7. **Shutdown messages**: confirm in Phase 3 whether Tauri delivers them or a hidden message window is needed. **Decided: Tauri delivers them.** The window library (tao 0.37) handles `WM_ENDSESSION` and ends the event loop, which Tauri reports as `RunEvent::Exit`, so no hidden message window is needed. Phase 4 writes its clean-stop record there. Still to confirm by hand with a real sign-out and shutdown.
+
+## 11. Set aside and dropped
+
+- **PIN grace window ("skip the PIN for 5 minutes"): set aside.**
+  - **The blanket version is rejected.** The browser approval page needs no login besides the PIN, and the agent already holds its link, so skipping the PIN would let any agent approve its own requests.
+  - **The in-app-only variant is not built.** It would never apply to the browser page or MCP, would still need a click per request, and would exclude admin repairs, purge, monitor management, and the Startup shortcut. After those exclusions it covered almost no tools.
+  - It can be revisited later under those constraints.
+- **Batch approve (one PIN for several separate pending tickets): dropped.** Superseded by [ADR 0003](0003-action-plans.md) action plans, which add a fixed order, stop-on-failure, and one reviewed, hash-bound list.

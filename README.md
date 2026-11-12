@@ -10,8 +10,11 @@ AegisWin is a single `.exe` you can run from a USB stick or a downloads folder. 
 
 - **Portable, single executable.** Tauri v2 app; all state lives in `./data/` next to the exe. Nothing goes to the registry or `%APPDATA%`, and no helper binaries are dropped.
 - **Standard user by default.** Runs `asInvoker`, so it never forces a UAC prompt at launch. Admin-only tools (`sfc /scannow`, Winsock reset) say so up front and offer to restart AegisWin as administrator.
-- **PIN-gated approvals for AI agents.** Each tool is either `auto` (e.g. read-only log queries) or `pin_required`. A gated MCP call returns a local approval link where you review the exact action, add a comment, and accept or decline with your PIN. The PIN never reaches the agent, an LLM, or a log.
+- **PIN-gated approvals for AI agents.** Each tool is either `auto` (e.g. read-only log queries) or `pin_required`. A gated MCP call waits on the **Approvals** tab, where you review the exact action, add a comment, and accept or decline with your PIN. Agents get no approval link, and AegisWin never asks for the PIN on a web page. Optionally, **Approve from another device** lets you approve from a phone with a one-time code the app shows. The PIN never reaches the agent, an LLM, or a log.
+- **Action plans.** An agent can propose up to five repairs to run in order under one approval. You see every step, its arguments, and the exact commands before you enter your PIN; the plan stops at the first failure, and you can stop it after any step. You can build the same kind of plan yourself with **Add to plan** on a repair's card. Every request, your decision, and each change AegisWin makes go into an encrypted approval record that only your PIN can open (Approvals tab). The record is tamper-evident: each event is chained to the one before and signed with a key kept in the vault, and the card says plainly if events were removed, cut short or changed. A change runs only once its start is on disk.
 - **LAN-aware LLM use.** Local endpoints (Ollama, LM Studio, private LAN addresses) are trusted. Before a plugin sends diagnostics to an LLM outside your LAN, you have to trust that plugin, and usernames, hostnames, and local paths are scrubbed from the payload.
+- **A passphrase protects the folder.** The vault key is a passphrase: five random words AegisWin generates for you, or your own of at least 14 characters (a strength guide shows how guessable it is). Argon2id at 256 MiB makes each guess slow, so a copied `data` folder cannot be opened by guessing. If typing it is too much, **Keep a short PIN on this PC** lets a 6+ character PIN unlock on this Windows account only (Windows DPAPI); **Forget this PC** removes it. Vaults set up with a short PIN before this keep working and show a banner until you choose.
+- **Locks itself.** The vault locks after 15 minutes without you (5 to 60 in Settings); what AI agents do never keeps it open. While a monitor runs, closing the window keeps AegisWin in the tray, and locking keeps the monitor going: it records only to an encrypted history that needs your PIN to read. Every start resumes running monitors, and an opt-in Startup shortcut (Settings, PIN to turn on) starts AegisWin in the tray when you sign in. Only one copy runs per folder.
 - **Self-contained plugins.** `event-logs`, `windows-health`, and `usage-monitor`, each with its own manifest, tests, and docs.
 
 See [`documentation/ARCHITECTURE.md`](documentation/ARCHITECTURE.md) for diagrams and [`documentation/SECURITY_MODEL.md`](documentation/SECURITY_MODEL.md) for the threat model.
@@ -72,6 +75,19 @@ npm install
 
 `npm run dev` and `npm run tauri:dev` both use port 1420, so run only one at a time.
 
+### Connecting Claude Code in this folder
+
+The repo's `.mcp.json` points Claude Code at AegisWin's MCP server. It holds no secrets; it reads two environment variables:
+
+| Variable | Value |
+| :--- | :--- |
+| `AEGIS_MCP_TOKEN` | Required. The bearer token from the MCP tab (**Show token and setup commands**, needs your PIN). Update it after rotating the token. |
+| `AEGIS_MCP_URL` | Optional, defaults to `http://127.0.0.1:47821/mcp`. Set it only if you changed the port. A LAN bind still listens on `127.0.0.1`, so clients on this PC never need the LAN address. |
+
+On your network the server uses HTTPS with a certificate AegisWin makes and keeps in the vault. Agents on other devices trust the public certificate, `data\mcp-cert.pem` (or **Copy certificate** on the MCP tab): `NODE_EXTRA_CA_CERTS=<path>` for Claude Code and other Node clients, `curl --cacert <path>` for curl. Phones show a one-time browser warning. To avoid it, put your own `mcp-cert.pem` and `mcp-key.pem` (for example from `tailscale cert`) in the data folder; AegisWin moves the key into the vault.
+
+Set them in your user environment, not in a file in the repo, so the token is never committed.
+
 ## Contributing
 
 - Read [`AGENT.md`](AGENT.md) for the engineering rules, and [`documentation/PLUGIN_SPEC.md`](documentation/PLUGIN_SPEC.md) before touching a plugin.
@@ -83,6 +99,8 @@ npm install
 ## Acknowledgements
 
 AegisWin is developed with help from **[Claude](https://claude.com)** by Anthropic, working through [Claude Code](https://claude.com/claude-code): architecture review, the Rust migration plan, build and repository setup, and code. Credit goes here instead of in individual commits.
+
+Generated passphrases use the [EFF large wordlist](https://www.eff.org/dice) by the Electronic Frontier Foundation, licensed under [CC BY 3.0 US](https://creativecommons.org/licenses/by/3.0/us/). It is included unchanged as `src/ui/assets/eff_large_wordlist.txt`; AegisWin leaves out its 4 hyphenated words when picking.
 
 ## License
 

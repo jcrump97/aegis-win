@@ -2,7 +2,7 @@
 //! mistake here would reset a machine's network stack. Execution of System32
 //! binaries is covered in aegis-core with harmless commands.
 
-use aegis_core::registry::{self, Gate, GatePolicy, Plugin, ToolContext};
+use aegis_core::registry::{self, CommandLine, Gate, GatePolicy, Plugin, ToolContext};
 use aegis_core::{schema, ErrorCode};
 use aegis_plugin_windows_health::{plan, summarize_sfc, valid_adapter_filter, WindowsHealthPlugin};
 use serde_json::{json, Value};
@@ -21,24 +21,46 @@ fn every_repair_is_pin_gated_and_supports_dry_run() {
         assert_eq!(tool.default_gate_policy, GatePolicy::PinRequired, "{}", tool.id);
         assert!(tool.input_schema.pointer("/properties/dryRun").is_some(), "{}", tool.id);
         let policy = tool.default_gate_policy;
-        assert_ne!(registry::gate(tool, policy, &json!({ "dryRun": false }), true), Gate::Run, "{}", tool.id);
-        assert_eq!(registry::gate(tool, policy, &json!({ "dryRun": true }), false), Gate::Run, "{}", tool.id);
+        let describes = plugin.describe(&tool.id, &json!({})).is_some();
+        assert!(describes, "{}", tool.id);
+        assert_ne!(registry::gate(tool, policy, &json!({ "dryRun": false }), true, describes), Gate::Run, "{}", tool.id);
+        assert_eq!(registry::gate(tool, policy, &json!({ "dryRun": true }), false, describes), Gate::Run, "{}", tool.id);
     }
 }
 
+#[test]
+fn the_four_repairs_can_be_plan_steps() {
+    let plugin = WindowsHealthPlugin::default();
+    let eligible: Vec<&str> = plugin.manifest().tools.iter().filter(|t| t.plan_eligible).map(|t| t.id.as_str()).collect();
+    assert_eq!(eligible, ["sfc_scan", "flush_dns", "ip_release_renew", "winsock_reset"]);
+}
+
 #[tokio::test]
-async fn dry_runs_describe_commands_without_running_them() {
+async fn describe_lists_absolute_commands_and_the_plugin_never_runs_a_dry_run() {
+    let plugin = WindowsHealthPlugin::default();
+    let sys = aegis_core::os::system32();
+    let at = |exe: &str, args: &[&str]| CommandLine::new(sys.join(exe).to_string_lossy(), args);
     for (tool, expected) in [
-        ("sfc_scan", vec!["sfc.exe /scannow"]),
-        ("flush_dns", vec!["ipconfig.exe /flushdns"]),
-        ("winsock_reset", vec!["netsh.exe winsock reset"]),
-        ("ip_release_renew", vec!["ipconfig.exe /release", "ipconfig.exe /renew"]),
+        ("sfc_scan", vec![at("sfc.exe", &["/scannow"])]),
+        ("flush_dns", vec![at("ipconfig.exe", &["/flushdns"])]),
+        ("winsock_reset", vec![at("netsh.exe", &["winsock", "reset"])]),
+        ("ip_release_renew", vec![at("ipconfig.exe", &["/release"]), at("ipconfig.exe", &["/renew"])]),
     ] {
-        let out = call(tool, json!({ "dryRun": true })).await.unwrap();
-        assert_eq!(out["executed"], false, "{tool}");
-        assert_eq!(out["commands"], json!(expected), "{tool}");
-        assert!(out["impact"].as_str().unwrap().len() > 20);
+        let described = plugin.describe(tool, &json!({ "dryRun": false })).unwrap().unwrap();
+        assert_eq!(described, expected, "{tool}");
+        assert!(described.iter().all(|c| std::path::Path::new(&c.exe).is_absolute()));
+        let review = plugin.review_call(tool, &json!({}), &[]).unwrap();
+        assert!(review.lines[0].len() > 20, "the impact comes first");
+        assert!(review.lines.iter().any(|l| l == &format!("Runs {}", expected[0].display())), "{tool}: {review:?}");
+        // A dry run that reached the plugin would be refused, never run.
+        assert_eq!(call(tool, json!({ "dryRun": true })).await.unwrap_err().code, ErrorCode::InvalidArguments, "{tool}");
     }
+    assert!(plugin.describe("interpret_health_output", &json!({})).is_none(), "the interpreter changes nothing");
+    let filtered = plugin.describe("ip_release_renew", &json!({ "adapterFilter": "Wi-Fi 2" })).unwrap().unwrap();
+    assert_eq!(filtered[1].args, ["/renew", "Wi-Fi 2"]);
+    assert!(filtered[1].display().ends_with(r#"ipconfig.exe /renew "Wi-Fi 2""#));
+    assert!(plugin.describe("ip_release_renew", &json!({ "adapterFilter": "a|b" })).unwrap().is_err());
+    assert!(plugin.review_call("winsock_reset", &json!({}), &[]).unwrap().warnings[0].contains("restarted"));
 }
 
 #[test]

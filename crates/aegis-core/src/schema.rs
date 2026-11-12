@@ -14,6 +14,13 @@ const KEYWORDS: [&str; 13] = [
     "maxLength", "items", "maxItems", "default", "description",
 ];
 
+/// Control characters, and invisible format characters (bidi overrides,
+/// zero-width marks) that could make text shown for review read differently
+/// from what it says.
+pub fn is_hidden_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
 /// Checks that a schema only uses supported keywords.
 pub fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
     let obj = schema.as_object().ok_or_else(|| format!("{at}: schema must be an object"))?;

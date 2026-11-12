@@ -77,3 +77,142 @@ test('UI: LLM answers parse a safe Markdown subset into plain data', async () =>
   const render = fs.readFileSync('src/ui/render.ts', 'utf8');
   assert.match(render, /markdown\(answer\.text\)/, 'LLM answers go through the Markdown renderer');
 });
+
+test('UI: the monitor screen starts monitors only through the PIN-gated tool, and labels AI text', () => {
+  const monitors = fs.readFileSync('src/ui/monitors.ts', 'utf8');
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // One place starts a monitor: the Start button of a rule AegisWin has just checked and described.
+  assert.equal(monitors.match(/run\('activate_monitor'/g)?.length, 1, 'activate_monitor is called from one place');
+  assert.match(monitors, /function proposalView[\s\S]*?deps\.run\('activate_monitor', args, start\)/);
+  // Every tool call goes through invokeTool, which asks for the PIN when the gate needs it.
+  assert.match(main, /function monitorDeps[\s\S]*?return invokeTool\(plugin, tool, args, button\);/);
+  assert.match(main, /async function invokeTool[\s\S]*?effectivePolicy === 'pin_required'[\s\S]*?askPin\(/);
+  // Editing the rule throws away the last check, so a stale review is never started.
+  assert.match(monitors, /addEventListener\('input', \(e\) => \{\s*if \(form\.contains\(e\.target as Node\)\) replace\(result\);/);
+  assert.match(monitors, /addEventListener\('change', \(e\) => \{\s*if \(form\.contains\(e\.target as Node\)\) replace\(result\);/);
+  // Text an AI wrote is always shown with a label saying so.
+  const labels = [...monitors.matchAll(/aiText\(('[^']*'|str\(reasoning\.label\))/g)].map((m) => m[1]);
+  assert.equal(labels.length, 3);
+  for (const l of labels) assert.ok(l === 'str(reasoning.label)' || /AI-generated, may be wrong/.test(l), l);
+  // App-only tools are never offered as generic forms or as agent gates.
+  assert.match(main, /plugin\.tools\.filter\(\(t\) => !t\.appOnly/);
+  assert.match(main, /p\.tools\.filter\(\(t\) => !t\.appOnly\)\.map/);
+});
+
+test('Lifecycle: one copy per install, close-to-tray only while monitors run, and the UI notices a lock', () => {
+  // DLL search is restricted first (ADR 0004 Phase 6); the single-instance claim comes before anything else starts.
+  assert.match(mainRs, /fn main\(\) \{\s*\/\/[^\n]*\n\s*let _ = os::restrict_dll_search\(\);\s*\/\/[^\n]*\n\s*let claim = match claim_instance\(\) \{[\s\S]*?Ok\(Instance::AlreadyRunning\) => return,/);
+  assert.match(fs.readFileSync('src-tauri/build.rs', 'utf8'), /rustc-link-arg-bins=\/DEPENDENTLOADFLAG:0x800/);
+  // Closing hides the window only when a plugin is working in the background.
+  assert.match(mainRs, /CloseRequested \{ api, \.\. \} = event \{\s*if window\.state::<Arc<Engine>>\(\)\.background_active\(\) \{\s*api\.prevent_close\(\);/);
+  // The elevated restart releases the claim so the elevated copy can start.
+  assert.match(mainRs, /drop\(claim\.0\.lock\(\)\.unwrap\(\)\.take\(\)\);\s*let reclaim[\s\S]*?relaunch_elevated\(\)/);
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // Only input in the app window counts as activity.
+  assert.match(main, /document\.addEventListener\('pointerdown', noteActivity, true\);/);
+  assert.match(main, /document\.addEventListener\('keydown', noteActivity, true\);/);
+  assert.equal(main.match(/api\.noteActivity\(\)/g)?.length, 1, 'activity is reported from one place');
+  // The poll checks the lock state first, because the vault can lock without the UI asking.
+  assert.match(main, /pollTimer = window\.setInterval\(async \(\) => \{\s*try \{\s*\/\/[^\n]*\n\s*const now = await api\.status\(\);\s*status = now;\s*if \(!now\.unlocked\) return route\(\);/);
+});
+
+test('Action plans: the app shows the plan as AegisWin describes it and approves it by hash', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // A plan approval sends the hash of the plan that was shown; the command passes it to the engine.
+  assert.match(main, /api\.decideTicket\(t\.ticketId, yes, pin\.value, comment\.value\.trim\(\) \|\| null, t\.plan\?\.hash \?\? null\)/);
+  assert.match(mainRs, /async fn decide_ticket\([\s\S]*?plan_hash: Option<String>,[\s\S]*?engine\.decide\(&ticket_id, approve, pin, comment, "app", plan_hash\.as_deref\(\)\)/);
+  // Cancel needs no PIN and goes straight to the engine.
+  assert.match(apiTs, /cancelTicket: \(ticketId: string\) => call<TicketView>\('cancel_ticket', \{ ticketId \}\)/);
+  assert.match(mainRs, /async fn cancel_ticket\(engine: EngineState<'_>, ticket_id: String\) -> Cmd<TicketView> \{\s*engine\.cancel_ticket\(&ticket_id\)\s*\}/);
+  // Every piece of supplied text is shown under the label of who wrote it.
+  const plan = main.slice(main.indexOf('function planCard('), main.indexOf('function ticketCard('));
+  assert.ok(plan.length > 0, 'planCard exists');
+  assert.equal(plan.match(/suppliedText\(plan\.suppliedLabel,/g)?.length, 2, 'step reasoning and the plan title and reasoning');
+  // Outside the lines that build a labelled block, supplied text is never read.
+  const unlabelled = plan.split('\n').filter((line) => !line.includes('suppliedText(plan.suppliedLabel,') && !line.includes('const { title, reasoning } = plan;'));
+  assert.deepEqual(unlabelled.filter((line) => /reasoning|title\b/.test(line)), [], 'no supplied text outside its label');
+  // The heading, toast, top bar, and tray use the code-written name, never the supplied title.
+  assert.match(plan, /h\('h3', \{\}, t\.toolName\)/);
+  assert.match(plan, /h\('pre', \{\}, s\.commands\.length/);
+  assert.match(plan, /'Stop after this step'/);
+  assert.match(main, /if \(t\.plan\) return planCard\(t, t\.plan\);/);
+});
+
+test('Approvals: a running or queued request is shown as in progress, never as an earlier request', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  const tab = main.slice(main.indexOf('function approvalsTab('), main.indexOf('/** Refreshes the list after a decision'));
+  assert.ok(tab.length > 0, 'approvalsTab exists');
+  // Requests that are running or waiting their turn get their own section...
+  assert.match(tab, /const active = tickets\.filter\(\(t\) => t\.status === 'running' \|\| t\.status === 'queued'\)/);
+  // ...and "Earlier requests" holds only finished ones.
+  assert.match(tab, /const done = tickets\.filter\(\(t\) => t\.status !== 'pending_approval' && !active\.includes\(t\)\)/);
+  // The empty notice appears only when nothing is waiting for the owner and nothing is in progress.
+  assert.match(tab, /pending\.length === 0 && active\.length === 0 \? h\('div', \{ class: 'card' \}, h\('p', \{\}, 'No requests are waiting\.'\)\) : null/);
+  // Order on the page: waiting for you, in progress, then earlier requests.
+  const order = ['Waiting for you', 'In progress', 'Earlier requests'].map((heading) => tab.indexOf(`'${heading}'`));
+  assert.ok(order.every((i) => i > 0), 'all three headings exist');
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'sections in order');
+});
+
+test('In-app plans: the owner builds a draft in memory and approves it like any plan', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  // The app's plans go through the same engine entry point, marked as the owner's.
+  assert.match(mainRs, /async fn propose_plan\(engine: EngineState<'_>, request: Value\) -> Cmd<TicketView> \{\s*engine\.propose_plan\(PlanOrigin::Owner, request\)\.await\s*\}/);
+  assert.match(apiTs, /proposePlan: \(request: PlanRequest\) => call<TicketView>\('propose_plan', \{ request \}\)/);
+  // Creating the plan runs nothing: it opens the review on the Approvals tab, where the PIN is asked.
+  const panel = main.slice(main.indexOf('function planDraftPanel('), main.indexOf('/** Runs a tool from the app'));
+  assert.match(panel, /api\.proposePlan\(/);
+  assert.match(panel, /selectTab\('approvals'\)/);
+  assert.doesNotMatch(panel, /askPin|decideTicket|runTool/, 'the draft never runs or approves anything itself');
+  // Only eligible tools offer "Add to plan"; the draft is dropped when the vault locks.
+  assert.match(main, /if \(tool\.planEligible\) \{\s*const addButton = h\('button', \{\}, 'Add to plan'\);/);
+  assert.match(main, /if \(!status\.unlocked\) planDraft = \[\];/);
+});
+
+test('Serial executor: the app shows the change in progress, and the shell never cuts one off', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  assert.match(main, /const \{ running, queued \} = status\.change;/);
+  assert.match(main, /queued: \['approved, waiting its turn'/);
+  // Restarting as administrator is refused while a change runs; Quit asks first.
+  assert.match(mainRs, /async fn restart_as_admin[\s\S]*?if let Some\(tool\) = engine\.change_running\(\) \{\s*return Err/);
+  assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
+  assert.match(mainRs, /"quit" => quit_app\(app\),/);
+});
+
+test('UI: the monitor chat polls only the progress tool, quietly and without a PIN', async () => {
+  const monitors = fs.readFileSync('src/ui/monitors.ts', 'utf8');
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  const peeks = [...monitors.matchAll(/deps\.peek\('([a-z_]+)'\)/g)].map((m) => m[1]);
+  assert.deepEqual(peeks, ['monitor_chat_progress'], 'peek is only for the progress tool');
+  assert.match(main, /peek: async \(toolId: string\): Promise<unknown> => \{\s*try \{\s*const out = await api\.runTool\(pluginId, toolId, \{\}, null\);/);
+  const { build } = await import('esbuild');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { pathToFileURL } = await import('node:url');
+  const { installFakeDom } = await import('./helpers/fake-dom.mjs');
+  installFakeDom();
+  const bundle = await build({ entryPoints: ['src/ui/monitors.ts'], bundle: true, write: false, format: 'esm', platform: 'browser', logLevel: 'silent' });
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'aegis-mon-')), 'monitors.mjs');
+  fs.writeFileSync(file, bundle.outputFiles[0].text);
+  const { progressText } = await import(pathToFileURL(file).href);
+  assert.equal(progressText({ phase: 'idle' }), null);
+  assert.match(progressText({ phase: 'waiting', elapsedSecs: 12, firstTokenSecs: 180 }), /12 s of up to 180 s/);
+  assert.equal(progressText({ phase: 'thinking', elapsedSecs: 3 }), 'The model is thinking (3 s).');
+  assert.match(progressText({ phase: 'answering', elapsedSecs: 9, chars: 120 }), /120 characters so far \(9 s\)/);
+});
+
+test('UI: generated passphrases use the EFF large wordlist as published, made in the window', async () => {
+  const { createHash } = await import('node:crypto');
+  const list = fs.readFileSync('src/ui/assets/eff_large_wordlist.txt');
+  assert.equal(createHash('sha256').update(list).digest('hex'), 'addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e', 'byte for byte as EFF publishes it');
+  const words = list.toString('utf8').split('\n').map((l) => l.split('\t')[1]).filter(Boolean);
+  assert.equal(words.length, 7776);
+  assert.equal(new Set(words).size, 7776);
+  const ts = fs.readFileSync('src/ui/passphrase.ts', 'utf8');
+  assert.match(ts, /import list from '\.\/assets\/eff_large_wordlist\.txt\?raw'/);
+  assert.match(ts, /crypto\.getRandomValues/, 'words come from the browser cryptographic generator');
+  assert.doesNotMatch(ts, /Math\.random/);
+  // The app never sends a new passphrase back: no command returns one.
+  assert.doesNotMatch(apiTs, /generate_passphrase/);
+  assert.match(fs.readFileSync('README.md', 'utf8'), /EFF/, 'the README credits the EFF wordlist (CC BY 3.0)');
+});

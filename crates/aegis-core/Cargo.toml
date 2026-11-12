@@ -15,27 +15,53 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+# RFC 9180 HPKE for the write-only history (ADR 0002 §5): X25519, HKDF-SHA256,
+# AES-256-GCM only. Pinned exactly; it shares aes-gcm 0.10, sha2 0.10 and
+# rand_core 0.6 with the vault. No formal audit (SECURITY_MODEL §10).
+hpke = { version = "=0.12.0", default-features = false, features = ["alloc", "x25519"] }
+rand_core = { version = "0.6", default-features = false }
+# hpke assumes X25519 secrets are wiped on drop but does not enable this
+# feature itself; enabling it here turns it on for hpke's copy too.
+x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
 getrandom = "0.3"
 hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
 subtle = "2.6"
 zeroize = { version = "1.8", features = ["derive"] }
 async-trait = "0.1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 tokio.workspace = true
 # Schannel (the Windows TLS stack and certificate store); the rustls default
 # needs CMake and NASM to build on Windows.
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json"] }
 url = "2"
-# MCP server and approval portal (HTTP/1.1 only, no TLS: loopback or private LAN).
+# MCP server and device page (HTTP/1.1). Plain HTTP on loopback; HTTPS on a
+# LAN bind (ADR 0004 §2).
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "json"] }
+# TLS for the LAN listener, with the ring provider: aws-lc-rs needs CMake and
+# NASM to build on Windows (ADR 0004 §2.3).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+# The LAN certificate: ECDSA P-256, generated in memory, key kept in the vault.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# QR code for the device page link (ADR 0004 §1.2). MIT, no dependencies.
+qrcodegen = "=1.8.0"
+zxcvbn = { version = "=3.1.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
   "Win32_System_EventLog",
+  "Win32_System_LibraryLoader",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",

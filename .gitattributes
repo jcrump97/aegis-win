@@ -1,2 +1,4 @@
 # Prebuilt binaries (Start AegisWin.exe): never convert line endings or diff as text
 *.exe binary
+# The EFF large wordlist: keep it byte for byte as published (its SHA-256 is checked in a test)
+src/ui/assets/eff_large_wordlist.txt -text

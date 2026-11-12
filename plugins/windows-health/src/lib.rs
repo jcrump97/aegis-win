@@ -1,9 +1,11 @@
-//! `windows-health`: PIN-gated Windows repair commands with dry runs.
+//! `windows-health`: PIN-gated Windows repair commands. `describe` lists the
+//! exact commands from the same `plan` that runs them, so AegisWin answers
+//! dry runs and binds approvals to what was shown (ADR 0004 §5).
 
 use std::time::Duration;
 
 use aegis_core::os::{self, CommandOutput};
-use aegis_core::registry::{Plugin, PluginManifest, ToolContext};
+use aegis_core::registry::{CallReview, CommandLine, Plugin, PluginManifest, ToolContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -25,8 +27,10 @@ impl Step {
     fn new(exe: &'static str, args: &[&str], timeout_secs: u64) -> Self {
         Self { exe, args: args.iter().map(|a| a.to_string()).collect(), timeout: Duration::from_secs(timeout_secs) }
     }
-    pub fn display(&self) -> String {
-        std::iter::once(self.exe.to_owned()).chain(self.args.iter().cloned()).collect::<Vec<_>>().join(" ")
+    /// The command as AegisWin shows and checks it: System32's absolute path
+    /// (the folder `os::run_system_binary` runs it from) and the argv.
+    pub fn command_line(&self) -> CommandLine {
+        CommandLine { exe: os::system32().join(self.exe).to_string_lossy().into_owned(), args: self.args.clone() }
     }
 }
 
@@ -34,6 +38,9 @@ pub struct Plan {
     pub steps: Vec<Step>,
     pub impact: &'static str,
 }
+
+/// The repairs: every tool except the read-only interpreter.
+const REPAIRS: [&str; 4] = ["sfc_scan", "flush_dns", "ip_release_renew", "winsock_reset"];
 
 /// Adapter names are passed as one argv element, but are still limited to
 /// characters real adapter names and ipconfig wildcards use.
@@ -121,19 +128,13 @@ impl Plugin for WindowsHealthPlugin {
             return Ok(json!({ "analysis": answer }));
         }
 
-        let plan = plan(tool, &args)?;
-        let requires_admin = self.manifest.tool(tool).is_some_and(|t| t.requires_admin);
-        let commands: Vec<String> = plan.steps.iter().map(Step::display).collect();
+        // AegisWin answers dry runs from `describe` and never calls this for one.
+        // Refused rather than run, should that ever change.
         if args.get("dryRun") == Some(&Value::Bool(true)) {
-            return Ok(json!({
-                "executed": false,
-                "dryRun": true,
-                "commands": commands,
-                "impact": plan.impact,
-                "requiresAdmin": requires_admin,
-                "elevated": ctx.elevated,
-            }));
+            return Err(AegisError::invalid("windows-health does not run dry runs; AegisWin answers them"));
         }
+        let plan = plan(tool, &args)?;
+        let commands: Vec<String> = plan.steps.iter().map(|s| s.command_line().display()).collect();
 
         let mut outputs = Vec::new();
         for step in plan.steps {
@@ -161,5 +162,25 @@ impl Plugin for WindowsHealthPlugin {
             _ => {}
         }
         Ok(result)
+    }
+
+    fn describe(&self, tool: &str, args: &Value) -> Option<AegisResult<Vec<CommandLine>>> {
+        REPAIRS.contains(&tool).then(|| plan(tool, args).map(|p| p.steps.iter().map(Step::command_line).collect()))
+    }
+
+    fn review_call(&self, tool: &str, args: &Value, _enabled_components: &[String]) -> Option<CallReview> {
+        let plan = plan(tool, args).ok()?;
+        let mut lines = vec![plan.impact.to_owned()];
+        lines.extend(plan.steps.iter().map(|s| format!("Runs {}", s.command_line().display())));
+        if plan.steps.len() > 1 {
+            lines.push("Stops at the first command that fails.".into());
+        }
+        let mut warnings = Vec::new();
+        match tool {
+            "ip_release_renew" => warnings.push("Network connections drop for a few seconds, including any remote session to this PC.".to_owned()),
+            "winsock_reset" => warnings.push("Windows must be restarted to finish, and some VPN or security software may need reinstalling.".to_owned()),
+            _ => {}
+        }
+        Some(CallReview { lines, warnings })
     }
 }

@@ -11,6 +11,9 @@ const REQUIRED_DOCS = [
   'documentation/SECURITY_MODEL.md',
   'documentation/AUDIT_LEDGER.md',
   'documentation/adr/0001-rust-core.md',
+  'documentation/adr/0002-ai-monitor-creator.md',
+  'documentation/adr/0003-action-plans.md',
+  'documentation/adr/0004-approval-channel-and-key-hardening.md',
 ];
 
 test('Documentation Audit: all required agent and architecture docs exist and are non-empty', () => {
@@ -75,4 +78,35 @@ test('Documentation Audit: ADR 0001 amendment defines the basic app and the MCP 
   assert.match(adr, /\^\[a-zA-Z0-9_-\]\{1,64\}\$/);
   const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
   assert.match(sec, /reveal_mcp_token/);
+});
+
+test('Documentation Audit: ADRs 0002 and 0003 are accepted and keep their trust rules', () => {
+  const monitor = fs.readFileSync('documentation/adr/0002-ai-monitor-creator.md', 'utf8');
+  assert.match(monitor, /\*\*Status\*\*: Accepted/);
+  // Monitors only observe; the AI never activates anything.
+  assert.match(monitor, /the AI proposes, code validates and describes, the owner approves with the PIN/);
+  assert.match(monitor, /`activate_monitor` \| \*\*pin_required\*\*/);
+  const plans = fs.readFileSync('documentation/adr/0003-action-plans.md', 'utf8');
+  assert.match(plans, /\*\*Status\*\*: Accepted/);
+  // One PIN approves exactly the stored plan, and the device page never asks for the PIN (ADR 0004 §1).
+  assert.match(plans, /hashed with SHA-256/);
+  assert.match(plans, /It never asks for the PIN\./);
+  assert.match(plans, /one global serial executor/);
+  // Plugin data in the vault: own records only, and the store never replaces the gate.
+  const spec = fs.readFileSync('documentation/PLUGIN_SPEC.md', 'utf8');
+  assert.match(spec, /## 5\. Plugin Data in the Vault/);
+  assert.match(spec, /\*\*Own records only\.\*\*/);
+  assert.match(spec, /\*\*Gating is the tool's job\.\*\*/);
+  for (const doc of [monitor, plans]) {
+    assert.doesNotMatch(doc, /\*Recommendation:/, 'every open question records its decision');
+  }
+});
+
+test('Documentation Audit: ADR 0004 is accepted and records every owner decision', () => {
+  const adr = fs.readFileSync('documentation/adr/0004-approval-channel-and-key-hardening.md', 'utf8');
+  assert.match(adr, /\*\*Status\*\*: Accepted/);
+  for (const d of ['D1', 'D2', 'D3', 'D4', 'D5', 'D6']) assert.ok(adr.includes(`- **${d}. `) && new RegExp(String.raw`\*\*` + d + String.raw`\. [^*]+: \([ab]\)\.\*\*`).test(adr), `${d} is decided`);
+  // The vault PIN never goes to a web page, and approval codes stay out of the vault lockout.
+  assert.match(adr, /The vault PIN is never sent to a web page\./);
+  assert.match(adr, /Wrong codes never count towards `PinGuard`\./);
 });

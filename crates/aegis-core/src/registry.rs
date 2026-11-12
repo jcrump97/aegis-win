@@ -43,6 +43,14 @@ pub struct ToolManifest {
     /// Component that must be enabled for this tool to run, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<String>,
+    /// Only the AegisWin app may call this tool. It is left out of MCP
+    /// `tools/list`, and an MCP call gets the same error as an unknown tool.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub app_only: bool,
+    /// May be a step of an action plan (ADR 0003 §4). Only pin-gated,
+    /// state-changing tools with a boolean `dryRun` qualify.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_eligible: bool,
     pub input_schema: Value,
 }
 
@@ -102,6 +110,14 @@ impl PluginManifest {
                     return Err(format!("{at}: dryRun must be a boolean"));
                 }
             }
+            if tool.plan_eligible
+                && (tool.default_gate_policy != GatePolicy::PinRequired
+                    || tool.read_only
+                    || tool.app_only
+                    || tool.input_schema.pointer("/properties/dryRun").is_none())
+            {
+                return Err(format!("{at}: planEligible needs defaultGatePolicy pin_required, readOnly false, a boolean dryRun, and no appOnly"));
+            }
             if let Some(component) = &tool.component {
                 if !self.sub_components.iter().any(|c| &c.id == component) {
                     return Err(format!("{at}: unknown component '{component}'"));
@@ -124,6 +140,10 @@ pub struct ToolContext {
     pub enabled_components: Vec<String>,
     /// Present for plugins with `usesLlm: true`; already bound to this plugin's id and trust grant.
     pub llm: Option<crate::llm::LlmHandle>,
+    /// This plugin's own records in the vault. Always set by the engine.
+    pub store: Option<crate::plugin_data::PluginStore>,
+    /// This plugin's own encrypted history stream. Always set by the engine.
+    pub history: Option<crate::history_service::HistoryHandle>,
 }
 
 impl ToolContext {
@@ -134,6 +154,124 @@ impl ToolContext {
     pub fn llm(&self) -> AegisResult<&crate::llm::LlmHandle> {
         self.llm.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::LlmNotConfigured, "this plugin is not allowed to use the LLM service"))
     }
+
+    pub fn store(&self) -> AegisResult<&crate::plugin_data::PluginStore> {
+        self.store.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::Internal, "no plugin data store in this context"))
+    }
+    pub fn history(&self) -> AegisResult<&crate::history_service::HistoryHandle> {
+        self.history.as_ref().ok_or_else(|| crate::AegisError::new(crate::ErrorCode::Internal, "no history stream in this context"))
+    }
+}
+
+/// One system command a call runs: an absolute executable path and its
+/// argument vector, never a shell line (ADR 0004 §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandLine {
+    pub exe: String,
+    pub args: Vec<String>,
+}
+
+impl CommandLine {
+    pub fn new(exe: impl Into<String>, args: &[&str]) -> Self {
+        Self { exe: exe.into(), args: args.iter().map(|a| a.to_string()).collect() }
+    }
+
+    /// As shown to the owner: arguments with spaces or quotes are quoted, so
+    /// where one argument ends is never ambiguous.
+    pub fn display(&self) -> String {
+        std::iter::once(&self.exe).chain(&self.args).map(|a| quoted(a)).collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn quoted(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_owned();
+    }
+    format!("\"{}\"", arg.replace('"', "\\\""))
+}
+
+/// What a call would do, written by the plugin's own code from the arguments
+/// (never from AI- or agent-supplied text). Shown with an approval request,
+/// next to the raw arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallReview {
+    /// Plain sentences describing exactly what will happen.
+    pub lines: Vec<String>,
+    /// Things the owner should notice before approving.
+    pub warnings: Vec<String>,
+}
+
+/// Handed to [`Plugin::on_unlock`]. The store stays usable from background
+/// threads, but only while the vault is unlocked and the plugin installed.
+#[derive(Clone, Default)]
+pub struct UnlockContext {
+    pub enabled_components: Vec<String>,
+    /// This plugin's own records in the vault. Always set by the engine.
+    pub store: Option<crate::plugin_data::PluginStore>,
+    /// This plugin's own encrypted history stream. Always set by the engine.
+    /// Appending keeps working after lock; reading does not.
+    pub history: Option<crate::history_service::HistoryHandle>,
+    /// Monitoring is paused from the tray (also from a pause kept in the
+    /// runtime file across a restart).
+    pub paused: bool,
+}
+
+/// Handed to [`Plugin::run_locked`]. On a lock everything in it comes from
+/// the vault (what the plugin declared with `HistoryHandle::set_runtime`).
+/// At launch (`launch` is set) it comes from the runtime file on disk,
+/// which is checked against the vault only at the next unlock (ADR 0002 §6).
+#[derive(Clone)]
+pub struct LockedContext {
+    /// The plugin's own runtime section, as it last declared it.
+    pub runtime: Value,
+    /// This plugin's history stream: appending works, reading does not.
+    pub history: crate::history_service::HistoryHandle,
+    /// Monitoring is paused from the tray.
+    pub paused: bool,
+    /// Set when AegisWin resumes this work at launch, not at a lock.
+    pub launch: Option<Launch>,
+}
+
+/// How AegisWin was started, for a plugin's session record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Launch {
+    /// The owner started it.
+    #[default]
+    Manual,
+    /// The Startup shortcut started it at sign-in (`--background`).
+    Autostart,
+}
+
+impl Launch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Launch::Manual => "manual",
+            Launch::Autostart => "autostart",
+        }
+    }
+}
+
+/// Shown once after the first unlock that follows a resume at launch: when
+/// monitoring was not running before this launch (ADR 0002 §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeNotice {
+    /// When monitoring stopped (RFC 3339), if the history still has it.
+    pub from: Option<String>,
+    /// When this launch started monitoring again (RFC 3339).
+    pub to: String,
+    /// Why it was not running, in a plain sentence.
+    pub label: String,
+}
+
+/// Why AegisWin is exiting, for a plugin's clean-stop record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// Quit from the tray or by closing the window.
+    Quit,
+    /// Windows is shutting down or signing out (the event loop ended on its own).
+    Shutdown,
 }
 
 #[async_trait]
@@ -144,11 +282,72 @@ pub trait Plugin: Send + Sync {
     /// `inputSchema` with defaults applied, and the gate has already passed.
     async fn call(&self, tool: &str, args: Value, ctx: ToolContext) -> AegisResult<Value>;
 
-    /// Called when the vault unlocks with this plugin installed (start background work here).
-    fn on_unlock(&self, _enabled_components: &[String]) {}
+    /// Called when the vault unlocks with this plugin installed, and again
+    /// when its components change (start background work here).
+    fn on_unlock(&self, _ctx: &UnlockContext) {}
 
     /// Called when the vault locks or the plugin is uninstalled.
     fn on_lock(&self) {}
+
+    /// Describes a gated call for its approval request. Arguments are already
+    /// validated. `None` (the default) shows the tool description and the
+    /// arguments only.
+    fn review_call(&self, _tool: &str, _args: &Value, _enabled_components: &[String]) -> Option<CallReview> {
+        None
+    }
+
+    /// The exact commands a call would run, from a pure function of its
+    /// validated arguments (ADR 0004 §5). Whether it returns `Some` must
+    /// depend on the tool only. For a tool that returns `Some`:
+    /// - AegisWin answers `dryRun: true` itself, and never calls [`Plugin::call`] for it;
+    /// - the commands are shown with an approval request and covered by a plan's hash;
+    /// - AegisWin asks again just before the call runs, and refuses it if the answer changed.
+    ///
+    /// A tool that returns `None` (the default) gets no free dry run: `dryRun: true`
+    /// goes through the gate like any other call.
+    fn describe(&self, _tool: &str, _args: &Value) -> Option<AegisResult<Vec<CommandLine>>> {
+        None
+    }
+
+    /// True while the plugin is doing work the owner asked to keep running
+    /// in the background (for example an active monitor). Closing the window
+    /// then hides AegisWin to the tray instead of quitting.
+    fn background_active(&self) -> bool {
+        false
+    }
+
+    /// Called **instead of** `on_lock` when the vault locks while this plugin
+    /// has declared locked work (ADR 0002 §4) and its runtime file is not
+    /// waiting for review. It must drop everything `on_lock` drops, then may
+    /// keep running only what `ctx.runtime` describes, writing only to
+    /// `ctx.history`. Returns true if it keeps running. The default stops
+    /// everything, like `on_lock`.
+    fn run_locked(&self, _ctx: &LockedContext) -> bool {
+        self.on_lock();
+        false
+    }
+
+    /// Pause or resume background work from the tray (no PIN: agents cannot
+    /// reach the tray). The plugin records the pause in its history.
+    fn set_paused(&self, _paused: bool) {}
+
+    /// AegisWin is exiting: write a clean-stop record. Called before the
+    /// final `on_lock`, whether the vault is locked or not.
+    fn on_exit(&self, _reason: ExitReason) {}
+
+    /// Called once after `on_unlock` at each unlock. A plugin that resumed at
+    /// launch says when it was not running before; the engine shows it in
+    /// the app until dismissed. Never sent over MCP.
+    fn resume_notice(&self) -> Option<ResumeNotice> {
+        None
+    }
+
+    /// Whether the owner has saved background work (for `usage-monitor`:
+    /// any monitor, running or paused) that the Startup shortcut exists
+    /// for. `None` while not known yet; the shortcut is then kept.
+    fn saved_background_work(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 pub struct Registry {
@@ -160,6 +359,9 @@ impl Registry {
         let mut ids = std::collections::HashSet::new();
         for p in &plugins {
             p.manifest().validate()?;
+            if p.manifest().id == crate::history_service::APPROVALS_STREAM {
+                return Err(format!("plugin id '{}' is reserved for the approvals history", p.manifest().id));
+            }
             if !ids.insert(p.manifest().id.clone()) {
                 return Err(format!("duplicate plugin id '{}'", p.manifest().id));
             }
@@ -199,7 +401,7 @@ pub fn effective_policy(plugin_id: &str, tool: &ToolManifest, overrides: &BTreeM
     overrides.get(&policy_key(plugin_id, &tool.id)).copied().unwrap_or(tool.default_gate_policy)
 }
 
-/// A dry run only describes what would happen, so it skips the PIN and admin gates.
+/// The call asks for a dry run (`dryRun: true`, on a tool that declares it).
 pub fn is_dry_run(tool: &ToolManifest, args: &Value) -> bool {
     tool.input_schema.pointer("/properties/dryRun").is_some() && args.get("dryRun") == Some(&Value::Bool(true))
 }
@@ -211,9 +413,12 @@ pub enum Gate {
     NeedsAdmin,
 }
 
-/// Admin is checked before the PIN: approving something that cannot run would waste the approval.
-pub fn gate(tool: &ToolManifest, policy: GatePolicy, args: &Value, elevated: bool) -> Gate {
-    if is_dry_run(tool, args) {
+/// Admin is checked before the PIN: approving something that cannot run would
+/// waste the approval. A dry run skips both only when the plugin `describes`
+/// the tool, since AegisWin then answers it without calling the plugin
+/// (ADR 0004 §5).
+pub fn gate(tool: &ToolManifest, policy: GatePolicy, args: &Value, elevated: bool, describes: bool) -> Gate {
+    if describes && is_dry_run(tool, args) {
         Gate::Run
     } else if tool.requires_admin && !elevated {
         Gate::NeedsAdmin
@@ -282,16 +487,47 @@ mod tests {
     }
 
     #[test]
+    fn only_pin_gated_changes_with_a_dry_run_can_be_plan_steps() {
+        let mut m = manifest();
+        m.tools[1].plan_eligible = true;
+        m.validate().unwrap();
+        let broken: [fn(&mut ToolManifest); 4] = [
+            |t| t.default_gate_policy = GatePolicy::Auto,
+            |t| t.read_only = true,
+            |t| t.app_only = true,
+            |t| t.input_schema = json!({ "type": "object", "properties": {} }),
+        ];
+        for (i, breaks) in broken.iter().enumerate() {
+            let mut m = manifest();
+            m.tools[1].plan_eligible = true;
+            breaks(&mut m.tools[1]);
+            assert!(m.validate().unwrap_err().contains("planEligible"), "case {i}");
+        }
+        // A read-only tool can never be a step.
+        let mut m = manifest();
+        m.tools[0].plan_eligible = true;
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
     fn gate_order_dry_run_then_admin_then_pin() {
         let m = manifest();
         let fix = m.tool("fix_it").unwrap();
         let read = m.tool("read_it").unwrap();
-        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({ "dryRun": true }), false), Gate::Run);
-        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), false), Gate::NeedsAdmin);
-        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), true), Gate::NeedsPin);
-        assert_eq!(gate(read, GatePolicy::Auto, &json!({}), false), Gate::Run);
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({ "dryRun": true }), false, true), Gate::Run);
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), false, true), Gate::NeedsAdmin);
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({}), true, true), Gate::NeedsPin);
+        assert_eq!(gate(read, GatePolicy::Auto, &json!({}), false, false), Gate::Run);
         // dryRun only counts for tools that declare it.
-        assert_eq!(gate(read, GatePolicy::PinRequired, &json!({ "dryRun": true }), false), Gate::NeedsPin);
+        assert_eq!(gate(read, GatePolicy::PinRequired, &json!({ "dryRun": true }), false, true), Gate::NeedsPin);
+        // And only when the plugin describes the tool, so AegisWin answers it.
+        assert_eq!(gate(fix, GatePolicy::PinRequired, &json!({ "dryRun": true }), true, false), Gate::NeedsPin);
+    }
+
+    #[test]
+    fn command_lines_show_where_each_argument_ends() {
+        let c = CommandLine::new(r"C:\Windows\System32\ipconfig.exe", &["/release", "Wi-Fi 2", "", "a\"b"]);
+        assert_eq!(c.display(), r#"C:\Windows\System32\ipconfig.exe /release "Wi-Fi 2" "" "a\"b""#);
     }
 
     #[test]

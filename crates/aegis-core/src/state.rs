@@ -4,7 +4,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::chain::ChainVault;
+use crate::history::{Retention, StreamKey};
 use crate::llm::LlmConfig;
 use crate::registry::GatePolicy;
 use crate::secret::Secret;
@@ -22,13 +25,23 @@ pub struct McpConfig {
     pub auth_token: Secret,
     /// Add a Windows Firewall rule for LAN binds (only possible when elevated).
     pub open_firewall: bool,
+    /// The LAN certificate and its key (ADR 0004 §2). Made at the first LAN start.
+    #[serde(default)]
+    pub tls: Option<crate::tls::TlsMaterial>,
+    /// *Compatibility: plain HTTP* for a LAN bind. Turning it on needs the PIN.
+    #[serde(default)]
+    pub plain_http: bool,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { enabled: false, host: "127.0.0.1".into(), port: DEFAULT_MCP_PORT, auth_token: Secret::random_token(), open_firewall: true }
+        Self { enabled: false, host: "127.0.0.1".into(), port: DEFAULT_MCP_PORT, auth_token: Secret::random_token(), open_firewall: true, tls: None, plain_http: false }
     }
 }
+
+/// The idle auto-lock choices. There is no "off".
+pub const AUTO_LOCK_CHOICES: [u32; 4] = [5, 15, 30, 60];
+pub const DEFAULT_AUTO_LOCK_MINUTES: u32 = 15;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -42,8 +55,23 @@ pub struct VaultState {
     pub tool_gate_overrides: BTreeMap<String, GatePolicy>,
     /// UI zoom in percent (80-150).
     pub ui_scale: u32,
+    /// Minutes without owner activity before the vault locks itself (ADR 0002 §4).
+    pub auto_lock_minutes: u32,
     pub llm: LlmConfig,
     pub mcp: McpConfig,
+    /// Plugin id → key → record (`plugin_data::PluginStore`). Kept when a
+    /// plugin is uninstalled, but unreachable until it is installed again.
+    pub plugin_data: BTreeMap<String, BTreeMap<String, Value>>,
+    /// History stream → its keypair (ADR 0002 §5). The private half never
+    /// leaves the vault; the public half is cached for writing while locked.
+    pub history_keys: BTreeMap<String, StreamKey>,
+    /// History stream → retention, when the owner changed the default.
+    pub history_retention: BTreeMap<String, Retention>,
+    /// Chained stream → its MAC session keys and last checkpoint (ADR 0004 §4.2, §4.3).
+    pub history_chains: BTreeMap<String, ChainVault>,
+    /// Plugin id → what it runs while locked: the copy each runtime file is
+    /// checked against on unlock (`history_service::RuntimeFile::plugin`).
+    pub runtime: BTreeMap<String, Value>,
 }
 
 impl Default for VaultState {
@@ -55,8 +83,14 @@ impl Default for VaultState {
             trusted_external_llm_plugins: vec![],
             tool_gate_overrides: BTreeMap::new(),
             ui_scale: 100,
+            auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             llm: LlmConfig::default(),
             mcp: McpConfig::default(),
+            plugin_data: BTreeMap::new(),
+            history_keys: BTreeMap::new(),
+            history_retention: BTreeMap::new(),
+            history_chains: BTreeMap::new(),
+            runtime: BTreeMap::new(),
         }
     }
 }
@@ -84,7 +118,10 @@ mod tests {
         let state: VaultState = serde_json::from_str(r#"{ "firstRunCompleted": true, "installedPlugins": ["event-logs"] }"#).unwrap();
         assert!(state.first_run_completed);
         assert_eq!(state.ui_scale, 100);
+        assert_eq!(state.auto_lock_minutes, 15);
         assert_eq!(state.mcp.port, DEFAULT_MCP_PORT);
         assert_eq!(state.mcp.auth_token.expose().len(), 48);
+        assert!(state.plugin_data.is_empty());
+        assert!(state.history_keys.is_empty() && state.runtime.is_empty());
     }
 }

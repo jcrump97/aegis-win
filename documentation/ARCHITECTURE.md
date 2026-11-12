@@ -48,7 +48,7 @@ sequenceDiagram
     participant Agent as External AI Agent (MCP Client)
     participant MCP as AegisWin MCP Server (:47821)
     participant Gate as Tool Gate Policy Engine
-    participant Portal as Local Approval Web Page (/approve/:id)
+    participant Portal as AegisWin app (Approvals tab)
     participant User as Human Operator
 
     Agent->>MCP: POST /mcp (Bearer Token) -> tools/call "windows-health__winsock_reset"
@@ -58,10 +58,9 @@ sequenceDiagram
         MCP-->>Agent: 200 OK { content, structuredContent, isError: false }
     else Tool Policy == "pin_required"
         Gate->>MCP: Create ticket (128-bit id, CSRF token, 30-minute expiry)
-        MCP-->>Agent: 200 OK { status: "pending_approval", ticketId, approvalUrl: "http://127.0.0.1:47821/approve/{ticketId}" }
-        User->>Portal: Opens the approvalUrl (or approves in the AegisWin app)
-        Portal-->>User: No-script page: tool, arguments, PIN, note, Approve/Decline
-        User->>Portal: POST /approve/{ticketId} { csrf, decision: "approve", comment: "Proceed before reboot", pin }
+        MCP-->>Agent: 200 OK { status: "pending_approval", ticketId, message: "Waiting for the owner to approve in the AegisWin app." }
+        Portal-->>User: Toast and Approvals badge: tool, arguments, PIN, note, Approve/Decline
+        User->>Portal: Approve { decision: "approve", comment: "Proceed before reboot", pin }
         Portal->>Gate: Check PIN through the global PIN guard (never stored in the ticket); 3 wrong PINs lock the ticket
         Gate->>Gate: Re-check install state, then run "windows-health__winsock_reset" in the background (status: running)
         Agent->>MCP: POST /mcp -> tools/call "aegis__check_ticket" { ticketId }
@@ -85,8 +84,33 @@ flowchart TD
     I --> E
 ```
 
+Every request is first fitted to the owner's context window setting (default 8192 tokens): the payload is sent as compact JSON, a diagnostic payload is shortened to fit, and a monitor chat turn that does not fit is refused. On Ollama (detected with `GET /api/version` on a LAN `/v1` base URL) the request goes to the native `/api/chat` with `num_ctx`, because Ollama's OpenAI endpoint ignores it; other servers get `/v1/chat/completions` with `max_tokens`. The reply budget is what the window has left after the prompt, at least the caller's floor (2048 by default), and at most a quarter of the window or 8192. Thinking models on Ollama get `think: false` (gpt-oss: `"low"`) when `/api/show` lists the `thinking` capability. A reply cut off at the budget is used when it already holds a complete JSON object; otherwise it is asked for once more with an "answer only" instruction and up to half the window (at most 16384). Answers stream in, with a configurable wait for the first piece (default 180 s), 60 s allowed between pieces and 10 minutes in all. See SECURITY_MODEL §6.
+
 ### 2.3 Long-Running Approved Tools (`sfc /scannow`)
-An approved ticket moves to `running` and the tool runs on a background task, so the approval page and the app return at once. The agent polls `aegis__check_ticket` until the status is final: `approved` (with the result), `execution_failed`, `declined`, `locked_out`, or `expired`. There is no progress percentage; `sfc /scannow` reports only its final result.
+An approved ticket moves to `running` (or `queued` while another change runs) and the tool runs on a background task, so the app and the device page return at once. The agent polls `aegis__check_ticket` until the status is final: `approved` (with the result), `execution_failed`, `declined`, `locked_out`, `expired`, or `cancelled`. There is no progress percentage; `sfc /scannow` reports only its final result.
+
+#### Action plans ([ADR 0003](adr/0003-action-plans.md))
+
+```mermaid
+sequenceDiagram
+    participant Agent as External AI Agent
+    participant MCP as AegisWin MCP Server
+    participant Engine as Engine (plan + executor)
+    participant Portal as Approvals tab
+    participant User as Owner
+
+    Agent->>MCP: tools/call "aegis__propose_plan" { title, reasoning, steps[1..5] }
+    MCP->>Engine: Check every step (planEligible, schema + defaults, plugin, component, admin), dry-run each
+    Engine-->>Agent: { status: "pending_approval", ticketId, plan: { shortHash, ... }, steps: [{ commands }] }
+    User->>Portal: Opens the plan: summary, every step, arguments, commands, labelled supplied text, fingerprint
+    User->>Portal: Approve { plan_hash, pin } (or, on the opt-in device page: csrf, plan_hash, one-time code)
+    Portal->>Engine: Hash matches (constant time) → PIN → re-check every step → queue
+    loop Each step, holding the one change slot
+        Engine->>Engine: Stop if cancelled or auto-lock is due; re-check; run; stop at the first failure
+    end
+    Agent->>MCP: tools/call "aegis__check_ticket" → steps[].status (succeeded / failed / skipped / cancelled)
+    Agent->>MCP: tools/call "aegis__cancel_ticket" (optional) → stops before the next step
+```
 
 ### 2.4 Process & Trust Layout
 
@@ -101,12 +125,14 @@ flowchart LR
     end
     PLG -- "Win32 via windows crate /<br/>absolute-path binaries, argv only" --> OS[(Windows)]
     AGENT["MCP client agent"] -- "POST /mcp (Bearer)" --> CORE
-    BROWSER["User's browser<br/>/approve/:ticketId"] -- "PIN + decision" --> CORE
+    BROWSER["Opt-in device page<br/>/approve/:ticketId"] -- "one-time code + decision" --> CORE
     CORE -- "Off-LAN only if plugin trusted;<br/>payload sanitized" --> LLM["LLM endpoint"]
 ```
 
-- The PIN crosses the webview→Rust boundary only as an argument of the one command that needs it (unlock, a gated run, an approval, a gate or trust change) and is never stored in JS state. Approval PINs from the browser portal go straight to the Rust HTTP handler. See [SECURITY_MODEL §2.1](SECURITY_MODEL.md).
+- The PIN crosses the webview→Rust boundary only as an argument of the one command that needs it (unlock, a gated run, an approval, a gate or trust change) and is never stored in JS state. No web page takes the PIN; the opt-in device page takes a one-time code the app showed, which the engine checks against its SHA-256 hash. See [SECURITY_MODEL §2.1](SECURITY_MODEL.md).
 - The UI receives display data only: no API keys, no bearer tokens, no derived keys.
+- State-changing tool runs go through one serial executor (`aegis-core::executor`), whatever their origin, so two repairs never overlap. See [SECURITY_MODEL §4](SECURITY_MODEL.md).
+- One process per install folder (a named mutex keyed on the folder). A tray icon (Open, Lock, Pause monitoring, Quit) keeps the process alive while a monitor runs and the window is closed, also while locked (*locked, monitoring*: `Plugin::run_locked`, ADR 0002 §4). Every launch first resumes running monitors from the runtime files (`Engine::resume_at_launch`, ADR 0002 §6); `--background` starts without a window; the opt-in Startup shortcut (`aegis_core::autostart`, IShellLinkW) uses it. A shell thread checks idle auto-lock every 5 seconds through `Engine::lock_if_idle`, and on the same tick tells the owner about new agent requests when the window is not in front (tray balloon, taskbar flash; `aegis_core::notify`). See [SECURITY_MODEL §9](SECURITY_MODEL.md).
 
 ## 3. Directory Structure
 ```
@@ -126,4 +152,14 @@ aegis-win/
 ├── scripts/build-launcher.mjs  # npm run launcher:build: rebuilds Start AegisWin.exe from launcher/
 ├── documentation/              # Specs, ADRs, audit ledger
 └── tests/                      # Node tests for repo, docs, and UI/Tauri wiring invariants (Rust tests live beside their crates)
+```
+
+At run time, next to the executable:
+```
+data/
+├── vault.enc.json              # Encrypted vault: settings, plugin data, history private keys
+├── webview/                    # WebView2 profile
+├── history/<stream>/           # Encrypted, write-only history segments (seg-YYYYMMDD-NNN.bin), one folder per stream;
+│                               #   `approvals` is the engine's own approval record (ADR 0003 §7)
+└── runtime/<plugin>.json       # Plaintext: what a plugin runs while locked, with its stream's public key (checked on unlock)
 ```

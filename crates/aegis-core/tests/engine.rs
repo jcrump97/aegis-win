@@ -21,6 +21,8 @@ async fn setup_lock_and_unlock() {
     let status = f.engine.status();
     assert!(!status.vault_exists && !status.unlocked);
     assert_eq!(f.engine.setup("123".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    // A six-digit PIN is no longer a vault key (ADR 0004 §3.2).
+    assert_eq!(f.engine.setup("135790".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
 
     let status = f.engine.setup(PIN.into()).await.unwrap();
     assert!(status.vault_exists && status.unlocked && !status.first_run_completed);
@@ -211,6 +213,20 @@ async fn settings_are_validated_and_hold_no_secrets() {
     assert_eq!(err.code, ErrorCode::InvalidArguments, "off-LAN must be https");
     let err = f.engine.update_settings(SettingsUpdate { ui_scale: Some(300), ..Default::default() }).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidArguments);
+    for bad in [1024, 200_000] {
+        let err = f.engine.update_settings(SettingsUpdate { llm_context_tokens: Some(bad), ..Default::default() }).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArguments, "{bad}");
+    }
+    assert_eq!(f.engine.settings().await.unwrap().llm.context_tokens, 8192, "the default");
+    let view = f.engine.update_settings(SettingsUpdate { llm_context_tokens: Some(32768), ..Default::default() }).await.unwrap();
+    assert_eq!(view.llm.context_tokens, 32768);
+    for bad in [10, 1000] {
+        let err = f.engine.update_settings(SettingsUpdate { llm_first_token_secs: Some(bad), ..Default::default() }).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArguments, "{bad}");
+    }
+    assert_eq!(view.llm.first_token_secs, 180, "the default");
+    let view = f.engine.update_settings(SettingsUpdate { llm_first_token_secs: Some(600), ..Default::default() }).await.unwrap();
+    assert_eq!(view.llm.first_token_secs, 600);
 
     f.engine.set_llm_api_key("sk-secret-value".into()).unwrap();
     let view = f.engine.update_settings(SettingsUpdate { ui_scale: Some(125), mcp_host: Some("192.168.1.20".into()), ..Default::default() }).await.unwrap();
@@ -226,14 +242,47 @@ async fn settings_are_validated_and_hold_no_secrets() {
 }
 
 #[tokio::test]
-async fn changing_the_pin_re_keys_the_vault() {
+async fn changing_the_passphrase_re_keys_the_vault() {
     let f = ready().await;
-    assert_eq!(f.engine.change_pin("000000".into(), "135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
-    assert_eq!(f.engine.change_pin(PIN.into(), "1".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
-    f.engine.change_pin(PIN.into(), "135791".into()).await.unwrap();
+    let next = "next-passphrase-1";
+    assert_eq!(f.engine.change_passphrase("000000".into(), next.into(), None).await.unwrap_err().code, ErrorCode::PinInvalid);
+    // A new key must meet the passphrase rule (ADR 0004 §3.2).
+    assert_eq!(f.engine.change_passphrase(PIN.into(), "135791".into(), None).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert_eq!(f.engine.change_passphrase(PIN.into(), next.into(), Some("12345".into())).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert_eq!(f.engine.change_passphrase(PIN.into(), next.into(), Some(next.into())).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    let status = f.engine.change_passphrase(PIN.into(), next.into(), None).await.unwrap();
+    assert!(!status.needs_passphrase && !status.this_pc_pin);
     f.engine.lock().await;
     assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    f.engine.unlock(next.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_short_pin_on_this_pc_unlocks_and_approves_until_forgotten() {
+    let f = ready().await;
+    assert!(!f.engine.status().this_pc_pin);
+    assert_eq!(f.engine.set_this_pc_pin("000000".into(), "135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    assert_eq!(f.engine.set_this_pc_pin(PIN.into(), "1357".into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert_eq!(f.engine.set_this_pc_pin(PIN.into(), PIN.into()).await.unwrap_err().code, ErrorCode::PinTooWeak);
+    assert!(f.engine.set_this_pc_pin(PIN.into(), "135791".into()).await.unwrap().this_pc_pin);
+    // Either secret works for approvals.
+    f.engine.check_pin("135791").await.unwrap();
+    f.engine.check_pin(PIN).await.unwrap();
+    f.engine.lock().await;
+    assert!(f.engine.status().this_pc_pin, "known while locked, for the unlock screen");
     f.engine.unlock("135791".into()).await.unwrap();
+    f.engine.lock().await;
+    // Forgetting needs no PIN and works while locked.
+    assert!(!f.engine.forget_this_pc().unwrap().this_pc_pin);
+    assert_eq!(f.engine.unlock("135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    f.engine.unlock(PIN.into()).await.unwrap();
+    // A new passphrase keeps the PC PIN only if it is set again.
+    f.engine.set_this_pc_pin(PIN.into(), "135791".into()).await.unwrap();
+    let status = f.engine.change_passphrase("135791".into(), "next-passphrase-1".into(), Some("975310".into())).await.unwrap();
+    assert!(status.this_pc_pin);
+    f.engine.lock().await;
+    assert_eq!(f.engine.unlock("135791".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    f.engine.unlock("975310".into()).await.unwrap();
 }
 
 #[tokio::test]
@@ -259,4 +308,85 @@ async fn trust_is_reset_when_the_llm_destination_changes() {
     let view = f.engine.update_settings(SettingsUpdate { llm_model: Some("gpt-oss:120b-cloud".into()), ..Default::default() }).await.unwrap();
     assert!(view.llm.endpoint.as_ref().unwrap().relayed);
     assert!(!trusted(&f), "moving to a cloud model needs a new grant");
+}
+
+#[tokio::test]
+async fn a_rejected_settings_change_changes_nothing() {
+    let f = ready().await;
+    // The scale and URL are valid; the port is not, so the whole update must be rejected.
+    let bad = SettingsUpdate { ui_scale: Some(130), llm_base_url: Some("http://192.168.1.50:11434/v1".into()), mcp_port: Some(80), ..Default::default() };
+    assert_eq!(f.engine.update_settings(bad).await.unwrap_err().code, ErrorCode::InvalidArguments);
+    let view = f.engine.settings().await.unwrap();
+    assert_eq!(view.ui_scale, 100);
+    assert_ne!(view.llm.base_url, "http://192.168.1.50:11434/v1");
+    // A later, unrelated save must not write the rejected values to disk either.
+    f.engine.set_llm_api_key(String::new()).unwrap();
+    f.engine.lock().await;
+    f.engine.unlock(PIN.into()).await.unwrap();
+    assert_eq!(f.engine.settings().await.unwrap().ui_scale, 100);
+}
+
+#[tokio::test]
+async fn idle_auto_lock_counts_only_the_owner() {
+    let f = ready().await;
+    let minutes = |m: u64| Duration::from_secs(m * 60);
+    assert_eq!(f.engine.settings().await.unwrap().auto_lock_minutes, 15, "default");
+    assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(14)).await);
+
+    // Agent requests and the approval page do not count as the owner being here.
+    let before = f.engine.last_activity();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let RunOutcome::PendingApproval { ticket } = f.engine.run_tool(Origin::Mcp, "demo", "fix", json!({})).await.unwrap() else { panic!() };
+    f.engine.run_tool(Origin::Mcp, "demo", "echo", json!({ "text": "hi" })).await.unwrap();
+    f.engine.ticket(&ticket.ticket_id).unwrap();
+    assert_eq!(f.engine.last_activity(), before);
+    // A wrong PIN does not either; a correct one does, wherever it is typed.
+    f.engine.decide_ticket(&ticket.ticket_id, false, "000000".into(), None, "browser").await.unwrap_err();
+    assert_eq!(f.engine.last_activity(), before);
+    f.engine.decide_ticket(&ticket.ticket_id, false, PIN.into(), None, "browser").await.unwrap();
+    assert!(f.engine.last_activity() > before);
+
+    // Only the listed choices; there is no "off".
+    for bad in [0, 1, 10, 120] {
+        let err = f.engine.update_settings(SettingsUpdate { auto_lock_minutes: Some(bad), ..Default::default() }).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArguments, "{bad}");
+    }
+    f.engine.update_settings(SettingsUpdate { auto_lock_minutes: Some(5), ..Default::default() }).await.unwrap();
+    assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(4)).await);
+    f.engine.note_activity();
+    assert!(f.engine.lock_if_idle(f.engine.last_activity() + minutes(5)).await);
+    assert!(!f.engine.status().unlocked);
+    assert!(!f.engine.lock_if_idle(f.engine.last_activity() + minutes(60)).await, "already locked");
+}
+
+#[tokio::test]
+async fn agents_can_keep_only_ten_requests_waiting_and_thirty_an_hour() {
+    use aegis_core::engine::{AGENT_REQUESTS_PER_HOUR, MAX_AGENT_PENDING};
+    let f = ready().await;
+    let ask = || f.engine.run_tool(Origin::Mcp, "demo", "fix", json!({ "note": "x" }));
+    let mut ids = Vec::new();
+    for _ in 0..MAX_AGENT_PENDING {
+        let RunOutcome::PendingApproval { ticket } = ask().await.unwrap() else { panic!() };
+        ids.push(ticket.ticket_id);
+    }
+    let err = ask().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    assert!(err.message.contains("already waiting for the owner"), "{}", err.message);
+    // The owner's own plans are not agent requests.
+    let own = f.engine.propose_plan(aegis_core::plan::PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "mine" } }] })).await;
+    assert!(own.is_ok(), "{own:?}");
+
+    // Withdrawn requests free their place, but every request counts toward the hour.
+    for id in &ids {
+        f.engine.cancel_ticket(id).unwrap();
+    }
+    let used = MAX_AGENT_PENDING + 1;
+    for _ in used..AGENT_REQUESTS_PER_HOUR {
+        let RunOutcome::PendingApproval { ticket } = ask().await.unwrap() else { panic!() };
+        f.engine.cancel_ticket(&ticket.ticket_id).unwrap();
+    }
+    let err = ask().await.unwrap_err();
+    assert!(err.message.contains("in the last hour"), "{}", err.message);
+    let plan = f.engine.propose_plan(aegis_core::plan::PlanOrigin::Agent, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "p" } }] })).await.unwrap_err();
+    assert!(plan.message.contains("in the last hour"), "plans count too: {}", plan.message);
 }
