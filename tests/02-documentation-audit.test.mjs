@@ -123,5 +123,9 @@ test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestio
   // Checks cannot write, record, or call an LLM; the AI can only pick tools code linked to a finding.
   assert.ok(adr.includes('It has **no** `PluginStore`, history handle, or `LlmHandle`.'), 'checks get no store, history, or LLM');
   assert.ok(adr.includes("appears in **that finding's own `next` list**"), 'AI steps are limited to code-linked tools');
+  // Review fixes: the engine (not the plugin) enforces nextTools, and Diagnose cannot bypass a tightened read tool.
+  assert.ok(adr.includes('**The engine, not the plugin, enforces `nextTools`.**'), 'engine enforces nextTools');
+  assert.ok(adr.includes('**It follows the owner\'s gates, not only its own.**'), 'aegis__diagnose respects pin_required read tools');
+  assert.ok(adr.includes('**One diagnosis at a time.**'), 'one diagnosis at a time');
   for (const d of ['D1', 'D2', 'D3', 'D4', 'D5']) assert.match(adr, new RegExp(String.raw`^- \*\*` + d + String.raw`\. .*\*\*Decided: \([ab]\)`, 'm'), `${d} is decided`);
 });
