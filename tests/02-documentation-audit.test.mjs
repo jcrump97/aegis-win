@@ -118,10 +118,10 @@ test('Documentation Audit: ADR 0004 is accepted and records every owner decision
 
 test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestions bound to them', () => {
   const adr = fs.readFileSync('documentation/adr/0005-diagnose-this-pc.md', 'utf8');
-  assert.match(adr, /\*\*Status\*\*: (Proposed|Accepted)/);
+  assert.match(adr, /\*\*Status\*\*: Accepted/);
   assert.match(adr, /code finds, code describes, the AI ranks and explains, the owner approves with the PIN/);
   // Checks cannot write, record, or call an LLM; the AI can only pick tools code linked to a finding.
   assert.ok(adr.includes('It has **no** `PluginStore`, history handle, or `LlmHandle`.'), 'checks get no store, history, or LLM');
   assert.ok(adr.includes("appears in **that finding's own `next` list**"), 'AI steps are limited to code-linked tools');
-  for (const d of ['D1', 'D2', 'D3', 'D4', 'D5']) assert.ok(adr.includes(`- **${d}. `), `${d} is listed`);
+  for (const d of ['D1', 'D2', 'D3', 'D4', 'D5']) assert.match(adr, new RegExp(String.raw`^- \*\*` + d + String.raw`\. .*\*\*Decided: \([ab]\)`, 'm'), `${d} is decided`);
 });

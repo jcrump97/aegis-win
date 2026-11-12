@@ -1,6 +1,6 @@
 # ADR 0005: Diagnose this PC
 
-- **Status**: Proposed (2026-11-11). Decisions D1-D5 in §9 wait for the owner.
+- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase.
 - **Date**: 2026-11-11
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (AI replies as untrusted input, code-written descriptions), [ADR 0003](0003-action-plans.md) (plans), [ADR 0004 §8](0004-approval-channel-and-key-hardening.md) (security scope), [PLUGIN_SPEC](../PLUGIN_SPEC.md), [SECURITY_MODEL](../SECURITY_MODEL.md)
 
@@ -139,13 +139,13 @@ Event messages are written by whatever program logged them, so a message can con
 
 Each phase is its own PR with tests, a ledger row, and doc updates (ARCHITECTURE, PLUGIN_SPEC §2 `checks` and the hook, SECURITY_MODEL for §6, the README).
 
-## 9. Decisions for the owner
+## 9. Decisions (accepted by the owner, 2026-11-11)
 
-- **D1. Diagnose without an LLM.** (a) The findings, cards and Add to plan all work with no LLM; the AI only adds a summary and a suggested plan. (b) Diagnose needs an LLM. *Recommendation: (a).* Many owners will not have an LLM running. Code-written findings can be tested, and they are what the AI's output is checked against.
-- **D2. `aegis__diagnose` over MCP.** (a) Expose it, `auto` and read-only. (b) In the app only (`appOnly`). *Recommendation: (a).* It gives agents nothing `query_logs` does not, and saves them guessing event IDs.
-- **D3. Landing tab.** (a) Diagnose becomes the first tab and opens after unlock. (b) Add it as another tab. *Recommendation: (a).* It is the main thing AegisWin is for.
-- **D4. Keeping results.** (a) The last report is kept in memory and dropped on lock. (b) Save each report to an encrypted `diagnose` history stream so runs can be compared. *Recommendation: (a) now and (b) later,* once there is a use for comparing runs.
-- **D5. Dismissing a finding.** (a) Not in Phase 1. (b) "Hide this finding" saved in the vault, PIN-free, shown under "Hidden" with Undo. *Recommendation: (a), and (b) once there is real use to learn from.* Hiding things on a diagnostic screen should be designed around false alarms that have actually happened.
+- **D1. Diagnose without an LLM.** (a) The findings, cards and Add to plan all work with no LLM; the AI only adds a summary and a suggested plan. (b) Diagnose needs an LLM. *Recommendation: (a).* Many owners will not have an LLM running. Code-written findings can be tested, and they are what the AI's output is checked against. **Decided: (a).**
+- **D2. `aegis__diagnose` over MCP.** (a) Expose it, `auto` and read-only. (b) In the app only (`appOnly`). *Recommendation: (a).* It gives agents nothing `query_logs` does not, and saves them guessing event IDs. **Decided: (a).**
+- **D3. Landing tab.** (a) Diagnose becomes the first tab and opens after unlock. (b) Add it as another tab. *Recommendation: (a).* It is the main thing AegisWin is for. **Decided: (a).**
+- **D4. Keeping results.** (a) The last report is kept in memory and dropped on lock. (b) Save each report to an encrypted `diagnose` history stream so runs can be compared. *Recommendation: (a) now and (b) later,* once there is a use for comparing runs. **Decided: (a) now, (b) later.**
+- **D5. Dismissing a finding.** (a) Not in Phase 1. (b) "Hide this finding" saved in the vault, PIN-free, shown under "Hidden" with Undo. *Recommendation: (a), and (b) once there is real use to learn from.* Hiding things on a diagnostic screen should be designed around false alarms that have actually happened. **Decided: (a).**
 
 ## Consequences
 
