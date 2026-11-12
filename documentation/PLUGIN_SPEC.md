@@ -58,6 +58,17 @@ A tool that runs system commands SHOULD implement `Plugin::describe(tool, args) 
 
 A tool whose plugin does not describe it gets no free dry run: `dryRun: true` goes through the gate like any other call and, approved, runs in the one change slot. When a real run does not succeed but returns normally, it MUST say so with `"success": false`: a plan treats that as a failed step and stops.
 
+### 2.4 Diagnose checks ([ADR 0005](adr/0005-diagnose-this-pc.md))
+A plugin may declare read-only health checks in `checks` (default empty): `{ "id", "name", "description", "nextTools": ["plugin:tool", ...] }`. A check id is lowercase letters, digits and `_`, unique in the plugin. **The manifest is rejected at startup** unless every `nextTools` entry names a `planEligible` tool of a compiled plugin (this one or another). Unknown fields are rejected.
+
+The plugin implements `Plugin::run_checks(&CheckContext) -> Vec<CheckResult>`, one result per declared check: `ran` with its findings (none means fine), `skipped` with a reason the owner can act on, or `failed`. `CheckContext` carries the lookback window, the enabled components, `elevated`, and the run's `now`. It has **no** `PluginStore`, history handle, or `LlmHandle`: a check reads Windows and must change nothing. Write each check as a pure function over what it read and `now`, so it can be tested on recorded events.
+
+A `Finding` has a `key` (tells findings of one check apart, such as a program; `None` for at most one finding), `severity` (`critical` / `warning` / `info`), `title`, `detail`, `count` (and `countIsMinimum` when a read hit the 500-event cap), `firstSeen`/`lastSeen`, up to 5 `evidence` records, and `next` steps: `tool` (`plugin:tool`, `args`, `why`) or `manual` (`text`). **The engine, not the plugin, enforces the rest**:
+- checks the manifest does not declare are ignored; a declared check with no result is reported as failed;
+- a `tool` step is dropped unless it is in the check's `nextTools`, its plugin is installed, and its `args` pass the tool's schema (defaults filled in); a step whose tool's component is off or that needs administrator rights is kept and marked unavailable, with the reason;
+- text is flattened and cut (titles 160, details 600, evidence messages 300 characters), hidden characters are removed, and the finding id becomes `<plugin>.<check>` or `<plugin>.<check>:<key>`, with duplicates dropped;
+- a plugin's checks get 20 seconds in all; past that, each is reported as failed ("Timed out.").
+
 ## 3. Tool Gate Policy Values
 - `"auto"`: Executes immediately when invoked from the UI or MCP server (ideal for read-only log queries or telemetry snapshots).
 - `"pin_required"`: Requires explicit human approval with the PIN on the app's Approvals tab when called over MCP (or the PIN confirmation modal for in-app runs). With the opt-in **Approve from another device**, a one-time code shown in the app can approve it on the device page instead. Users can change every tool's gate policy on the app's MCP server tab; loosening a gate to `auto` needs the PIN.

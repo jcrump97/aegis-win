@@ -128,4 +128,10 @@ test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestio
   assert.ok(adr.includes('**It follows the owner\'s gates, not only its own.**'), 'aegis__diagnose respects pin_required read tools');
   assert.ok(adr.includes('**One diagnosis at a time.**'), 'one diagnosis at a time');
   for (const d of ['D1', 'D2', 'D3', 'D4', 'D5']) assert.match(adr, new RegExp(String.raw`^- \*\*` + d + String.raw`\. .*\*\*Decided: \([ab]\)`, 'm'), `${d} is decided`);
+  // Phase 1a: the plugin contract for checks is documented where plugin authors look.
+  const spec = fs.readFileSync('documentation/PLUGIN_SPEC.md', 'utf8');
+  assert.match(spec, /### 2\.4 Diagnose checks/);
+  assert.ok(spec.includes('**The manifest is rejected at startup** unless every `nextTools` entry names a `planEligible` tool'), 'nextTools is validated at startup');
+  assert.ok(spec.includes('**The engine, not the plugin, enforces the rest**'), 'the engine enforces next steps');
+  assert.match(fs.readFileSync('documentation/ARCHITECTURE.md', 'utf8'), /### 2\.5 Diagnose this PC/);
 });

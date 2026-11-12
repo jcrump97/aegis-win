@@ -134,6 +134,9 @@ flowchart LR
 - State-changing tool runs go through one serial executor (`aegis-core::executor`), whatever their origin, so two repairs never overlap. See [SECURITY_MODEL §4](SECURITY_MODEL.md).
 - One process per install folder (a named mutex keyed on the folder). A tray icon (Open, Lock, Pause monitoring, Quit) keeps the process alive while a monitor runs and the window is closed, also while locked (*locked, monitoring*: `Plugin::run_locked`, ADR 0002 §4). Every launch first resumes running monitors from the runtime files (`Engine::resume_at_launch`, ADR 0002 §6); `--background` starts without a window; the opt-in Startup shortcut (`aegis_core::autostart`, IShellLinkW) uses it. A shell thread checks idle auto-lock every 5 seconds through `Engine::lock_if_idle`, and on the same tick tells the owner about new agent requests when the window is not in front (tray balloon, taskbar flash; `aegis_core::notify`). See [SECURITY_MODEL §9](SECURITY_MODEL.md).
 
+### 2.5 Diagnose this PC ([ADR 0005](adr/0005-diagnose-this-pc.md))
+`Engine::diagnose(lookbackDays)` (1, 7 or 30) runs every installed plugin's `run_checks` concurrently, 20 s per plugin, and returns a report: `{ranAt, lookbackDays, elevated, checks[], findings[]}`, findings sorted by severity, then recency, then count. It is read-only: no executor turn, no ticket, and checks get no store, history or LLM. It is refused while the vault is locked, and a report finished after a lock is withheld. One diagnosis runs at a time; a request made while one runs gets that run's report. Each finding's tool steps are limited by the engine to the check's `nextTools` from `manifest.json` (PLUGIN_SPEC §2.4).
+
 ## 3. Directory Structure
 ```
 aegis-win/

@@ -15,6 +15,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::chain::{self, Head, MacCheck, Session};
+use crate::diagnose::{self, CheckContext, CheckResult, ToolAvailability};
 use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
 use crate::history::{self, Retention, StreamKey, StreamRead};
@@ -93,6 +94,9 @@ pub struct Engine {
     record_hard_bytes: AtomicU64,
     /// Held events dropped because too many were waiting; noted in the record once it can be written.
     unwritten_lost: AtomicU64,
+    /// The Diagnose run in progress, if any: a second request shares its
+    /// report instead of starting another (ADR 0005 §2).
+    diagnosis: Mutex<Option<tokio::sync::watch::Receiver<Option<AegisResult<diagnose::Report>>>>>,
 }
 
 /// The approval record refuses new agent requests at this size (ADR 0004 §4.5).
@@ -370,6 +374,7 @@ impl Engine {
             record_full_bytes: AtomicU64::new(APPROVAL_RECORD_FULL_BYTES),
             record_hard_bytes: AtomicU64::new(APPROVAL_RECORD_FULL_BYTES + APPROVAL_RECORD_HEADROOM),
             unwritten_lost: AtomicU64::new(0),
+            diagnosis: Mutex::new(None),
             data_dir,
             registry,
             vault: Mutex::new(None),
@@ -2694,6 +2699,95 @@ impl Engine {
             s.mcp.auth_token = Secret::random_token();
             Ok(())
         })
+    }
+
+    // ---- Diagnose (ADR 0005) ---------------------------------------------
+
+    /// Runs every installed plugin's checks and returns the report. Read-only:
+    /// no executor turn, no ticket. One run at a time: a request made while
+    /// one runs waits for it and gets its report.
+    pub async fn diagnose(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {
+        if !diagnose::LOOKBACK_DAYS.contains(&lookback_days) {
+            return Err(AegisError::invalid(format!("Look back 1, 7 or 30 days, not {lookback_days}.")));
+        }
+        self.with_state(|_| ())?;
+        let mut rx = {
+            let mut slot = lock(&self.diagnosis);
+            // A closed channel means the last run's task ended without a report.
+            match slot.as_ref().filter(|rx| rx.has_changed().is_ok()) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    *slot = Some(rx.clone());
+                    let engine = self.self_arc()?;
+                    // On its own task, so a caller that goes away does not leave the others waiting.
+                    tokio::spawn(async move {
+                        let report = engine.run_diagnosis(lookback_days).await;
+                        // Cleared before the result is sent, so a later request starts a fresh run.
+                        *lock(&engine.diagnosis) = None;
+                        let _ = tx.send(Some(report));
+                    });
+                    rx
+                }
+            }
+        };
+        let report = rx.wait_for(Option::is_some).await.map_err(|_| internal("the diagnosis stopped"))?.clone();
+        // The vault may have locked while the checks ran.
+        self.with_state(|_| ())?;
+        report.expect("waited for Some")
+    }
+
+    async fn run_diagnosis(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {
+        let ran_at = chrono::Utc::now();
+        let installed: BTreeMap<String, Vec<String>> = self.with_state(|s| {
+            s.installed_plugins.iter().filter(|id| self.registry.plugin(id).is_some()).map(|id| (id.clone(), s.components_for(id))).collect()
+        })?;
+        let mut runs = tokio::task::JoinSet::new();
+        for (index, plugin) in self.registry.plugins().iter().enumerate() {
+            let id = &plugin.manifest().id;
+            let Some(components) = installed.get(id) else { continue };
+            if plugin.manifest().checks.is_empty() {
+                continue;
+            }
+            let ctx = CheckContext { lookback_days, enabled_components: components.clone(), elevated: self.elevated, now: ran_at };
+            let plugin = plugin.clone();
+            runs.spawn(async move { (index, tokio::time::timeout(diagnose::PLUGIN_TIME_LIMIT, async { plugin.run_checks(&ctx).await }).await) });
+        }
+        let mut results: BTreeMap<usize, Vec<CheckResult>> = BTreeMap::new();
+        let mut stopped: BTreeMap<usize, &'static str> = BTreeMap::new();
+        while let Some(joined) = runs.join_next().await {
+            match joined {
+                Ok((index, Ok(found))) => {
+                    results.insert(index, found);
+                }
+                Ok((index, Err(_elapsed))) => {
+                    stopped.insert(index, "Timed out.");
+                }
+                // A panic in a plugin's checks: the task's index is lost with it, so
+                // its checks are reported below as not reported.
+                Err(_) => {}
+            }
+        }
+        let installed_fn = |id: &str| installed.contains_key(id);
+        let components_fn = |id: &str| installed.get(id).cloned().unwrap_or_default();
+        let tools = ToolAvailability { registry: &self.registry, installed: &installed_fn, components: &components_fn, elevated: self.elevated };
+        let mut checks = Vec::new();
+        let mut findings = Vec::new();
+        for (index, plugin) in self.registry.plugins().iter().enumerate() {
+            let manifest = plugin.manifest();
+            if !installed.contains_key(&manifest.id) || manifest.checks.is_empty() {
+                continue;
+            }
+            let reported = match stopped.get(&index) {
+                Some(reason) => manifest.checks.iter().map(|c| CheckResult::failed(&c.id, *reason)).collect(),
+                None => results.remove(&index).unwrap_or_default(),
+            };
+            let (entries, found) = diagnose::collect(manifest, reported, &tools);
+            checks.extend(entries);
+            findings.extend(found);
+        }
+        diagnose::sort(&mut findings);
+        Ok(diagnose::Report { ran_at, lookback_days, elevated: self.elevated, checks, findings })
     }
 
     fn self_arc(&self) -> AegisResult<Arc<Self>> {
