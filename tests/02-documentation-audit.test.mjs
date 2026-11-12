@@ -115,3 +115,17 @@ test('Documentation Audit: ADR 0004 is accepted and records every owner decision
   for (const trigger of ['**A finding.**', '**New attack surface.**', '**An outside security review.**']) assert.ok(adr.includes(trigger), `§8 lists ${trigger}`);
   assert.match(fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8'), /security baseline for 0\.x\. .*\[ADR 0004 §8\]\(adr\/0004-approval-channel-and-key-hardening\.md\)/, 'SECURITY_MODEL points to the scope rule');
 });
+
+test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestions bound to them', () => {
+  const adr = fs.readFileSync('documentation/adr/0005-diagnose-this-pc.md', 'utf8');
+  assert.match(adr, /\*\*Status\*\*: Accepted/);
+  assert.match(adr, /code finds, code describes, the AI ranks and explains, the owner approves with the PIN/);
+  // Checks cannot write, record, or call an LLM; the AI can only pick tools code linked to a finding.
+  assert.ok(adr.includes('It has **no** `PluginStore`, history handle, or `LlmHandle`.'), 'checks get no store, history, or LLM');
+  assert.ok(adr.includes("appears in **that finding's own `next` list**"), 'AI steps are limited to code-linked tools');
+  // Review fixes: the engine (not the plugin) enforces nextTools, and Diagnose cannot bypass a tightened read tool.
+  assert.ok(adr.includes('**The engine, not the plugin, enforces `nextTools`.**'), 'engine enforces nextTools');
+  assert.ok(adr.includes('**It follows the owner\'s gates, not only its own.**'), 'aegis__diagnose respects pin_required read tools');
+  assert.ok(adr.includes('**One diagnosis at a time.**'), 'one diagnosis at a time');
+  for (const d of ['D1', 'D2', 'D3', 'D4', 'D5']) assert.match(adr, new RegExp(String.raw`^- \*\*` + d + String.raw`\. .*\*\*Decided: \([ab]\)`, 'm'), `${d} is decided`);
+});
