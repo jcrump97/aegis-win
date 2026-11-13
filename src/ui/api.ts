@@ -285,7 +285,33 @@ export interface SettingsView {
   uiScale: number;
   autoLockMinutes: number;
   llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; firstTokenSecs: number; endpoint: Endpoint | null; endpointError: string | null };
-  mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; plainHttp: boolean; deviceApproval: boolean; deviceApprovalNotice: string | null; status: McpStatus; suggestedLanHost: string | null };
+  mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; plainHttp: boolean; agentsMayDiagnose: boolean; deviceApproval: boolean; deviceApprovalNotice: string | null; status: McpStatus; suggestedLanHost: string | null };
+}
+
+/** A Diagnose report (ADR 0005). Every text in it is plain text written by code or Windows. */
+export interface DiagnosisReport {
+  ranAt: string;
+  lookbackDays: number;
+  elevated: boolean;
+  checks: Array<{ id: string; pluginId: string; name: string; description: string; status: 'ok' | 'finding' | 'skipped' | 'failed'; reason?: string }>;
+  findings: DiagnosisFinding[];
+}
+
+export interface DiagnosisFinding {
+  id: string;
+  check: string;
+  severity: 'info' | 'warning' | 'critical';
+  title: string;
+  detail: string;
+  count: number;
+  countIsMinimum?: boolean;
+  firstSeen?: string;
+  lastSeen?: string;
+  evidence: Array<{ source: string; provider?: string; eventId?: number; recordId?: number; time?: string; message: string }>;
+  next: Array<
+    | { kind: 'tool'; tool: string; mcpName: string; name: string; args: Record<string, unknown>; why: string; available: boolean; reason?: string }
+    | { kind: 'manual'; text: string }
+  >;
 }
 
 export interface SettingsUpdate {
@@ -364,6 +390,9 @@ export const api = {
   showDeviceCode: (ticketId: string) => call<DeviceCodeView>('show_device_code', { ticketId }),
   cancelTicket: (ticketId: string) => call<TicketView>('cancel_ticket', { ticketId }),
   proposePlan: (request: PlanRequest) => call<TicketView>('propose_plan', { request }),
+  runDiagnosis: (lookbackDays: number) => call<DiagnosisReport>('run_diagnosis', { lookbackDays }),
+  lastDiagnosis: () => call<DiagnosisReport | null>('last_diagnosis'),
+  setAgentsMayDiagnose: (on: boolean, pin: string | null) => call<boolean>('set_agents_may_diagnose', { on, pin }),
   startMcp: () => call<McpStatus>('start_mcp'),
   setMcpPlainHttp: (on: boolean, pin: string | null) => call<McpStatus>('set_mcp_plain_http', { on, pin }),
   resetMcpCertificate: (pin: string) => call<McpStatus>('reset_mcp_certificate', { pin }),

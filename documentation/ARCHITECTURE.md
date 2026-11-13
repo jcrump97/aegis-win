@@ -137,6 +137,8 @@ flowchart LR
 ### 2.5 Diagnose this PC ([ADR 0005](adr/0005-diagnose-this-pc.md))
 `Engine::diagnose(lookbackDays)` (1, 7 or 30) runs every installed plugin's `run_checks` concurrently, 20 s per plugin, and returns a report: `{ranAt, lookbackDays, elevated, checks[], findings[]}`, findings sorted by severity, then recency, then count. It is read-only: no executor turn, no ticket, and checks get no store, history or LLM. It is refused while the vault is locked, and a report finished after a lock is withheld. One diagnosis runs at a time; a request made while one runs gets that run's report. Each finding's tool steps are limited by the engine to the check's `nextTools` from `manifest.json` (PLUGIN_SPEC §2.4).
 
+The app's **Diagnose** tab is the first tab and the one shown after every unlock. **Check this PC** runs `run_diagnosis`. The engine keeps the last report in memory for the tab (`last_diagnosis`) and drops it at every lock. **Add to plan** on a tool step adds that step's tool and code-chosen `args` to the in-app plan draft, which is proposed and approved with the PIN like any plan. Over MCP, `aegis__diagnose` (read-only, `lookbackDays` 1/7/30) runs the same diagnosis. Agents do not get the findings of a plugin with a read tool set to `pin_required`: its checks show as skipped, "Needs approval for this plugin's tools." The owner can turn agent access off on the MCP tab (**Agents may run Diagnose**, a vault setting); turning it back on needs the PIN.
+
 ## 3. Directory Structure
 ```
 aegis-win/

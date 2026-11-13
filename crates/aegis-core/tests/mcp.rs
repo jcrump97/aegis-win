@@ -579,3 +579,25 @@ async fn plain_http_on_the_network_needs_the_pin_and_loopback_stays_plain_http()
     assert_eq!(err.code, aegis_core::ErrorCode::PinInvalid);
     assert!(s.f.engine.reset_mcp_certificate(PIN.into()).await.unwrap().running);
 }
+
+#[tokio::test]
+async fn agents_run_diagnose_read_only_unless_the_owner_turned_it_off() {
+    let s = server().await;
+    let listed = |list: &Value| list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "aegis__diagnose").cloned();
+    let tool = listed(&s.rpc("tools/list", json!({})).await).expect("listed by default");
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool["inputSchema"]["properties"]["lookbackDays"]["enum"], json!([1, 7, 30]));
+
+    let report = s.call("aegis__diagnose", json!({})).await;
+    assert_eq!(report["isError"], false, "{report}");
+    assert_eq!(report["structuredContent"]["lookbackDays"], 7);
+    assert!(report["structuredContent"]["findings"].is_array());
+    let bad = s.call("aegis__diagnose", json!({ "lookbackDays": 3 })).await;
+    assert_eq!(bad["isError"], true);
+
+    s.f.engine.set_agents_may_diagnose(false, None).await.unwrap();
+    assert!(listed(&s.rpc("tools/list", json!({})).await).is_none());
+    let off = s.call("aegis__diagnose", json!({})).await;
+    assert_eq!(off["isError"], true);
+    assert!(off["structuredContent"]["error"]["message"].as_str().unwrap().contains("turned off Diagnose"));
+}

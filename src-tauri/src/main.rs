@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aegis_core::autostart::{Autostart, AutostartState};
+use aegis_core::diagnose::Report;
 use aegis_core::engine::{DeviceCodeView, Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
@@ -431,6 +432,24 @@ async fn cancel_ticket(engine: EngineState<'_>, ticket_id: String) -> Cmd<Ticket
     engine.cancel_ticket(&ticket_id)
 }
 
+/// Runs every installed plugin's read-only checks (ADR 0005). One run at a time.
+#[tauri::command]
+async fn run_diagnosis(engine: EngineState<'_>, lookback_days: u32) -> Cmd<Report> {
+    engine.diagnose(lookback_days).await
+}
+
+/// The last report since unlocking, if any.
+#[tauri::command]
+async fn last_diagnosis(engine: EngineState<'_>) -> Cmd<Option<Report>> {
+    engine.last_diagnosis()
+}
+
+/// Lets AI agents run `aegis__diagnose` (needs the PIN) or stops them.
+#[tauri::command]
+async fn set_agents_may_diagnose(engine: EngineState<'_>, on: bool, pin: Option<String>) -> Cmd<bool> {
+    engine.set_agents_may_diagnose(on, pin).await
+}
+
 /// Serves a LAN bind over plain HTTP (turning on needs the PIN) or HTTPS again.
 #[tauri::command]
 async fn set_mcp_plain_http(engine: EngineState<'_>, on: bool, pin: Option<String>) -> Cmd<McpStatus> {
@@ -583,6 +602,9 @@ fn main() {
             show_device_code,
             cancel_ticket,
             propose_plan,
+            run_diagnosis,
+            last_diagnosis,
+            set_agents_may_diagnose,
             start_mcp,
             set_mcp_plain_http,
             reset_mcp_certificate,

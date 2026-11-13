@@ -1,6 +1,6 @@
 # ADR 0005: Diagnose this PC
 
-- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase. Phases 1a (the engine and model) and 1b (the checks in §4) are done.
+- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase. Phases 1a (the engine and model), 1b (the checks in §4) and 1c (the tab and `aegis__diagnose`) are done.
 - **Date**: 2026-11-11
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (AI replies as untrusted input, code-written descriptions), [ADR 0003](0003-action-plans.md) (plans), [ADR 0004 §8](0004-approval-channel-and-key-hardening.md) (security scope), [PLUGIN_SPEC](../PLUGIN_SPEC.md), [SECURITY_MODEL](../SECURITY_MODEL.md)
 
@@ -82,7 +82,7 @@ async fn run_checks(&self, ctx: &CheckContext) -> Vec<CheckResult> { Vec::new() 
 **One diagnosis at a time.** Windows event-log reads block a thread and cannot be stopped part-way, so a timed-out read keeps running until it ends. A second request while a diagnosis runs waits for that run and gets its report, rather than starting another. This also keeps an agent from piling up reads.
 
 - **In the app:** a new **Diagnose** tab, the first tab and the one shown after unlocking (D3). It has one button, **Check this PC**, a lookback choice (1, 7 or 30 days, default 7), the findings as cards with their evidence and next steps, and a collapsed "Checked and fine" list. A `tool` next step has **Add to plan**, the same button repair cards have today.
-- **Over MCP:** `aegis__diagnose` (`readOnly`, D2) returns the same report. Its data is the kind `query_logs` and `capture_diagnostic_snapshot` already return. **It follows the owner's gates, not only its own.** It has a gate of its own on the MCP tab (default `auto`). And when the owner has set any read tool of a plugin to `pin_required`, that plugin's findings are left out of the MCP report, with `status: "skipped", reason: "Needs approval for this plugin's tools."`. Tightening `query_logs` therefore cannot be bypassed through Diagnose. The app's own Diagnose tab always shows everything.
+- **Over MCP:** `aegis__diagnose` (`readOnly`, D2) returns the same report. Its data is the kind `query_logs` and `capture_diagnostic_snapshot` already return. **It follows the owner's gates, not only its own.** It has a switch of its own on the MCP tab, **Agents may run Diagnose** (on by default; turning it back on needs the PIN). When it is off the tool is not listed, and a call gets an error asking the owner to run **Check this PC** in the app. *Decided at Phase 1c (2026-11-12):* a switch, not a ticket gate, because tickets run a plugin's tool and Diagnose is the engine's; a switch needs no change to the approval code. And when the owner has set any read tool of a plugin to `pin_required`, that plugin's findings are left out of the MCP report, with `status: "skipped", reason: "Needs approval for this plugin's tools."`. Tightening `query_logs` therefore cannot be bypassed through Diagnose. The app's own Diagnose tab always shows everything.
 - **No LLM needed.** Everything above works with no LLM set up (D1).
 
 ## 4. First checks (Phase 1)
@@ -121,7 +121,7 @@ This adds new attack surface: a new MCP tool, a new LLM caller, and a new plan o
 
 | Surface | Reused | New, and why it is safe |
 |---|---|---|
-| `aegis__diagnose` | Gate policy (own gate, default `auto`) + `readOnly`; vault must be unlocked | Same kind of data as `query_logs` and `capture_diagnostic_snapshot`; a plugin with a `pin_required` read tool is left out (§3); one run at a time |
+| `aegis__diagnose` | **Agents may run Diagnose** switch (default on; on needs the PIN) + `readOnly`; vault must be unlocked | Same kind of data as `query_logs` and `capture_diagnostic_snapshot`; a plugin with a `pin_required` read tool is left out (§3); one run at a time |
 | Checks | Plugin isolation | `CheckContext` cannot write, record, or call an LLM; bounded reads |
 | Next steps | Manifest validation, schema | The engine enforces each check's `nextTools` |
 | AI summary | `LlmHandle` (Off-LAN trust, scrubbing, context fit) | Reserved id `diagnose`, kept by the trust cleanup; reply checker as in ADR 0002 |

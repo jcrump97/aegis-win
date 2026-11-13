@@ -155,6 +155,7 @@ dl.kv dd { margin: 0; word-break: break-word; }
 .answer ul, .answer ol { padding-left: 1.4rem; }
 .answer li + li { margin-top: 0.25rem; }
 .answer code { font-family: Consolas, 'Cascadia Mono', monospace; font-size: 0.9em; background: var(--raised); padding: 0 0.25em; border-radius: 4px; }
+pre.evidence { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0.3rem 0 0.6rem; font-size: 0.85em; }
 details > summary { cursor: pointer; color: var(--muted); margin-top: 0.4rem; }
 
 /* Dialog */

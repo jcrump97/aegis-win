@@ -31,11 +31,18 @@ pub struct McpConfig {
     /// *Compatibility: plain HTTP* for a LAN bind. Turning it on needs the PIN.
     #[serde(default)]
     pub plain_http: bool,
+    /// Agents may run `aegis__diagnose` (ADR 0005 §3). Turning it back on needs the PIN.
+    #[serde(default = "on")]
+    pub agents_may_diagnose: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
-        Self { enabled: false, host: "127.0.0.1".into(), port: DEFAULT_MCP_PORT, auth_token: Secret::random_token(), open_firewall: true, tls: None, plain_http: false }
+        Self { enabled: false, host: "127.0.0.1".into(), port: DEFAULT_MCP_PORT, auth_token: Secret::random_token(), open_firewall: true, tls: None, plain_http: false, agents_may_diagnose: true }
     }
 }
 
