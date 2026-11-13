@@ -15,12 +15,12 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::chain::{self, Head, MacCheck, Session};
-use crate::diagnose::{self, CheckContext, CheckResult, ToolAvailability};
+use crate::diagnose::{self, CheckContext, CheckResult, Diagnosis, ToolAvailability};
 use crate::error::{AegisError, AegisResult, ErrorCode};
 use crate::executor::{self, ChangeView, Executor, Place, Stop, QUEUE_TIMEOUT};
 use crate::history::{self, Retention, StreamKey, StreamRead};
 use crate::history_service::{self, Append, AppendError, ChangeWindow, HistoryHandle, HistoryService, RuntimeFile, RuntimeReview, APPROVALS_STREAM, MAX_RUNTIME_BYTES, RUNTIME_VERSION};
-use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle};
+use crate::llm::{classify, classify_endpoint, Endpoint, LlmHandle, LlmOptions};
 use crate::mcp::{self, McpHandle, McpStatus};
 use crate::plan::{self, PlanOrigin, PlanRequest, MAX_PENDING_PLANS};
 use crate::plugin_data::{PluginStore, MAX_PLUGIN_DATA_BYTES};
@@ -98,7 +98,7 @@ pub struct Engine {
     /// report instead of starting another (ADR 0005 §2).
     diagnosis: Mutex<Option<tokio::sync::watch::Receiver<Option<AegisResult<diagnose::Report>>>>>,
     /// The last Diagnose report, for the app. Memory only: dropped at every lock (ADR 0005 D4).
-    last_diagnosis: Mutex<Option<diagnose::Report>>,
+    last_diagnosis: Mutex<Option<Diagnosis>>,
 }
 
 /// The approval record refuses new agent requests at this size (ADR 0004 §4.5).
@@ -186,6 +186,8 @@ pub struct ResumeNoticeView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmSettingsView {
+    /// Diagnose may send findings to an Off-LAN endpoint (ADR 0005 §5).
+    pub diagnose_trusted_off_lan: bool,
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
@@ -865,6 +867,7 @@ impl Engine {
                     base_url: s.llm.base_url.clone(),
                     model: s.llm.model.clone(),
                     has_api_key: s.llm.api_key.as_ref().is_some_and(|k| !k.is_empty()),
+                    diagnose_trusted_off_lan: s.is_trusted(diagnose::ai::LLM_ID),
                     context_tokens: s.llm.context_tokens,
                     first_token_secs: s.llm.first_token_secs,
                     endpoint,
@@ -1065,7 +1068,7 @@ impl Engine {
             s.installed_plugins =
                 self.registry.plugins().iter().map(|p| p.manifest().id.clone()).filter(|id| selection.contains_key(id)).collect();
             s.installed_components = selection.clone();
-            s.trusted_external_llm_plugins.retain(|id| selection.contains_key(id));
+            s.trusted_external_llm_plugins.retain(|id| selection.contains_key(id) || id == diagnose::ai::LLM_ID);
             // An uninstalled plugin runs nothing while locked.
             s.runtime.retain(|id, _| selection.contains_key(id));
             s.first_run_completed = true;
@@ -1112,9 +1115,12 @@ impl Engine {
 
     /// Lets a plugin send (scrubbed) diagnostics to an off-LAN LLM. Needs the PIN.
     pub async fn grant_llm_trust(&self, plugin_id: &str, pin: String) -> AegisResult<()> {
-        let plugin = self.registry.plugin(plugin_id).ok_or_else(|| AegisError::invalid(format!("unknown plugin '{plugin_id}'")))?;
-        if !plugin.manifest().uses_llm {
-            return Err(AegisError::invalid(format!("plugin '{plugin_id}' does not use the LLM service")));
+        // Diagnose asks the LLM itself, under its reserved id (ADR 0005 §5).
+        if plugin_id != diagnose::ai::LLM_ID {
+            let plugin = self.registry.plugin(plugin_id).ok_or_else(|| AegisError::invalid(format!("unknown plugin '{plugin_id}'")))?;
+            if !plugin.manifest().uses_llm {
+                return Err(AegisError::invalid(format!("plugin '{plugin_id}' does not use the LLM service")));
+            }
         }
         self.check_pin(&pin).await?;
         self.mutate(|s| {
@@ -2365,7 +2371,7 @@ impl Engine {
             let n = i + 1;
             let (plugin_id, tool_id) = registry::parse_mcp_tool_name(&step.tool).ok_or_else(|| unknown(n, &step.tool))?;
             let (_, tool) = self.registry.tool(plugin_id, tool_id).ok_or_else(|| unknown(n, &step.tool))?;
-            if tool.app_only && origin == PlanOrigin::Agent {
+            if tool.app_only && origin != PlanOrigin::Owner {
                 return Err(unknown(n, &step.tool));
             }
             if !tool.plan_eligible {
@@ -2465,7 +2471,14 @@ impl Engine {
             Instant::now(),
         );
         drop(store);
-        self.record_created(&view, if origin == PlanOrigin::Agent { "mcp plan" } else { "app plan" })?;
+        self.record_created(
+            &view,
+            match origin {
+                PlanOrigin::Agent => "mcp plan",
+                PlanOrigin::Owner => "app plan",
+                PlanOrigin::Assistant => "ai plan from diagnosis",
+            },
+        )?;
         Ok(view)
     }
 
@@ -2746,15 +2759,79 @@ impl Engine {
         if vault.is_none() {
             return Err(locked());
         }
-        *lock(&self.last_diagnosis) = Some(report.clone());
+        *lock(&self.last_diagnosis) = Some(Diagnosis { report: report.clone(), advice: None });
         drop(vault);
         Ok(report)
     }
 
     /// The last report since unlocking, if any. For the app only.
-    pub fn last_diagnosis(&self) -> AegisResult<Option<diagnose::Report>> {
+    pub fn last_diagnosis(&self) -> AegisResult<Option<Diagnosis>> {
         self.with_state(|_| ())?;
         Ok(lock(&self.last_diagnosis).clone())
+    }
+
+    /// Asks the LLM to rank and explain the last report's findings and pick
+    /// fixes among those code linked to them (ADR 0005 §5). The advice is
+    /// kept with the report until the next run or the next lock.
+    pub async fn explain_diagnosis(&self) -> AegisResult<diagnose::ai::Advice> {
+        use diagnose::ai;
+        let report = self.last_diagnosis()?.map(|d| d.report).ok_or_else(|| AegisError::new(ErrorCode::NotFound, "Run Check this PC first."))?;
+        if report.findings.is_empty() {
+            return Err(AegisError::invalid("Nothing looks wrong, so there is nothing for the AI to explain."));
+        }
+        let llm = self.with_state(|s| LlmHandle::new(self.http.clone(), s.llm.clone(), ai::LLM_ID, s.is_trusted(ai::LLM_ID)))?;
+        llm.preflight()?;
+        let options = LlmOptions { max_tokens: ai::REPLY_TOKENS, json: true, must_fit: true };
+        let retry_prompt = |why: &str| format!("{}\n\nYour last reply was refused: {why}. Reply again with only the JSON object.", ai::SYSTEM_PROMPT);
+        // Room for the longer prompt of the retry, so both send the same findings.
+        let room = llm.room_chars(&retry_prompt(&"x".repeat(200)), options);
+        let payload = ai::payload(&report, room).ok_or_else(|| {
+            AegisError::new(ErrorCode::LlmFailed, "Not even one finding fits the model's context window. Raise Context window on the LLM tab.")
+        })?;
+        let schema_of = |id: &str| {
+            let (plugin, tool) = id.split_once(':')?;
+            self.registry.tool(plugin, tool).map(|(_, t)| t.input_schema.clone())
+        };
+        let mut answer = llm.complete_with(ai::SYSTEM_PROMPT, payload.clone(), options).await?;
+        let checked = match ai::check(&answer.text, &report, &schema_of) {
+            Ok(c) => c,
+            Err(why) => {
+                answer = llm.complete_with(&retry_prompt(&why), payload, options).await?;
+                ai::check(&answer.text, &report, &schema_of)
+                    .map_err(|why| AegisError::new(ErrorCode::LlmFailed, format!("The AI's reply was not in the format AegisWin asked for ({why}). Try again, or try another model.")))?
+            }
+        };
+        let advice = ai::Advice {
+            ran_at: report.ran_at,
+            summary: checked.summary,
+            order: checked.order,
+            steps: checked.steps,
+            dropped: checked.dropped,
+            notice: checked.notice,
+            model: answer.model,
+            endpoint_host: answer.endpoint_host,
+            off_lan: answer.off_lan,
+        };
+        // Kept only with the report it is about, and never after a lock.
+        let vault = lock(&self.vault);
+        if vault.is_none() {
+            return Err(locked());
+        }
+        match lock(&self.last_diagnosis).as_mut() {
+            Some(d) if d.report.ran_at == report.ran_at => d.advice = Some(advice.clone()),
+            _ => return Err(AegisError::new(ErrorCode::Conflict, "A new diagnosis finished while the AI was answering. Ask the AI again.")),
+        }
+        drop(vault);
+        Ok(advice)
+    }
+
+    /// Opens the AI's suggested steps as a plan ticket, from the advice kept
+    /// with the last report: the app never supplies the steps itself.
+    pub async fn propose_suggested_plan(&self) -> AegisResult<TicketView> {
+        let advice = self.last_diagnosis()?.and_then(|d| d.advice).filter(|a| !a.steps.is_empty());
+        let advice = advice.ok_or_else(|| AegisError::new(ErrorCode::NotFound, "The AI suggested no steps for this diagnosis."))?;
+        let steps: Vec<Value> = advice.steps.iter().map(|s| json!({ "tool": s.mcp_name, "args": s.args, "reasoning": s.reasoning })).collect();
+        self.propose_plan(PlanOrigin::Assistant, json!({ "reasoning": advice.summary, "steps": steps })).await
     }
 
     pub fn agents_may_diagnose(&self) -> AegisResult<bool> {
