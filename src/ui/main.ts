@@ -2,7 +2,7 @@
 // Rust engine enforces all gates, so this file only decides what to show.
 
 import './styles.css';
-import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type DiagnosisFinding, type DiagnosisReport, type McpStatus, type McpTls, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
+import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type DiagnosisAdvice, type DiagnosisFinding, type DiagnosisReport, type McpStatus, type McpTls, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { generatePassphrase } from './passphrase';
@@ -22,6 +22,8 @@ let reviewSignature = '';
 /** Steps the owner is collecting for an action plan. Memory only; dropped on lock. */
 /** The last Diagnose report, as the engine keeps it until the vault locks (ADR 0005 D4). */
 let diagnosis: DiagnosisReport | null = null;
+/** What the AI made of it, if the owner asked. Dropped with the report. */
+let advice: DiagnosisAdvice | null = null;
 let diagnosisDays = 7;
 let planDraft: Array<{ tool: string; name: string; args: Record<string, unknown> }> = [];
 const MAX_PLAN_STEPS = 5;
@@ -218,6 +220,7 @@ function route(): void {
     // Both are dropped at every lock, like the engine's copy (ADR 0005 D4).
     planDraft = [];
     diagnosis = null;
+    advice = null;
   }
   if (!status.vaultExists) setupScreen();
   else if (!status.unlocked) unlockScreen();
@@ -391,7 +394,10 @@ async function wizardScreen(): Promise<void> {
 
 async function appShell(): Promise<void> {
   try {
-    [plugins, settings, tickets, diagnosis] = await Promise.all([api.listPlugins(), api.getSettings(), api.listTickets(), api.lastDiagnosis()]);
+    let last;
+    [plugins, settings, tickets, last] = await Promise.all([api.listPlugins(), api.getSettings(), api.listTickets(), api.lastDiagnosis()]);
+    diagnosis = last?.report ?? null;
+    advice = last?.advice ?? null;
   } catch (e) {
     return handleError(e);
   }
@@ -595,6 +601,7 @@ function diagnoseTab(): HTMLElement {
   run.addEventListener('click', async () => {
     try {
       diagnosis = await busy(run, () => api.runDiagnosis(diagnosisDays));
+      advice = null;
       renderTab();
     } catch (e) {
       const err = asError(e);
@@ -608,8 +615,71 @@ function diagnoseTab(): HTMLElement {
     h('div', {}, h('h2', {}, 'Diagnose this PC'), h('p', { class: 'hint' }, 'Reads Windows event logs, memory and CPU, and lists what looks wrong, most serious first. Checking changes nothing. Repairs it suggests go into a plan you approve with your PIN.')),
     h('section', { class: 'card' }, h('div', { class: 'row' }, h('label', { for: 'diagnose-days' }, 'Look back'), days, run), message),
     planDraftPanel(),
+    diagnosis && diagnosis.findings.length > 0 ? adviceCard(diagnosis) : null,
     diagnosis ? diagnosisReport(diagnosis) : null,
   );
+}
+
+/** The AI's summary and suggested steps (ADR 0005 §5). Its words are labelled as
+ * its own; the findings, tool names and commands shown are code's. */
+function adviceCard(report: DiagnosisReport): HTMLElement {
+  const message = h('div', { 'aria-live': 'polite' });
+  const ask = h('button', { class: advice ? '' : 'primary' }, advice ? 'Ask again' : 'Explain with AI');
+  const explain = async (): Promise<void> => {
+    try {
+      advice = await busy(ask, () => api.explainDiagnosis());
+      renderTab();
+    } catch (e) {
+      const err = asError(e);
+      if (err.code === 'VAULT_LOCKED') return handleError(e);
+      if (err.code === 'OFF_LAN_TRUST_REQUIRED' && (await askTrust('diagnose', 'Diagnose'))) return explain();
+      replace(message, errorNotice(err));
+    }
+  };
+  ask.addEventListener('click', () => void explain());
+  const title = (id: string) => report.findings.find((f) => f.id === id)?.title ?? id;
+  const parts: Array<Node | null> = [h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'What the AI makes of it'), ask)];
+  if (!advice) {
+    parts.push(
+      h('p', { class: 'hint' }, 'Sends these findings and their evidence to the LLM set on the LLM tab. The AI ranks and explains them and can pick repairs from the ones listed under each finding. It cannot add others, and nothing runs without your PIN.'),
+    );
+  } else {
+    const a = advice;
+    if (a.summary) parts.push(h('div', { class: 'stack' }, h('span', { class: 'badge accent' }, 'Written by the AI'), h('p', {}, a.summary)));
+    if (a.notice) parts.push(h('div', { class: 'notice', role: 'status' }, a.notice));
+    if (a.summary) parts.push(h('h4', {}, 'Deal with these first'), h('ol', {}, ...a.order.slice(0, 5).map((id) => h('li', {}, title(id)))));
+    if (a.steps.length > 0) {
+      const review = h('button', { class: 'primary' }, 'Review as plan');
+      review.addEventListener('click', async () => {
+        try {
+          const ticket = await busy(review, () => api.proposeSuggestedPlan());
+          tickets = await api.listTickets();
+          if (!tickets.some((t) => t.ticketId === ticket.ticketId)) tickets = [ticket, ...tickets];
+          updateShellBadges();
+          selectTab('approvals');
+        } catch (e) {
+          const err = asError(e);
+          if (err.code === 'VAULT_LOCKED') return handleError(e);
+          replace(message, errorNotice(err));
+        }
+      });
+      parts.push(
+        h('h4', {}, 'Suggested steps'),
+        h(
+          'ol',
+          { class: 'stack' },
+          ...a.steps.map((s) =>
+            h('li', {}, h('strong', {}, s.name), ` for “${title(s.findingId)}” `, h('code', {}, JSON.stringify(s.args)), s.reasoning ? h('p', { class: 'hint' }, 'Written by the AI: ', s.reasoning) : null),
+          ),
+        ),
+        h('p', { class: 'hint' }, 'Review as plan shows the exact commands. Nothing runs until you approve it with your PIN.'),
+        h('div', { class: 'row' }, review),
+      );
+    }
+    parts.push(h('p', { class: 'hint' }, `Model ${a.model} at ${a.endpointHost}${a.offLan ? ', outside your network (personal details removed before sending)' : ''}.`));
+  }
+  parts.push(message);
+  return h('section', { class: 'card stack' }, ...parts);
 }
 
 function diagnosisReport(report: DiagnosisReport): HTMLElement {
@@ -680,7 +750,8 @@ function ticketSignature(list: TicketView[]): string {
 }
 
 function askedFor(t: TicketView): string | null {
-  if (t.plan?.origin === 'owner') return null;
+  // The owner's own plans, and the AI suggestions the owner opened, need no alert.
+  if (t.plan && t.plan.origin !== 'agent') return null;
   return t.plan ? `An AI agent proposes an action plan with ${t.steps?.length ?? 0} step(s). Open Approvals to review it.` : `An AI agent is asking to run "${t.toolName}". Open Approvals to decide.`;
 }
 
@@ -911,7 +982,7 @@ async function invokeTool(plugin: PluginView, tool: ToolView, args: Record<strin
       await handleError(e);
       return { ok: false, error: null };
     }
-    if (err.code === 'OFF_LAN_TRUST_REQUIRED' && (await askTrust(plugin))) return invokeTool(plugin, tool, args, button);
+    if (err.code === 'OFF_LAN_TRUST_REQUIRED' && (await askTrust(plugin.id, plugin.name))) return invokeTool(plugin, tool, args, button);
     return { ok: false, error: err };
   }
 }
@@ -937,17 +1008,18 @@ function showResult(resultEl: HTMLElement, plugin: PluginView, tool: ToolView, v
   replace(resultEl, h('div', { class: 'result' }, renderValue(value), rawJson(value), followButton ? h('div', { class: 'row', style: 'margin-top:0.6rem' }, followButton) : null, followResult));
 }
 
-async function askTrust(plugin: PluginView): Promise<boolean> {
+/** Off-LAN trust for a plugin, or for Diagnose's own requests (id `diagnose`). */
+async function askTrust(id: string, name: string): Promise<boolean> {
   const host = settings?.llm.endpoint?.host ?? 'the configured endpoint';
   const pin = await askPin(
-    `Let ${plugin.name} use ${host}?`,
+    `Let ${name} use ${host}?`,
     `${host} is outside your local network. AegisWin removes your user name, computer name, profile paths and network share names before sending, but the diagnostics themselves (event messages, process names, command output) will leave this PC. You can revoke this in the LLM tab.`,
     'Allow',
   );
   if (pin === null) return false;
   try {
-    await api.grantLlmTrust(plugin.id, pin);
-    plugins = await api.listPlugins();
+    await api.grantLlmTrust(id, pin);
+    [plugins, settings] = await Promise.all([api.listPlugins(), api.getSettings()]);
     return true;
   } catch (e) {
     await handleError(e);
@@ -1251,6 +1323,12 @@ function suppliedText(label: string, ...parts: Array<HTMLElement | null>): HTMLE
 }
 
 /** The plan review (ADR 0003 §2): AegisWin's summary and steps, then the supplied text. */
+const PLAN_FROM: Record<NonNullable<TicketView['plan']>['origin'], string> = {
+  owner: 'Your plan',
+  agent: 'From an AI agent',
+  assistant: 'Suggested by the AI from your diagnosis',
+};
+
 function planCard(t: TicketView, plan: NonNullable<TicketView['plan']>): HTMLElement {
   const [base, tone] = STATUS_TEXT[t.status] ?? [t.status, ''];
   const pending = t.status === 'pending_approval';
@@ -1258,11 +1336,11 @@ function planCard(t: TicketView, plan: NonNullable<TicketView['plan']>): HTMLEle
   const head = h(
     'div',
     { class: 'tool-head' },
-    h('div', {}, h('h3', {}, t.toolName), h('p', { class: 'hint' }, `${plan.origin === 'owner' ? 'Your plan' : 'From an AI agent'} · requested ${new Date(t.createdAt).toLocaleString()}${pending ? ` · expires ${new Date(plan.expiresAt).toLocaleTimeString()}` : ''}`)),
+    h('div', {}, h('h3', {}, t.toolName), h('p', { class: 'hint' }, `${PLAN_FROM[plan.origin]} · requested ${new Date(t.createdAt).toLocaleString()}${pending ? ` · expires ${new Date(plan.expiresAt).toLocaleTimeString()}` : ''}`)),
     h('div', { class: 'badges' }, t.requiresAdmin ? h('span', { class: 'badge danger' }, 'administrator') : null, h('span', { class: `badge ${tone}` }, t.status === 'queued' && t.queuePosition ? `${base} (#${t.queuePosition})` : base)),
   );
   const body: Node[] = [head, h('p', {}, h('strong', {}, plan.summary))];
-  if (plan.origin !== 'owner') body.push(h('p', { class: 'hint' }, 'Plan fingerprint: ', h('code', {}, plan.shortHash), '. If the agent told you one, it should match.'));
+  if (plan.origin === 'agent') body.push(h('p', { class: 'hint' }, 'Plan fingerprint: ', h('code', {}, plan.shortHash), '. If the agent told you one, it should match.'));
   body.push(h('p', { class: 'hint' }, 'The steps run one at a time, in this order. The plan stops at the first failure, and changes made by earlier steps stay: Windows repairs cannot be undone.'));
   const list = h('ol', { class: 'stack' });
   for (const s of steps) {
@@ -1690,7 +1768,7 @@ function llmTab(): HTMLElement {
             btn.addEventListener('click', async () => {
               try {
                 if (p.trustedOffLan) await api.revokeLlmTrust(p.id);
-                else if (!(await askTrust(p))) return;
+                else if (!(await askTrust(p.id, p.name))) return;
                 plugins = await api.listPlugins();
                 renderTrust();
               } catch (e) {
@@ -1700,6 +1778,7 @@ function llmTab(): HTMLElement {
             return h('div', { class: 'row' }, h('span', { class: 'grow' }, p.name), h('span', { class: `badge ${p.trustedOffLan ? 'warn' : ''}` }, p.trustedOffLan ? 'may send off-LAN' : 'LAN only'), btn);
           })
         : [h('p', { class: 'hint' }, 'No installed plugin uses an LLM.')]),
+      diagnoseTrustRow(renderTrust),
     );
   };
   renderTrust();
@@ -1712,6 +1791,24 @@ function llmTab(): HTMLElement {
     h('section', { class: 'card' }, h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'API key'), keyState), h('p', { class: 'hint' }, 'Stored encrypted in the vault and never shown again. Local servers usually need none.'), key, h('div', { class: 'row', style: 'margin-top:0.6rem' }, saveKey, clearKey)),
     h('section', { class: 'card' }, h('h3', {}, 'Off-LAN permission'), h('p', { class: 'hint' }, 'An endpoint outside your network only receives data from plugins you allow, after personal details are scrubbed. Changing the endpoint to a different host clears these permissions.'), trustBody),
   );
+}
+
+/** Diagnose asks the LLM itself (ADR 0005 §5), so it has its own Off-LAN permission. */
+function diagnoseTrustRow(rerender: () => void): HTMLElement {
+  const trusted = settings?.llm.diagnoseTrustedOffLan ?? false;
+  const btn = trusted ? h('button', { class: 'danger' }, 'Revoke') : h('button', {}, 'Allow');
+  btn.addEventListener('click', async () => {
+    try {
+      if (trusted) {
+        await api.revokeLlmTrust('diagnose');
+        settings = await api.getSettings();
+      } else if (!(await askTrust('diagnose', 'Diagnose'))) return;
+      rerender();
+    } catch (e) {
+      await handleError(e);
+    }
+  });
+  return h('div', { class: 'row' }, h('span', { class: 'grow' }, 'Diagnose (Explain with AI)'), h('span', { class: `badge ${trusted ? 'warn' : ''}` }, trusted ? 'may send off-LAN' : 'LAN only'), btn);
 }
 
 // ---- settings ---------------------------------------------------------------

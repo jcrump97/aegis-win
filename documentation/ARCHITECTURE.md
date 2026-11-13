@@ -139,6 +139,8 @@ flowchart LR
 
 The app's **Diagnose** tab is the first tab and the one shown after every unlock. **Check this PC** runs `run_diagnosis`. The engine keeps the last report in memory for the tab (`last_diagnosis`) and drops it at every lock. **Add to plan** on a tool step adds that step's tool and code-chosen `args` to the in-app plan draft, which is proposed and approved with the PIN like any plan. Over MCP, `aegis__diagnose` (read-only, `lookbackDays` 1/7/30) runs the same diagnosis. Agents do not get the findings of a plugin with a read tool set to `pin_required`: its checks show as skipped, "Needs approval for this plugin's tools." The owner can turn agent access off on the MCP tab (**Agents may run Diagnose**, a vault setting); turning it back on needs the PIN.
 
+**Explain with AI** (`explain_diagnosis`, ADR 0005 §5) sends the last report's findings, with evidence and the fixes that can run, to the LLM through an `LlmHandle` for the reserved id `diagnose` (its own Off-LAN trust, granted with the PIN, kept when plugins change). `diagnose::ai::check` keeps the reply only in the format asked for, drops order entries that are not findings and steps whose tool is not one of that same finding's available next steps or whose `args` fail the tool's schema, and hides the summary when nothing matched. The advice is kept with the report. **Review as plan** (`propose_suggested_plan`) proposes the engine's copy as a `PlanOrigin::Assistant` plan, labelled "Suggested by the AI from your diagnosis", approved with the PIN like any plan.
+
 ## 3. Directory Structure
 ```
 aegis-win/

@@ -1,6 +1,6 @@
 # ADR 0005: Diagnose this PC
 
-- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase. Phases 1a (the engine and model), 1b (the checks in §4) and 1c (the tab and `aegis__diagnose`) are done.
+- **Status**: Accepted (2026-11-11). The owner accepted every recommended decision in §9. Implementation follows the phases in §8, one PR per phase. Phases 1a (the engine and model), 1b (the checks in §4), 1c (the tab and `aegis__diagnose`) and 2 (the AI summary and suggested plan, §5) are done.
 - **Date**: 2026-11-11
 - **Related**: [ADR 0002](0002-ai-monitor-creator.md) (AI replies as untrusted input, code-written descriptions), [ADR 0003](0003-action-plans.md) (plans), [ADR 0004 §8](0004-approval-channel-and-key-hardening.md) (security scope), [PLUGIN_SPEC](../PLUGIN_SPEC.md), [SECURITY_MODEL](../SECURITY_MODEL.md)
 
@@ -113,6 +113,7 @@ Diagnose can ask the LLM to **rank and explain** the findings and **suggest a pl
 - **What is sent.** Findings and their evidence only, compact, fitted to the context window. Evidence is cut first.
 - **The reply format** is strict JSON, checked like the monitor creator's: `{ "summary": string (≤600), "order": [findingId], "steps": [{ "findingId", "tool", "args", "reasoning" (≤200) }] (≤5) }`. Unknown fields are refused. Hidden characters are removed.
 - **What code allows.** An `order` entry that is not a finding of this run is dropped. A step is kept only if its `tool` appears in **that finding's own `next` list** (which the engine has already limited to the check's `nextTools`, §2) and is available, and its `args` pass the tool's schema. So the AI can pick and order fixes that code linked to evidence, but it cannot invent one. If everything is dropped, the owner sees the code's findings and "The AI's suggestions did not match the findings, so none are shown."
+- **Kept by the engine.** The checked advice is stored with the report it is about, and dropped with it at the next run or the next lock. **Review as plan** proposes the engine's copy, so the app never supplies the steps of an `Assistant` plan. A reply in the wrong format gets one retry, which tells the model what was wrong. Payload fitting: evidence goes to one entry per finding, then none, then the least serious findings are left out (with a count), and the request is sent whole or not at all.
 - **Review.** The summary and each step's reasoning are shown in blocks labelled "Written by the AI". **Review as plan** proposes the steps through `Engine::propose_plan` with a new origin, `PlanOrigin::Assistant`, labelled "Suggested by the AI from your diagnosis". Approval is then the existing plan flow: the code-written summary, the commands, the hash, the PIN.
 
 ## 6. Security (ADR 0004 §8, rule 2)

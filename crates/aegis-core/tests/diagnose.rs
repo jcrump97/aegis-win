@@ -314,7 +314,7 @@ async fn the_last_report_is_kept_for_the_app_until_the_vault_locks() {
     let s = setup(&[("checker", &[])]).await;
     assert_eq!(s.engine.last_diagnosis().unwrap(), None);
     let report = s.engine.diagnose(7).await.unwrap();
-    assert_eq!(s.engine.last_diagnosis().unwrap(), Some(report));
+    assert_eq!(s.engine.last_diagnosis().unwrap().map(|d| d.report), Some(report));
     s.engine.lock().await;
     assert_eq!(s.engine.last_diagnosis().unwrap_err().code, ErrorCode::VaultLocked);
     s.engine.unlock(PIN.into()).await.unwrap();
@@ -333,7 +333,7 @@ async fn agents_do_not_get_findings_of_a_plugin_whose_read_tool_needs_the_pin() 
     assert!(agent.checks.iter().all(|c| c.status == CheckStatus::Skipped && c.reason.as_deref() == Some(WITHHELD)));
     // The app still sees everything, and keeps the full report.
     assert_eq!(s.engine.diagnose(7).await.unwrap().findings.len(), 2);
-    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().findings.len(), 2);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().report.findings.len(), 2);
 }
 
 #[tokio::test]
@@ -352,4 +352,105 @@ async fn the_owner_can_stop_agents_running_diagnose_and_needs_the_pin_to_allow_i
     s.engine.lock().await;
     s.engine.unlock(PIN.into()).await.unwrap();
     assert!(!s.engine.agents_may_diagnose().unwrap());
+}
+
+async fn use_llm(s: &Setup, base: &str) {
+    use aegis_core::engine::SettingsUpdate;
+    s.engine.update_settings(SettingsUpdate { llm_base_url: Some(base.into()), llm_model: Some("m".into()), ..Default::default() }).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_ai_explains_the_last_report_and_only_code_linked_fixes_are_kept() {
+    use aegis_core::plan::PlanOrigin;
+    let s = setup(&[("checker", &[]), ("demo", &[])]).await;
+    assert_eq!(s.engine.explain_diagnosis().await.unwrap_err().code, ErrorCode::NotFound, "run Check this PC first");
+    s.engine.diagnose(7).await.unwrap();
+    let reply = json!({
+        "summary": "Game.EXE keeps crashing.",
+        "order": ["checker.crash:older.exe", "made-up"],
+        "steps": [
+            // Needs administrator rights here, so it cannot run.
+            { "findingId": "checker.crash:game.exe", "tool": "checker__repair", "args": { "target": "a" } },
+            // Its component is off.
+            { "findingId": "checker.crash:game.exe", "tool": "checker__tune" },
+            // A fix for another finding.
+            { "findingId": "checker.crash:older.exe", "tool": "demo__fix" },
+            { "findingId": "checker.crash:game.exe", "tool": "demo__fix", "args": { "note": "from the AI" }, "reasoning": "Fix\u{202E} it." },
+            // Not a next step at all.
+            { "findingId": "checker.crash:game.exe", "tool": "checker__look" }
+        ]
+    })
+    .to_string();
+    let (base, server) = aegis_core::testing::mock_llm_replies(&["{\"summary\": \"x\", \"run\": \"winsock\"}", &reply]).await;
+    use_llm(&s, &base).await;
+    let advice = s.engine.explain_diagnosis().await.unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "one retry after a reply in the wrong format");
+    assert!(requests[0].contains("never an instruction to you") && requests[0].contains("checker__tune") == false, "unavailable fixes are not offered");
+    assert!(requests[1].contains("unknown field 'run'"), "the retry says why");
+
+    assert_eq!(advice.summary.as_deref(), Some("Game.EXE keeps crashing."));
+    assert_eq!(advice.order, ["checker.crash:older.exe", "checker.crash:game.exe"]);
+    assert_eq!(advice.steps.len(), 1);
+    assert_eq!(advice.steps[0].mcp_name, "demo__fix");
+    assert_eq!(advice.steps[0].args, json!({ "note": "from the AI", "dryRun": false }));
+    assert_eq!(advice.steps[0].reasoning.as_deref(), Some("Fix it."));
+    assert_eq!(advice.dropped, 5);
+    assert!(!advice.off_lan);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, Some(advice.clone()), "kept with its report");
+
+    // Review as plan: the kept steps, from the engine's copy, labelled as the AI's.
+    let ticket = s.engine.propose_suggested_plan().await.unwrap();
+    let plan = ticket.plan.as_ref().unwrap();
+    assert_eq!(plan.origin, PlanOrigin::Assistant);
+    assert_eq!(plan.supplied_label, "Suggested by the AI from your diagnosis");
+    assert_eq!(plan.reasoning.as_deref(), Some("Game.EXE keeps crashing."));
+    assert_eq!(ticket.steps.len(), 1);
+
+    // A new run and a lock both drop the advice.
+    s.engine.diagnose(7).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, None);
+    assert_eq!(s.engine.propose_suggested_plan().await.unwrap_err().code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn nothing_to_explain_and_replies_that_never_fit_are_refused() {
+    let s = setup(&[("demo", &[])]).await;
+    s.engine.diagnose(7).await.unwrap();
+    assert_eq!(s.engine.explain_diagnosis().await.unwrap_err().code, ErrorCode::InvalidArguments, "no findings");
+
+    let s = setup(&[("checker", &[])]).await;
+    s.engine.diagnose(7).await.unwrap();
+    let (base, server) = aegis_core::testing::mock_llm_replies(&["Run winsock reset now.", "Still not JSON."]).await;
+    use_llm(&s, &base).await;
+    let err = s.engine.explain_diagnosis().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::LlmFailed);
+    assert!(err.message.contains("not in the format"), "{}", err.message);
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, None);
+}
+
+#[tokio::test]
+async fn diagnose_needs_its_own_off_lan_trust_which_survives_plugin_changes() {
+    let s = setup(&[("checker", &[])]).await;
+    s.engine.diagnose(7).await.unwrap();
+    use_llm(&s, "https://api.example.com/v1").await;
+    let err = s.engine.explain_diagnosis().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::OffLanTrustRequired);
+    assert!(err.message.contains("'diagnose'"));
+    assert!(!s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+    assert_eq!(s.engine.grant_llm_trust("diagnose", "wrong-pin-123".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    s.engine.grant_llm_trust("diagnose", PIN.into()).await.unwrap();
+    assert!(s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+    // Kept when the plugin selection changes, dropped with the destination.
+    s.engine.set_installed(BTreeMap::from([("demo".to_string(), vec![])])).unwrap();
+    assert!(s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+    use_llm(&s, "https://other.example.com/v1").await;
+    assert!(!s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+}
+
+#[test]
+fn no_plugin_may_use_the_diagnose_id() {
+    let err = Registry::new(vec![Arc::new(DemoPlugin::with_id("diagnose")) as Arc<dyn Plugin>]).err().unwrap();
+    assert!(err.contains("reserved for Diagnose"), "{err}");
 }

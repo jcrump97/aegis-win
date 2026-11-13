@@ -49,6 +49,9 @@ fn empty_object() -> Value {
 pub enum PlanOrigin {
     Agent,
     Owner,
+    /// The steps the AI suggested from a diagnosis, after code checked them
+    /// (ADR 0005 §5). Proposed by the owner from the app.
+    Assistant,
 }
 
 impl PlanOrigin {
@@ -56,6 +59,7 @@ impl PlanOrigin {
         match self {
             Self::Agent => "Supplied by the requesting agent",
             Self::Owner => "Written by you",
+            Self::Assistant => "Suggested by the AI from your diagnosis",
         }
     }
 }

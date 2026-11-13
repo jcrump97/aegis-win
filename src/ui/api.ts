@@ -205,7 +205,7 @@ export interface PlanRequest {
 export interface PlanMeta {
   title?: string;
   reasoning?: string;
-  origin: 'agent' | 'owner';
+  origin: 'agent' | 'owner' | 'assistant';
   suppliedLabel: string;
   /** Approving must send this back. */
   hash: string;
@@ -284,7 +284,7 @@ export interface McpTls {
 export interface SettingsView {
   uiScale: number;
   autoLockMinutes: number;
-  llm: { baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; firstTokenSecs: number; endpoint: Endpoint | null; endpointError: string | null };
+  llm: { diagnoseTrustedOffLan: boolean; baseUrl: string; model: string; hasApiKey: boolean; contextTokens: number; firstTokenSecs: number; endpoint: Endpoint | null; endpointError: string | null };
   mcp: { enabled: boolean; host: string; port: number; openFirewall: boolean; plainHttp: boolean; agentsMayDiagnose: boolean; deviceApproval: boolean; deviceApprovalNotice: string | null; status: McpStatus; suggestedLanHost: string | null };
 }
 
@@ -312,6 +312,26 @@ export interface DiagnosisFinding {
     | { kind: 'tool'; tool: string; mcpName: string; name: string; args: Record<string, unknown>; why: string; available: boolean; reason?: string }
     | { kind: 'manual'; text: string }
   >;
+}
+
+/** What the AI made of a report, after code dropped what did not match (ADR 0005 §5). */
+export interface DiagnosisAdvice {
+  ranAt: string;
+  /** Written by the AI. Missing when nothing it suggested matched. */
+  summary?: string;
+  /** Every finding id, the AI's order first. */
+  order: string[];
+  steps: Array<{ findingId: string; tool: string; mcpName: string; name: string; args: Record<string, unknown>; reasoning?: string }>;
+  dropped: number;
+  notice?: string;
+  model: string;
+  endpointHost: string;
+  offLan: boolean;
+}
+
+export interface Diagnosis {
+  report: DiagnosisReport;
+  advice: DiagnosisAdvice | null;
 }
 
 export interface SettingsUpdate {
@@ -391,7 +411,9 @@ export const api = {
   cancelTicket: (ticketId: string) => call<TicketView>('cancel_ticket', { ticketId }),
   proposePlan: (request: PlanRequest) => call<TicketView>('propose_plan', { request }),
   runDiagnosis: (lookbackDays: number) => call<DiagnosisReport>('run_diagnosis', { lookbackDays }),
-  lastDiagnosis: () => call<DiagnosisReport | null>('last_diagnosis'),
+  lastDiagnosis: () => call<Diagnosis | null>('last_diagnosis'),
+  explainDiagnosis: () => call<DiagnosisAdvice>('explain_diagnosis'),
+  proposeSuggestedPlan: () => call<TicketView>('propose_suggested_plan'),
   setAgentsMayDiagnose: (on: boolean, pin: string | null) => call<boolean>('set_agents_may_diagnose', { on, pin }),
   startMcp: () => call<McpStatus>('start_mcp'),
   setMcpPlainHttp: (on: boolean, pin: string | null) => call<McpStatus>('set_mcp_plain_http', { on, pin }),

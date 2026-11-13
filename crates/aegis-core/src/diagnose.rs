@@ -8,6 +8,8 @@
 //! Next steps are limited here, by the engine, to the tools a check declares
 //! in its manifest (`nextTools`), whatever the check's code returns.
 
+pub mod ai;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -201,6 +203,15 @@ pub struct ReportFinding {
     pub next: Vec<NextStep>,
 }
 
+/// The last report and what the AI made of it, kept for the app until the
+/// next run or the next lock (ADR 0005 D4).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Diagnosis {
+    pub report: Report,
+    pub advice: Option<ai::Advice>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {
@@ -347,7 +358,7 @@ fn clean_evidence(mut e: Evidence) -> Evidence {
 }
 
 /// Without hidden or control characters (newlines kept as spaces), cut to `max` characters.
-fn clean(text: &str, max: usize) -> String {
+pub(crate) fn clean(text: &str, max: usize) -> String {
     let flat: String = text.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !is_hidden_char(*c)).collect();
     let flat = flat.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {

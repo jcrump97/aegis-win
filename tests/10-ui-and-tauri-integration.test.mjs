@@ -193,6 +193,28 @@ test('Diagnose: the first tab after unlock, plain-text findings, and code-chosen
   assert.match(mainRs, /async fn set_agents_may_diagnose\(engine: EngineState<'_>, on: bool, pin: Option<String>\) -> Cmd<bool> \{\s*engine\.set_agents_may_diagnose\(on, pin\)\.await/);
 });
 
+test('Diagnose AI: the AI text is labelled, and Review as plan sends no steps from the window', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  assert.match(apiTs, /explainDiagnosis: \(\) => call<DiagnosisAdvice>\('explain_diagnosis'\)/);
+  // The engine proposes its own checked copy: the command takes no steps.
+  assert.match(apiTs, /proposeSuggestedPlan: \(\) => call<TicketView>\('propose_suggested_plan'\)/);
+  assert.match(mainRs, /async fn propose_suggested_plan\(engine: EngineState<'_>\) -> Cmd<TicketView> \{\s*engine\.propose_suggested_plan\(\)\.await/);
+  const card = main.slice(main.indexOf('function adviceCard('), main.indexOf('function diagnosisReport('));
+  assert.match(card, /'Written by the AI'/);
+  assert.match(card, /'Written by the AI: ', s\.reasoning/);
+  assert.match(card, /api\.proposeSuggestedPlan\(\)/);
+  assert.match(card, /selectTab\('approvals'\)/);
+  assert.doesNotMatch(card, /askPin|decideTicket|runTool|proposePlan\(/, 'opening the plan approves nothing');
+  // Off-LAN: Diagnose asks for its own trust, by its reserved id.
+  assert.match(card, /OFF_LAN_TRUST_REQUIRED' && \(await askTrust\('diagnose', 'Diagnose'\)\)/);
+  // A suggested plan is labelled as the AI's, and raises no agent alert.
+  assert.match(main, /assistant: 'Suggested by the AI from your diagnosis'/);
+  assert.match(main, /if \(t\.plan && t\.plan\.origin !== 'agent'\) return null;/);
+  // The advice goes with the report at every lock and every new run.
+  assert.match(main, /diagnosis = null;\s*advice = null;/);
+  assert.match(main, /api\.runDiagnosis\(diagnosisDays\)\);\s*advice = null;/);
+});
+
 test('Serial executor: the app shows the change in progress, and the shell never cuts one off', () => {
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   assert.match(main, /const \{ running, queued \} = status\.change;/);

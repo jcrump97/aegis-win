@@ -134,6 +134,11 @@ test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestio
   assert.ok(spec.includes('**The manifest is rejected at startup** unless every `nextTools` entry names a `planEligible` tool'), 'nextTools is validated at startup');
   assert.ok(spec.includes('**The engine, not the plugin, enforces the rest**'), 'the engine enforces next steps');
   assert.match(fs.readFileSync('documentation/ARCHITECTURE.md', 'utf8'), /### 2\.5 Diagnose this PC/);
+  // Phase 2: the AI picks only among a finding's own next steps, and the engine keeps what was checked.
+  assert.ok(adr.includes('**Review as plan** proposes the engine\'s copy, so the app never supplies the steps of an `Assistant` plan.'), 'the window never supplies AI steps');
+  const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
+  assert.match(sec, /Diagnose's own requests \(ADR 0005 §5\)\*\* use the reserved id `diagnose`/);
+  assert.ok(spec.includes('`diagnose` for Diagnose\'s LLM requests'), 'PLUGIN_SPEC reserves diagnose');
   // Phase 1b: every check a plugin declares is documented in its README.
   for (const plugin of ['event-logs', 'usage-monitor']) {
     const readme = fs.readFileSync(`plugins/${plugin}/README.md`, 'utf8');
