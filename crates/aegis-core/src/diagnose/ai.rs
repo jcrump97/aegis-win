@@ -256,6 +256,8 @@ pub fn check(text: &str, report: &Report, schema_of: &dyn Fn(&str) -> Option<Val
             Some(a @ Value::Object(_)) => schema_of(tool).and_then(|schema| crate::schema::validate(&schema, a.clone()).ok()),
             Some(_) => None,
         };
+        // A plan step really runs: a dry run cannot be one (`PlanRequest::parse`).
+        let args = args.filter(|a| a.get("dryRun") != Some(&Value::Bool(true)));
         let Some(args) = args else {
             dropped += 1;
             continue;

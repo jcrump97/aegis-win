@@ -147,7 +147,9 @@ fn steps_code_did_not_link_to_that_finding_are_dropped() {
             { "findingId": "nope", "tool": "p__flush" },
             // Arguments the schema refuses.
             { "findingId": "p.c:disk", "tool": "p__repair", "args": { "drive": "Z" } },
-            { "findingId": "p.c:disk", "tool": "p__repair", "args": "C" }
+            { "findingId": "p.c:disk", "tool": "p__repair", "args": "C" },
+            // A dry run cannot be a plan step.
+            { "findingId": "p.c:dns", "tool": "p__flush", "args": { "dryRun": true } }
         ]
     }))
     .unwrap();
