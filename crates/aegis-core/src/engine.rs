@@ -97,6 +97,8 @@ pub struct Engine {
     /// The Diagnose run in progress, if any: a second request shares its
     /// report instead of starting another (ADR 0005 §2).
     diagnosis: Mutex<Option<tokio::sync::watch::Receiver<Option<AegisResult<diagnose::Report>>>>>,
+    /// The last Diagnose report, for the app. Memory only: dropped at every lock (ADR 0005 D4).
+    last_diagnosis: Mutex<Option<diagnose::Report>>,
 }
 
 /// The approval record refuses new agent requests at this size (ADR 0004 §4.5).
@@ -202,6 +204,8 @@ pub struct McpSettingsView {
     pub open_firewall: bool,
     /// *Compatibility: plain HTTP* for a LAN bind (ADR 0004 §2).
     pub plain_http: bool,
+    /// Agents may run `aegis__diagnose` (ADR 0005 §3).
+    pub agents_may_diagnose: bool,
     /// Approve from another device, with a one-time code (memory only).
     pub device_approval: bool,
     /// Why device approval was turned off, when too many wrong codes did it.
@@ -375,6 +379,7 @@ impl Engine {
             record_hard_bytes: AtomicU64::new(APPROVAL_RECORD_FULL_BYTES + APPROVAL_RECORD_HEADROOM),
             unwritten_lost: AtomicU64::new(0),
             diagnosis: Mutex::new(None),
+            last_diagnosis: Mutex::new(None),
             data_dir,
             registry,
             vault: Mutex::new(None),
@@ -751,6 +756,8 @@ impl Engine {
         self.history.close_all();
         lock(&self.tickets).clear();
         lock(&self.resume_notices).clear();
+        // After the vault is gone, so a run finishing now cannot store its report again.
+        lock(&self.last_diagnosis).take();
         self.device_approval.store(false, Ordering::SeqCst);
         lock(&self.device_misses).clear();
         self.status()
@@ -868,6 +875,7 @@ impl Engine {
                     host: s.mcp.host.clone(),
                     port: s.mcp.port,
                     plain_http: s.mcp.plain_http,
+                    agents_may_diagnose: s.mcp.agents_may_diagnose,
                     open_firewall: s.mcp.open_firewall,
                     device_approval: self.device_approval.load(Ordering::SeqCst),
                     device_approval_notice: self.device_tripped.load(Ordering::SeqCst).then(|| {
@@ -2731,10 +2739,66 @@ impl Engine {
                 }
             }
         };
-        let report = rx.wait_for(Option::is_some).await.map_err(|_| internal("the diagnosis stopped"))?.clone();
-        // The vault may have locked while the checks ran.
+        let report = rx.wait_for(Option::is_some).await.map_err(|_| internal("the diagnosis stopped"))?.clone().expect("waited for Some")?;
+        // The vault may have locked while the checks ran. Stored under the
+        // vault lock, so a lock cannot slip in between the check and the store.
+        let vault = lock(&self.vault);
+        if vault.is_none() {
+            return Err(locked());
+        }
+        *lock(&self.last_diagnosis) = Some(report.clone());
+        drop(vault);
+        Ok(report)
+    }
+
+    /// The last report since unlocking, if any. For the app only.
+    pub fn last_diagnosis(&self) -> AegisResult<Option<diagnose::Report>> {
         self.with_state(|_| ())?;
-        report.expect("waited for Some")
+        Ok(lock(&self.last_diagnosis).clone())
+    }
+
+    pub fn agents_may_diagnose(&self) -> AegisResult<bool> {
+        self.with_state(|s| s.mcp.agents_may_diagnose)
+    }
+
+    /// Lets agents run Diagnose (needs the PIN) or stops them.
+    pub async fn set_agents_may_diagnose(&self, on: bool, pin: Option<String>) -> AegisResult<bool> {
+        if on && !self.agents_may_diagnose()? {
+            let pin = Zeroizing::new(pin.ok_or_else(|| AegisError::new(ErrorCode::PinRequired, "Enter your PIN to let AI agents run Diagnose."))?);
+            self.check_pin(&pin).await?;
+        }
+        self.mutate(|s| {
+            s.mcp.agents_may_diagnose = on;
+            Ok(on)
+        })
+    }
+
+    /// `aegis__diagnose`: the same run, without the findings of any plugin
+    /// whose read tools the owner set to need the PIN (ADR 0005 §3).
+    pub async fn diagnose_for_agent(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {
+        let off = || AegisError::new(ErrorCode::PluginDisabled, "The owner turned off Diagnose for AI agents. Ask them to run Check this PC in the AegisWin app.");
+        if !self.agents_may_diagnose()? {
+            return Err(off());
+        }
+        let report = self.diagnose(lookback_days).await?;
+        // Read after the run, so a gate tightened while it ran still applies.
+        let (allowed, withheld) = self.with_state(|s| (s.mcp.agents_may_diagnose, self.withheld_from_agents(s)))?;
+        if !allowed {
+            return Err(off());
+        }
+        Ok(report.for_agent(&withheld))
+    }
+
+    /// Installed plugins with a read-only tool whose gate is `pin_required`.
+    fn withheld_from_agents(&self, s: &VaultState) -> Vec<String> {
+        self.registry
+            .plugins()
+            .iter()
+            .map(|p| p.manifest())
+            .filter(|m| s.is_installed(&m.id))
+            .filter(|m| m.tools.iter().any(|t| t.read_only && registry::effective_policy(&m.id, t, &s.tool_gate_overrides) == GatePolicy::PinRequired))
+            .map(|m| m.id.clone())
+            .collect()
     }
 
     async fn run_diagnosis(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {

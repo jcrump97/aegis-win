@@ -2,7 +2,7 @@
 // Rust engine enforces all gates, so this file only decides what to show.
 
 import './styles.css';
-import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type McpStatus, type McpTls, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
+import { api, asError, type AegisError, type ApprovalRecordEvent, type AutostartView, type DeviceCodeView, type DiagnosisFinding, type DiagnosisReport, type McpStatus, type McpTls, type PluginView, type SettingsView, type Status, type TicketView, type ToolView } from './api';
 import { append, askPin, busy, confirmDialog, copyText, h, replace, toast } from './dom';
 import { forgetMonitorPanel, MONITOR_TOOLS, monitorPanel, type ToolRun } from './monitors';
 import { generatePassphrase } from './passphrase';
@@ -20,6 +20,9 @@ let mainEl: HTMLElement | null = null;
 let shellParts: { approvalsCount: HTMLElement; mcpPill: HTMLElement; changePill: HTMLElement; reviews: HTMLElement } | null = null;
 let reviewSignature = '';
 /** Steps the owner is collecting for an action plan. Memory only; dropped on lock. */
+/** The last Diagnose report, as the engine keeps it until the vault locks (ADR 0005 D4). */
+let diagnosis: DiagnosisReport | null = null;
+let diagnosisDays = 7;
 let planDraft: Array<{ tool: string; name: string; args: Record<string, unknown> }> = [];
 const MAX_PLAN_STEPS = 5;
 
@@ -211,7 +214,11 @@ function route(): void {
   mainEl = null;
   forgetMonitorPanel();
   recordCard = null;
-  if (!status.unlocked) planDraft = [];
+  if (!status.unlocked) {
+    // Both are dropped at every lock, like the engine's copy (ADR 0005 D4).
+    planDraft = [];
+    diagnosis = null;
+  }
   if (!status.vaultExists) setupScreen();
   else if (!status.unlocked) unlockScreen();
   else if (!status.firstRunCompleted) void wizardScreen();
@@ -254,6 +261,8 @@ function setupScreen(): void {
 }
 
 function unlockScreen(): void {
+  // Diagnose is the first thing shown after every unlock (ADR 0005 D3).
+  activeTab = 'diagnose';
   const input = h('input', { type: 'password', id: 'unlock-pin', autocomplete: 'current-password', required: true });
   const message = h('div');
   const forget = h('button', { type: 'button' }, 'Forget this PC');
@@ -382,12 +391,12 @@ async function wizardScreen(): Promise<void> {
 
 async function appShell(): Promise<void> {
   try {
-    [plugins, settings, tickets] = await Promise.all([api.listPlugins(), api.getSettings(), api.listTickets()]);
+    [plugins, settings, tickets, diagnosis] = await Promise.all([api.listPlugins(), api.getSettings(), api.listTickets(), api.lastDiagnosis()]);
   } catch (e) {
     return handleError(e);
   }
   const installed = plugins.filter((p) => p.installed);
-  const tabs = [...installed.map((p) => `plugin:${p.id}`), 'approvals', 'mcp', 'llm', 'settings'];
+  const tabs = ['diagnose', ...installed.map((p) => `plugin:${p.id}`), 'approvals', 'mcp', 'llm', 'settings'];
   if (!tabs.includes(activeTab)) activeTab = tabs[0];
 
   const approvalsCount = h('span');
@@ -408,6 +417,7 @@ async function appShell(): Promise<void> {
   const sidebar = h(
     'nav',
     { class: 'sidebar', 'aria-label': 'Sections' },
+    nav('diagnose', 'Diagnose'),
     h('div', { class: 'section' }, 'Tools'),
     ...installed.map((p) => nav(`plugin:${p.id}`, p.name)),
     installed.length === 0 ? h('p', { class: 'hint' }, 'No plugins turned on. See Settings.') : null,
@@ -558,12 +568,109 @@ function updateRuntimeReviews(host: HTMLElement): void {
 function renderTab(): void {
   if (!mainEl) return;
   const content =
-    activeTab.startsWith('plugin:') ? pluginTab(activeTab.slice(7))
+    activeTab === 'diagnose' ? diagnoseTab()
+    : activeTab.startsWith('plugin:') ? pluginTab(activeTab.slice(7))
     : activeTab === 'approvals' ? approvalsTab()
     : activeTab === 'mcp' ? mcpTab()
     : activeTab === 'llm' ? llmTab()
     : settingsTab();
   replace(mainEl, shellParts?.reviews ?? null, content);
+}
+
+// ---- Diagnose this PC (ADR 0005) ----------------------------------------------
+
+const SEVERITY_TEXT: Record<DiagnosisFinding['severity'], [string, string]> = {
+  critical: ['Serious', 'danger'],
+  warning: ['Warning', 'warn'],
+  info: ['Worth knowing', 'accent'],
+};
+
+const when = (iso?: string): string => (iso ? new Date(iso).toLocaleString() : '');
+
+function diagnoseTab(): HTMLElement {
+  const days = h('select', { id: 'diagnose-days' }, ...[1, 7, 30].map((d) => h('option', { value: String(d), selected: d === diagnosisDays }, d === 1 ? 'Last day' : `Last ${d} days`)));
+  days.addEventListener('change', () => (diagnosisDays = Number(days.value)));
+  const run = h('button', { class: 'primary' }, diagnosis ? 'Check again' : 'Check this PC');
+  const message = h('div', { 'aria-live': 'polite' });
+  run.addEventListener('click', async () => {
+    try {
+      diagnosis = await busy(run, () => api.runDiagnosis(diagnosisDays));
+      renderTab();
+    } catch (e) {
+      const err = asError(e);
+      if (err.code === 'VAULT_LOCKED') return handleError(e);
+      replace(message, errorNotice(err));
+    }
+  });
+  return h(
+    'div',
+    { class: 'stack' },
+    h('div', {}, h('h2', {}, 'Diagnose this PC'), h('p', { class: 'hint' }, 'Reads Windows event logs, memory and CPU, and lists what looks wrong, most serious first. Checking changes nothing. Repairs it suggests go into a plan you approve with your PIN.')),
+    h('section', { class: 'card' }, h('div', { class: 'row' }, h('label', { for: 'diagnose-days' }, 'Look back'), days, run), message),
+    planDraftPanel(),
+    diagnosis ? diagnosisReport(diagnosis) : null,
+  );
+}
+
+function diagnosisReport(report: DiagnosisReport): HTMLElement {
+  const fine = report.checks.filter((c) => c.status === 'ok');
+  const notRun = report.checks.filter((c) => c.status === 'skipped' || c.status === 'failed');
+  const span = report.lookbackDays === 1 ? 'the last day' : `the last ${report.lookbackDays} days`;
+  const n = report.findings.length;
+  return h(
+    'div',
+    { class: 'stack' },
+    h('p', { class: 'hint' }, `Checked ${when(report.ranAt)}, looking back over ${span}. ${n === 0 ? 'Nothing looks wrong.' : `${n} thing${n === 1 ? '' : 's'} to look at.`}`),
+    ...report.findings.map(findingCard),
+    notRun.length > 0
+      ? h('section', { class: 'card' }, h('h3', {}, 'Not checked'), h('ul', {}, ...notRun.map((c) => h('li', {}, h('strong', {}, c.name), `: ${c.reason ?? (c.status === 'failed' ? 'The check failed.' : 'Skipped.')}`))))
+      : null,
+    fine.length > 0
+      ? h('details', { class: 'card' }, h('summary', {}, `Checked and fine (${fine.length})`), h('ul', {}, ...fine.map((c) => h('li', {}, h('strong', {}, c.name), ` — ${c.description}`))))
+      : null,
+  );
+}
+
+function findingCard(f: DiagnosisFinding): HTMLElement {
+  const [label, tone] = SEVERITY_TEXT[f.severity];
+  const count = f.count > 1 ? `${f.count}${f.countIsMinimum ? '+' : ''} times` : null;
+  const seen = f.firstSeen && f.lastSeen && f.firstSeen !== f.lastSeen ? `${when(f.firstSeen)} to ${when(f.lastSeen)}` : when(f.lastSeen ?? f.firstSeen);
+  const steps = f.next.map((step) => {
+    if (step.kind === 'manual') return h('li', {}, step.text);
+    const add = h('button', {}, 'Add to plan');
+    const inPlan = planDraft.some((s) => s.tool === step.mcpName && JSON.stringify(s.args) === JSON.stringify(step.args));
+    add.disabled = !step.available || inPlan || planDraft.length >= MAX_PLAN_STEPS;
+    if (inPlan) add.textContent = 'In your plan';
+    add.addEventListener('click', () => {
+      // The arguments code chose for this finding; the engine checks the plan again when it is proposed.
+      planDraft.push({ tool: step.mcpName, name: step.name, args: step.args });
+      toast(`${step.name} added to your plan (step ${planDraft.length} of ${MAX_PLAN_STEPS}).`);
+      renderTab();
+    });
+    return h('li', {}, h('strong', {}, step.name), ` — ${step.why} `, step.available ? null : h('span', { class: 'hint' }, step.reason ?? 'Not available now.'), ' ', add);
+  });
+  return h(
+    'section',
+    { class: 'card stack' },
+    h('div', { class: 'row' }, h('h3', { class: 'grow' }, f.title), count ? h('span', { class: 'badge' }, count) : null, h('span', { class: `badge ${tone}` }, label)),
+    h('p', {}, f.detail),
+    seen ? h('p', { class: 'hint' }, seen) : null,
+    steps.length > 0 ? h('div', {}, h('h4', {}, 'What to do'), h('ul', {}, ...steps)) : null,
+    f.evidence.length > 0
+      ? h(
+          'details',
+          {},
+          h('summary', {}, `Evidence (${f.evidence.length})`),
+          h(
+            'ul',
+            {},
+            ...f.evidence.map((e) =>
+              h('li', {}, h('strong', {}, [e.source, e.provider, e.eventId != null ? `event ${e.eventId}` : null].filter(Boolean).join(' · ')), e.time ? ` ${when(e.time)}` : '', h('pre', { class: 'evidence' }, e.message)),
+            ),
+          ),
+        )
+      : null,
+  );
 }
 
 // ---- polling for approval requests ------------------------------------------
@@ -1428,7 +1535,36 @@ function mcpTab(): HTMLElement {
   });
   const tokenCard = h('section', { class: 'card stack' }, h('h3', {}, 'Connect an AI client'), h('div', { class: 'row' }, reveal, rotate), tokenArea);
 
-  return h('div', { class: 'stack' }, container, statusCard, configCard, securityCard, deviceCard, tokenCard, gatesCard());
+  return h('div', { class: 'stack' }, container, statusCard, configCard, securityCard, deviceCard, tokenCard, diagnoseAgentsCard(), gatesCard());
+}
+
+/** "Agents may run Diagnose": on by default; turning it back on needs the PIN (ADR 0005 §3). */
+function diagnoseAgentsCard(): HTMLElement {
+  const card = h('section', { class: 'card stack' });
+  const render = () => {
+    const on = settings!.mcp.agentsMayDiagnose;
+    const toggle = h('button', { class: on ? '' : 'primary' }, on ? 'Stop agents running Diagnose' : 'Let agents run Diagnose (PIN)');
+    toggle.addEventListener('click', async () => {
+      try {
+        let pin: string | null = null;
+        if (!on) {
+          pin = await askPin('Let AI agents run Diagnose?', 'Agents get the findings and evidence from your event logs, except from plugins whose read tools need your PIN.', 'Allow');
+          if (pin === null) return;
+        }
+        settings!.mcp.agentsMayDiagnose = await busy(toggle, () => api.setAgentsMayDiagnose(!on, pin));
+        render();
+      } catch (e) {
+        await handleError(e);
+      }
+    });
+    replace(
+      card,
+      h('div', { class: 'row' }, h('h3', { class: 'grow' }, 'Agents may run Diagnose'), h('span', { class: `badge ${on ? 'ok' : 'warn'}` }, on ? 'on' : 'off'), toggle),
+      h('p', { class: 'hint' }, 'Diagnose only reads, and needs no approval. Plugins with a read tool set to “needs my PIN” are left out of what agents get. When this is off, agents are told to ask you to run Check this PC here.'),
+    );
+  };
+  if (settings) render();
+  return card;
 }
 
 function gatesCard(): HTMLElement {

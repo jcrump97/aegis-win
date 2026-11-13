@@ -308,3 +308,48 @@ fn next_tools_must_name_plan_eligible_tools_of_compiled_plugins() {
         assert!(with_next(bad).unwrap_err().contains("nextTools"), "{bad}");
     }
 }
+
+#[tokio::test]
+async fn the_last_report_is_kept_for_the_app_until_the_vault_locks() {
+    let s = setup(&[("checker", &[])]).await;
+    assert_eq!(s.engine.last_diagnosis().unwrap(), None);
+    let report = s.engine.diagnose(7).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap(), Some(report));
+    s.engine.lock().await;
+    assert_eq!(s.engine.last_diagnosis().unwrap_err().code, ErrorCode::VaultLocked);
+    s.engine.unlock(PIN.into()).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap(), None, "dropped at lock, not only hidden");
+}
+
+#[tokio::test]
+async fn agents_do_not_get_findings_of_a_plugin_whose_read_tool_needs_the_pin() {
+    use aegis_core::diagnose::WITHHELD;
+    use aegis_core::registry::GatePolicy;
+    let s = setup(&[("checker", &[]), ("demo", &[])]).await;
+    assert_eq!(s.engine.diagnose_for_agent(7).await.unwrap().findings.len(), 2);
+    s.engine.set_gate_policy("checker", "look", GatePolicy::PinRequired, None).await.unwrap();
+    let agent = s.engine.diagnose_for_agent(7).await.unwrap();
+    assert!(agent.findings.is_empty());
+    assert!(agent.checks.iter().all(|c| c.status == CheckStatus::Skipped && c.reason.as_deref() == Some(WITHHELD)));
+    // The app still sees everything, and keeps the full report.
+    assert_eq!(s.engine.diagnose(7).await.unwrap().findings.len(), 2);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().findings.len(), 2);
+}
+
+#[tokio::test]
+async fn the_owner_can_stop_agents_running_diagnose_and_needs_the_pin_to_allow_it_again() {
+    let s = setup(&[("checker", &[])]).await;
+    assert!(s.engine.agents_may_diagnose().unwrap(), "on by default (D2)");
+    s.engine.set_agents_may_diagnose(false, None).await.unwrap();
+    assert_eq!(s.engine.diagnose_for_agent(7).await.unwrap_err().code, ErrorCode::PluginDisabled);
+    assert_eq!(s.checker.runs.load(Ordering::SeqCst), 0, "refused before running anything");
+    assert_eq!(s.engine.set_agents_may_diagnose(true, None).await.unwrap_err().code, ErrorCode::PinRequired);
+    assert_eq!(s.engine.set_agents_may_diagnose(true, Some("wrong-pin-123".into())).await.unwrap_err().code, ErrorCode::PinInvalid);
+    s.engine.set_agents_may_diagnose(true, Some(PIN.into())).await.unwrap();
+    s.engine.diagnose_for_agent(7).await.unwrap();
+    // The setting is in the vault: it survives a lock.
+    s.engine.set_agents_may_diagnose(false, None).await.unwrap();
+    s.engine.lock().await;
+    s.engine.unlock(PIN.into()).await.unwrap();
+    assert!(!s.engine.agents_may_diagnose().unwrap());
+}

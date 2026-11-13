@@ -166,7 +166,31 @@ test('In-app plans: the owner builds a draft in memory and approves it like any 
   assert.doesNotMatch(panel, /askPin|decideTicket|runTool/, 'the draft never runs or approves anything itself');
   // Only eligible tools offer "Add to plan"; the draft is dropped when the vault locks.
   assert.match(main, /if \(tool\.planEligible\) \{\s*const addButton = h\('button', \{\}, 'Add to plan'\);/);
-  assert.match(main, /if \(!status\.unlocked\) planDraft = \[\];/);
+  assert.match(main, /if \(!status\.unlocked\) \{[^}]*planDraft = \[\];/);
+});
+
+test('Diagnose: the first tab after unlock, plain-text findings, and code-chosen plan steps', () => {
+  const main = fs.readFileSync('src/ui/main.ts', 'utf8');
+  for (const [fn, cmd] of [['runDiagnosis', 'run_diagnosis'], ['lastDiagnosis', 'last_diagnosis'], ['setAgentsMayDiagnose', 'set_agents_may_diagnose']]) {
+    assert.ok(apiTs.includes(`${fn}: (`) && apiTs.includes(`'${cmd}'`), `api.${fn} calls ${cmd}`);
+  }
+  // D3: shown first, and selected at every unlock. D4: the app's copy goes at every lock, like the engine's.
+  assert.match(main, /const tabs = \['diagnose', /);
+  assert.match(main, /function unlockScreen\(\): void \{[^}]*activeTab = 'diagnose';/);
+  assert.match(main, /if \(!status\.unlocked\) \{[^}]*diagnosis = null;/);
+  // Add to plan uses the step's own tool and arguments (chosen by code), and only fills the draft:
+  // nothing runs until the plan is proposed and approved with the PIN.
+  const card = main.slice(main.indexOf('function findingCard('), main.indexOf('// ---- polling for approval requests'));
+  assert.match(card, /planDraft\.push\(\{ tool: step\.mcpName, name: step\.name, args: step\.args \}\)/);
+  assert.match(card, /add\.disabled = !step\.available/);
+  assert.doesNotMatch(card, /askPin|runTool|proposePlan|decideTicket/);
+  // Evidence is Windows text: shown in a text node, never parsed.
+  assert.match(card, /h\('pre', \{ class: 'evidence' \}, e\.message\)/);
+  // Turning agent access back on asks for the PIN; turning it off does not.
+  const gate = main.slice(main.indexOf('function diagnoseAgentsCard('));
+  assert.match(gate, /if \(!on\) \{\s*pin = await askPin\(/);
+  assert.match(gate, /api\.setAgentsMayDiagnose\(!on, pin\)/);
+  assert.match(mainRs, /async fn set_agents_may_diagnose\(engine: EngineState<'_>, on: bool, pin: Option<String>\) -> Cmd<bool> \{\s*engine\.set_agents_may_diagnose\(on, pin\)\.await/);
 });
 
 test('Serial executor: the app shows the change in progress, and the shell never cuts one off', () => {

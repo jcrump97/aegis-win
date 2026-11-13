@@ -211,6 +211,25 @@ pub struct Report {
     pub findings: Vec<ReportFinding>,
 }
 
+impl Report {
+    /// The report an agent gets: the findings of `withheld` plugins are left
+    /// out, and their checks listed as skipped, so Diagnose cannot be used to
+    /// get around a read tool the owner set to need the PIN (ADR 0005 §3).
+    pub fn for_agent(&self, withheld: &[String]) -> Report {
+        let mut out = self.clone();
+        for entry in out.checks.iter_mut().filter(|c| withheld.contains(&c.plugin_id)) {
+            entry.status = CheckStatus::Skipped;
+            entry.reason = Some(WITHHELD.to_owned());
+        }
+        let checks: Vec<&str> = out.checks.iter().filter(|c| withheld.contains(&c.plugin_id)).map(|c| c.id.as_str()).collect();
+        let kept: Vec<ReportFinding> = out.findings.iter().filter(|f| !checks.contains(&f.check.as_str())).cloned().collect();
+        out.findings = kept;
+        out
+    }
+}
+
+pub const WITHHELD: &str = "Needs approval for this plugin's tools.";
+
 /// Where the tools a check may suggest stand at the time of a run.
 pub struct ToolAvailability<'a> {
     pub registry: &'a Registry,
