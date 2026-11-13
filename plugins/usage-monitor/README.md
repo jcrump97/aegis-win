@@ -76,6 +76,12 @@ There are no crash records: crashes and hangs come from the Application log in t
 - Saved monitors are kept inside the encrypted vault (`documentation/PLUGIN_SPEC.md` §5), so they survive a restart.
 - For replay, the last 30 minutes of samples inside the watch window are kept in memory: process names with CPU and memory (only those at 1 % CPU or 64 MB and up, the lowest a rule can use) and system load while `resource-spikes` is on, and the foreground process name while `active-window` is on. They are cleared on lock and by `purge_telemetry_history` and are never sent to the LLM.
 
+## Diagnose checks ([ADR 0005](../../documentation/adr/0005-diagnose-this-pc.md))
+
+`run_checks` (`src/checks.rs`) uses only what the plugin already has: memory read now (`sysinfo`), and the sampler's last 30 minutes of ticks, which are kept only while unlocked and inside the watch window.
+- `memory_pressure`: 90% or more in use now, or in more than half of at least 12 recent ticks (Resource spikes on). `warning`; the evidence names the 3 processes using the most.
+- `sustained_cpu`: one process, by name (its busiest instance, not their sum), at 80% or more of the CPU in more than half of at least 12 recent ticks. Skipped unless the sampler is running with Resource spikes on.
+
 ## How it talks to Windows
 
 - Per-process CPU and memory: the `sysinfo` crate (Win32 process snapshots under the hood). No processes are spawned.
@@ -84,4 +90,4 @@ There are no crash records: crashes and hangs come from the Application log in t
 
 ## Tests
 
-`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), the AI creator's reply format, question filter, and consistency check (`src/creator.rs`), the in-app chat against a loopback LLM mock, including retries, the round limit, app-name consent, and that agents cannot reach it (`src/chat.rs`, `tests/chat.rs`), the monitor tools' PIN gates through the real engine (`tests/monitors.rs`), the timeline's gaps and evidence (`src/timeline.rs`), and the encrypted history, runtime file, purge, and retention through the real engine (`tests/history.rs`).
+`cargo test -p aegis-plugin-usage-monitor`: watch-window maths, spike detection and cooldown, component gating, crash correlation, a real snapshot of this machine, sampler start/stop on unlock/lock, LLM analysis against a loopback mock, the rule language (`src/rules.rs`), saved monitors (`src/monitors.rs`), replay (`src/replay.rs`), the AI creator's reply format, question filter, and consistency check (`src/creator.rs`), the in-app chat against a loopback LLM mock, including retries, the round limit, app-name consent, and that agents cannot reach it (`src/chat.rs`, `tests/chat.rs`), the monitor tools' PIN gates through the real engine (`tests/monitors.rs`), the timeline's gaps and evidence (`src/timeline.rs`), and the encrypted history, runtime file, purge, and retention through the real engine (`tests/history.rs`), and the Diagnose checks on recorded ticks (`tests/checks.rs`).

@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 pub mod chat;
+pub mod checks;
 pub mod creator;
 pub mod monitors;
 pub mod replay;
@@ -1079,6 +1080,27 @@ impl Plugin for UsageMonitorPlugin {
             }
             other => Err(AegisError::new(ErrorCode::UnknownTool, format!("usage-monitor has no tool '{other}'"))),
         }
+    }
+
+    async fn run_checks(&self, ctx: &aegis_core::diagnose::CheckContext) -> Vec<aegis_core::diagnose::CheckResult> {
+        let recent: Vec<RecordedTick> = lock(&self.telemetry).recent.iter().cloned().collect();
+        // Ticks name busy processes only with Resource spikes on (RecordedTick::keep).
+        let recording = self.is_sampling() && ctx.component_enabled(COMPONENT_SPIKES);
+        let now = tokio::task::spawn_blocking(|| {
+            let mut sys = System::new();
+            sys.refresh_memory();
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_memory());
+            let mut top = samples(&sys);
+            top.sort_by(|a, b| b.ram_mb.cmp(&a.ram_mb));
+            top.truncate(3);
+            checks::MemoryNow { used_mb: sys.used_memory() / (1024 * 1024), total_mb: sys.total_memory() / (1024 * 1024), top }
+        })
+        .await;
+        let memory = match now {
+            Ok(now) => checks::memory_pressure(&now, &recent, ctx.now),
+            Err(e) => aegis_core::diagnose::CheckResult::failed("memory_pressure", format!("Could not read memory use: {e}")),
+        };
+        vec![memory, checks::sustained_cpu(&recent, recording)]
     }
 
     fn on_unlock(&self, ctx: &UnlockContext) {

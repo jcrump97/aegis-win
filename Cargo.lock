@@ -57,8 +57,11 @@ name = "aegis-plugin-event-logs"
 version = "0.1.0"
 dependencies = [
  "aegis-core",
+ "aegis-plugin-windows-health",
  "async-trait",
+ "chrono",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

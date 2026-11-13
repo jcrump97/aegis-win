@@ -134,4 +134,12 @@ test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestio
   assert.ok(spec.includes('**The manifest is rejected at startup** unless every `nextTools` entry names a `planEligible` tool'), 'nextTools is validated at startup');
   assert.ok(spec.includes('**The engine, not the plugin, enforces the rest**'), 'the engine enforces next steps');
   assert.match(fs.readFileSync('documentation/ARCHITECTURE.md', 'utf8'), /### 2\.5 Diagnose this PC/);
+  // Phase 1b: every check a plugin declares is documented in its README.
+  for (const plugin of ['event-logs', 'usage-monitor']) {
+    const readme = fs.readFileSync(`plugins/${plugin}/README.md`, 'utf8');
+    assert.match(readme, /## Diagnose checks/, `${plugin} README documents its checks`);
+    for (const check of JSON.parse(fs.readFileSync(`plugins/${plugin}/manifest.json`, 'utf8')).checks) {
+      assert.ok(readme.includes(`\`${check.id}\``), `${plugin} README documents ${check.id}`);
+    }
+  }
 });

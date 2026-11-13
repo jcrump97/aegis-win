@@ -61,5 +61,16 @@
         }
       }
     }
+  ],
+  "checks": [
+    { "id": "unexpected_shutdown", "name": "Unexpected shutdowns", "description": "Windows restarting without shutting down cleanly (Kernel-Power 41, EventLog 6008). Restarts that belong to a blue screen are counted there.", "nextTools": ["windows-health:sfc_scan"] },
+    { "id": "blue_screen", "name": "Blue screens", "description": "Windows stopping with a stop code (BugCheck 1001).", "nextTools": ["windows-health:sfc_scan"] },
+    { "id": "app_crashes", "name": "Program crashes", "description": "Programs crashing or hanging (Application Error 1000, Application Hang 1002), 3 or more times for one program." },
+    { "id": "service_failures", "name": "Service failures", "description": "Services stopping unexpectedly or failing to start (Service Control Manager 7031, 7034, 7000, 7009), by service." },
+    { "id": "disk_errors", "name": "Disk errors", "description": "Bad blocks, paging errors, resets and file system damage (disk 7, 51, 153; storahci and stornvme 129; Ntfs 55, 98)." },
+    { "id": "hardware_errors", "name": "Hardware errors", "description": "Processor, memory and PCIe errors (WHEA-Logger 17, 18, 19, 47)." },
+    { "id": "display_driver_resets", "name": "Display driver resets", "description": "The graphics driver stopping and recovering (Display 4101)." },
+    { "id": "update_failures", "name": "Windows Update failures", "description": "Updates that failed to install (WindowsUpdateClient 20).", "nextTools": ["windows-health:sfc_scan"] },
+    { "id": "dns_timeouts", "name": "DNS timeouts", "description": "Name lookups timing out (DNS Client 1014), 10 or more.", "nextTools": ["windows-health:flush_dns"] }
   ]
 }
