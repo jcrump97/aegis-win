@@ -250,5 +250,9 @@
         "properties": {}
       }
     }
+  ],
+  "checks": [
+    { "id": "memory_pressure", "name": "Memory pressure", "description": "Memory 90% or more in use now, or in most of the usage monitor's recent samples." },
+    { "id": "sustained_cpu", "name": "A process holding the CPU", "description": "One process over 80% of the CPU in most of the usage monitor's recent samples (only while it is sampling with Resource spikes on)." }
   ]
 }

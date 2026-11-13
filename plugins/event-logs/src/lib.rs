@@ -1,5 +1,8 @@
 //! `event-logs`: read-only Windows event log queries plus LLM explanations.
 
+pub mod checks;
+
+use aegis_core::diagnose::{CheckContext, CheckResult};
 use aegis_core::os::eventlog::{self, EventLogError, EventQuery};
 use aegis_core::registry::{Plugin, PluginManifest, ToolContext};
 use aegis_core::{AegisError, AegisResult, ErrorCode};
@@ -87,6 +90,14 @@ impl Plugin for EventLogsPlugin {
                 Ok(json!({ "analysis": answer }))
             }
             other => Err(AegisError::new(ErrorCode::UnknownTool, format!("event-logs has no tool '{other}'"))),
+        }
+    }
+
+    async fn run_checks(&self, ctx: &CheckContext) -> Vec<CheckResult> {
+        let days = ctx.lookback_days;
+        match tokio::task::spawn_blocking(move || checks::read_all(days)).await {
+            Ok(reads) => checks::evaluate_all(&reads, &checks::Window::of(ctx)),
+            Err(e) => checks::CHECKS.iter().map(|(id, _)| CheckResult::failed(id, format!("Reading the event logs stopped: {e}"))).collect(),
         }
     }
 }
