@@ -101,22 +101,17 @@ test('UI: the monitor screen starts monitors only through the PIN-gated tool, an
 
 test('Lifecycle: one copy per install, close-to-tray only while monitors run, and the UI notices a lock', () => {
   // DLL search is restricted first (ADR 0004 Phase 6); the single-instance claim comes before anything else starts.
-  assert.match(mainRs, /fn main\(\) \{\s*\/\/[^\n]*\n\s*let _ = os::restrict_dll_search\(\);\s*\/\/[^\n]*\n\s*let claim = match claim_instance\(\) \{[\s\S]*?Ok\(Instance::AlreadyRunning\) => return,/);
+  assert.match(mainRs, /fn main\(\) \{\s*\/\/[^\n]*\n\s*let _ = os::restrict_dll_search\(\);\s*\/\/[^\n]*\n\s*let after_restart = [^\n]*\n\s*let claim = match claim_instance\(after_restart\) \{[\s\S]*?Ok\(Instance::AlreadyRunning\) => return,/);
   assert.match(fs.readFileSync('src-tauri/build.rs', 'utf8'), /rustc-link-arg-bins=\/DEPENDENTLOADFLAG:0x800/);
   // Closing hides the window only when a plugin is working in the background.
   assert.match(mainRs, /CloseRequested \{ api, \.\. \} = event \{\s*if window\.state::<Arc<Engine>>\(\)\.background_active\(\) \{\s*api\.prevent_close\(\);/);
-  // The elevated restart releases the claim so the elevated copy can start.
-  assert.match(mainRs, /drop\(claim\.0\.lock\(\)\.unwrap\(\)\.take\(\)\);\s*let reclaim[\s\S]*?relaunch_elevated\(\)/);
-  // #10: nothing is stopped or recorded until Windows has accepted the elevated launch. A cancelled
-  // UAC prompt (ERROR_CANCELLED, reported as ErrorKind::Interrupted) leaves monitoring running.
+  // The elevated restart goes through the tested seam (aegis_core::restart, plugins/usage-monitor/tests/restart.rs):
+  // the claim is kept until the quit record is written, and the elevated copy waits for it.
   const restart = mainRs.slice(mainRs.indexOf('async fn restart_as_admin'), mainRs.indexOf('fn main()'));
-  const launchAt = restart.indexOf('relaunch_elevated()');
-  assert.ok(launchAt > 0, 'restart_as_admin launches the elevated copy');
-  assert.equal(restart.slice(0, launchAt).includes('engine.exit('), false, 'no exit record before the launch is accepted');
-  assert.equal(restart.slice(0, launchAt).includes('request_quit('), false, 'no quit before the launch is accepted');
-  // The quit (whose exit handler writes the clean-stop record) is only in the Ok arm.
-  assert.match(restart, /Ok\(\(\)\) => \{\s*request_quit\(&app\);/);
-  assert.equal(restart.slice(restart.indexOf('Err(e) if')).includes('request_quit('), false, 'failure paths do not quit');
+  assert.match(restart, /aegis_core::restart::restart_elevated\(\s*&engine,\s*aegis_core::os::relaunch_elevated,/);
+  assert.equal(restart.includes('engine.exit('), false, 'the shell does not stop anything itself');
+  assert.match(mainRs, /os::single_instance_after_restart\(&key, show, std::time::Duration::from_secs\(30\)\)/);
+  assert.match(mainRs, /args\(\)\.skip\(1\)\.any\(\|a\| a == os::AFTER_RESTART_ARG\)/);
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   // Only input in the app window counts as activity.
   assert.match(main, /document\.addEventListener\('pointerdown', noteActivity, true\);/);
@@ -232,7 +227,7 @@ test('Serial executor: the app shows the change in progress, and the shell never
   assert.match(main, /const \{ running, queued \} = status\.change;/);
   assert.match(main, /queued: \['approved, waiting its turn'/);
   // Restarting as administrator is refused while a change runs; Quit asks first.
-  assert.match(mainRs, /async fn restart_as_admin[\s\S]*?if let Some\(tool\) = engine\.change_running\(\) \{\s*return Err/);
+  assert.match(fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8'), /if let Some\(tool\) = engine\.change_running\(\) \{\s*return Err[\s\S]*?match launch\(\)/);
   assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
   assert.match(mainRs, /"quit" => quit_app\(app\),/);
 });
