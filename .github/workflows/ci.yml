@@ -11,10 +11,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `edited` re-checks a changed title or description; only the message job runs for it.
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
-  verify-atomic-commit-and-tests:
-    runs-on: windows-latest
+  check-messages:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -28,12 +31,26 @@ jobs:
 
       # Git does not clone core.hooksPath, so a contributor's commits may never have met .githooks/commit-msg.
       - name: Check Commit Messages (type tag, no AI attribution)
-        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: node scripts/check-commit-messages.mjs
+
+  verify-atomic-commit-and-tests:
+    if: github.event.action != 'edited'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Setup Rust Toolchain (Tauri v2 Backend)
         uses: dtolnay/rust-toolchain@stable

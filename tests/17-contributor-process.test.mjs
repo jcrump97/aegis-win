@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
-import { ATTRIBUTION_PATTERN, PREFIXES, checkMessage, checkPrBody } from '../scripts/check-commit-messages.mjs';
+import { ATTRIBUTION_PATTERN, PREFIXES, checkMessage, checkPrBody, checkPrTitle } from '../scripts/check-commit-messages.mjs';
 import { refusal } from '../.claude/hooks/guard-git.mjs';
 import { summary } from '../.claude/hooks/session-issues.mjs';
 import { changedPaths, reason } from '../.claude/hooks/stop-ledger.mjs';
@@ -27,6 +29,42 @@ test('Contributor process: CI checks commit messages with the same rules as the 
   assert.match(ci, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
   // Untrusted text reaches the script through the environment, never the command line.
   assert.doesNotMatch(ci, /run:.*\$\{\{/);
+});
+
+test('Contributor process: a message may quote the attribution rule, a real trailer or footer is still refused (issue #37)', () => {
+  // Quoting the rule mid-line is fine.
+  assert.deepEqual(checkMessage('(fix) Refuse a "Generated with Claude Code" footer'), []);
+  assert.deepEqual(checkMessage('(doc) Note\n\nThe check refuses the line Generated with Claude Code and a Co-Authored-By: Claude line.'), []);
+  assert.deepEqual(checkPrBody('The hook refuses footers such as "Generated with [Claude Code](x)" in a description.'), []);
+  // Real trailers and footers, with the markup a tool puts in front, are still refused.
+  for (const line of ['Generated with [Claude Code](https://claude.com/claude-code)', '\u{1F916} Generated with [Claude Code](https://claude.com/claude-code)', '> **Generated with Copilot**', 'GENERATED WITH CHATGPT', 'Co-authored-by: GitHub Copilot <x@y.z>']) {
+    assert.equal(checkMessage(`(feat) Add a thing\n\n${line}`).length, 1, line);
+    assert.equal(checkPrBody(`Text.\n\n${line}`).length, 1, line);
+  }
+  // The shell hook refuses and accepts the same messages.
+  const hook = (message) => {
+    const file = path.join(os.tmpdir(), `aegis-msg-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    fs.writeFileSync(file, message);
+    const run = spawnSync('sh', ['.githooks/commit-msg', file], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'en_US.UTF-8' } }); // git runs hooks in a UTF-8 locale
+    fs.rmSync(file);
+    return run.status;
+  };
+  assert.equal(hook('(fix) Refuse a "Generated with Claude Code" footer\n'), 0, 'hook allows a quote');
+  assert.equal(hook('(feat) Add\n\n\u{1F916} Generated with [Claude Code](x)\n'), 1, 'hook refuses a footer');
+  assert.equal(hook('(feat) Add\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n'), 1, 'hook refuses a trailer');
+});
+
+test('Contributor process: the pull request title is checked and an edit re-runs the check (issue #30)', () => {
+  assert.deepEqual(checkPrTitle('(fix) Resolve DNS timeout'), []);
+  assert.equal(checkPrTitle('Resolve DNS timeout').length, 1);
+  assert.equal(checkPrTitle(undefined).length, 1);
+  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+  assert.match(ci, /types: \[opened, synchronize, reopened, edited\]/);
+  assert.match(ci, /PR_TITLE: \$\{\{ github\.event\.pull_request\.title \}\}/);
+  // An edit re-runs only the message check, not the Windows build and tests.
+  assert.match(ci, /if: github\.event\.action != 'edited'/);
+  assert.doesNotMatch(ci, /run:.*\$\{\{/);
+  assert.doesNotMatch(ci, /: write/, 'no write permission');
 });
 
 test('Contributor process: the commit message check passes on this repository\'s own history', () => {
