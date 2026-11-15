@@ -175,3 +175,11 @@ test('Documentation Audit: agent docs keep the review and findings rules, and no
   assert.match(fs.readFileSync('documentation/ARCHITECTURE.md', 'utf8'), /Dynamic Zoom: 80% - 150%/);
   assert.match(fs.readFileSync('documentation/GUIDING_PRINCIPLES.md', 'utf8'), /`--ui-scale: 0\.80` to `1\.50`/);
 });
+
+test('Documentation Audit: the guiding principles in AGENTS.md are numbered in order', () => {
+  // Rendered Markdown renumbers a list, so an out-of-order source shows different numbers than it says (issue #28).
+  const section = fs.readFileSync('AGENTS.md', 'utf8').split(/^## /m).find((s) => s.startsWith('1. Guiding Engineering Principles'));
+  const numbers = [...section.matchAll(/^(\d+)\. \*\*/gm)].map((m) => Number(m[1]));
+  assert.ok(numbers.length >= 7, 'the principles are found');
+  assert.deepEqual(numbers, numbers.map((_, i) => i + 1));
+});
