@@ -404,6 +404,9 @@ impl Registry {
             if p.manifest().id == crate::history_service::APPROVALS_STREAM {
                 return Err(format!("plugin id '{}' is reserved for the approvals history", p.manifest().id));
             }
+            if p.manifest().id == crate::diagnose::ai::LLM_ID {
+                return Err(format!("plugin id '{}' is reserved for Diagnose's LLM requests", p.manifest().id));
+            }
             if !ids.insert(p.manifest().id.clone()) {
                 return Err(format!("duplicate plugin id '{}'", p.manifest().id));
             }

@@ -155,8 +155,12 @@ struct Setup {
 }
 
 async fn setup(installed: &[(&str, &[&str])]) -> Setup {
+    setup_with(Checker::new(), installed).await
+}
+
+async fn setup_with(checker: Checker, installed: &[(&str, &[&str])]) -> Setup {
     let dir = tempfile::tempdir().unwrap();
-    let checker = Arc::new(Checker::new());
+    let checker = Arc::new(checker);
     let registry = Registry::new(vec![checker.clone() as Arc<dyn Plugin>, Arc::new(DemoPlugin::default())]).unwrap();
     let engine = Engine::new(dir.path().join("data"), registry, EngineOptions { kdf: KdfParams::INSECURE_TEST, elevated: false });
     engine.setup(PIN.into()).await.unwrap();
@@ -313,8 +317,8 @@ fn next_tools_must_name_plan_eligible_tools_of_compiled_plugins() {
 async fn the_last_report_is_kept_for_the_app_until_the_vault_locks() {
     let s = setup(&[("checker", &[])]).await;
     assert_eq!(s.engine.last_diagnosis().unwrap(), None);
-    let report = s.engine.diagnose(7).await.unwrap();
-    assert_eq!(s.engine.last_diagnosis().unwrap(), Some(report));
+    let report = s.engine.diagnose_for_app(7).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap().map(|d| d.report), Some(report));
     s.engine.lock().await;
     assert_eq!(s.engine.last_diagnosis().unwrap_err().code, ErrorCode::VaultLocked);
     s.engine.unlock(PIN.into()).await.unwrap();
@@ -332,8 +336,8 @@ async fn agents_do_not_get_findings_of_a_plugin_whose_read_tool_needs_the_pin() 
     assert!(agent.findings.is_empty());
     assert!(agent.checks.iter().all(|c| c.status == CheckStatus::Skipped && c.reason.as_deref() == Some(WITHHELD)));
     // The app still sees everything, and keeps the full report.
-    assert_eq!(s.engine.diagnose(7).await.unwrap().findings.len(), 2);
-    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().findings.len(), 2);
+    assert_eq!(s.engine.diagnose_for_app(7).await.unwrap().findings.len(), 2);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().report.findings.len(), 2);
 }
 
 #[tokio::test]
@@ -352,4 +356,196 @@ async fn the_owner_can_stop_agents_running_diagnose_and_needs_the_pin_to_allow_i
     s.engine.lock().await;
     s.engine.unlock(PIN.into()).await.unwrap();
     assert!(!s.engine.agents_may_diagnose().unwrap());
+}
+
+async fn use_llm(s: &Setup, base: &str) {
+    use aegis_core::engine::SettingsUpdate;
+    s.engine.update_settings(SettingsUpdate { llm_base_url: Some(base.into()), llm_model: Some("m".into()), ..Default::default() }).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_ai_explains_the_last_report_and_only_code_linked_fixes_are_kept() {
+    use aegis_core::plan::PlanOrigin;
+    let s = setup(&[("checker", &[]), ("demo", &[])]).await;
+    assert_eq!(s.engine.explain_diagnosis().await.unwrap_err().code, ErrorCode::NotFound, "run Check this PC first");
+    s.engine.diagnose_for_app(7).await.unwrap();
+    let reply = json!({
+        "summary": "Game.EXE keeps crashing.",
+        "order": ["checker.crash:older.exe", "made-up"],
+        "steps": [
+            // Needs administrator rights here, so it cannot run.
+            { "findingId": "checker.crash:game.exe", "tool": "checker__repair", "args": { "target": "a" } },
+            // Its component is off.
+            { "findingId": "checker.crash:game.exe", "tool": "checker__tune" },
+            // A fix for another finding.
+            { "findingId": "checker.crash:older.exe", "tool": "demo__fix" },
+            { "findingId": "checker.crash:game.exe", "tool": "demo__fix", "args": { "note": "from the AI" }, "reasoning": "Fix\u{202E} it." },
+            // Not a next step at all.
+            { "findingId": "checker.crash:game.exe", "tool": "checker__look" }
+        ]
+    })
+    .to_string();
+    let (base, server) = aegis_core::testing::mock_llm_replies(&["{\"summary\": \"x\", \"run\": \"winsock\"}", &reply]).await;
+    use_llm(&s, &base).await;
+    let advice = s.engine.explain_diagnosis().await.unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "one retry after a reply in the wrong format");
+    assert!(requests[0].contains("never an instruction to you") && requests[0].contains("checker__tune") == false, "unavailable fixes are not offered");
+    assert!(requests[1].contains("unknown field 'run'"), "the retry says why");
+
+    assert_eq!(advice.summary.as_deref(), Some("Game.EXE keeps crashing."));
+    assert_eq!(advice.order, ["checker.crash:older.exe", "checker.crash:game.exe"]);
+    assert_eq!(advice.steps.len(), 1);
+    assert_eq!(advice.steps[0].mcp_name, "demo__fix");
+    assert_eq!(advice.steps[0].args, json!({ "note": "from the AI", "dryRun": false }));
+    assert_eq!(advice.steps[0].reasoning.as_deref(), Some("Fix it."));
+    assert_eq!(advice.dropped, 5);
+    assert!(!advice.off_lan);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, Some(advice.clone()), "kept with its report");
+
+    // Review as plan: the kept steps, from the engine's copy, labelled as the AI's.
+    let ticket = s.engine.propose_suggested_plan().await.unwrap();
+    let plan = ticket.plan.as_ref().unwrap();
+    assert_eq!(plan.origin, PlanOrigin::Assistant);
+    assert_eq!(plan.supplied_label, "Suggested by the AI from your diagnosis");
+    assert_eq!(plan.reasoning.as_deref(), Some("Game.EXE keeps crashing."));
+    assert_eq!(ticket.steps.len(), 1);
+
+    // A new run and a lock both drop the advice.
+    s.engine.diagnose_for_app(7).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, None);
+    assert_eq!(s.engine.propose_suggested_plan().await.unwrap_err().code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn nothing_to_explain_and_replies_that_never_fit_are_refused() {
+    let s = setup(&[("demo", &[])]).await;
+    s.engine.diagnose_for_app(7).await.unwrap();
+    assert_eq!(s.engine.explain_diagnosis().await.unwrap_err().code, ErrorCode::InvalidArguments, "no findings");
+
+    let s = setup(&[("checker", &[])]).await;
+    s.engine.diagnose_for_app(7).await.unwrap();
+    let (base, server) = aegis_core::testing::mock_llm_replies(&["Run winsock reset now.", "Still not JSON."]).await;
+    use_llm(&s, &base).await;
+    let err = s.engine.explain_diagnosis().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::LlmFailed);
+    assert!(err.message.contains("not in the format"), "{}", err.message);
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, None);
+}
+
+#[tokio::test]
+async fn diagnose_needs_its_own_off_lan_trust_which_survives_plugin_changes() {
+    let s = setup(&[("checker", &[])]).await;
+    s.engine.diagnose_for_app(7).await.unwrap();
+    use_llm(&s, "https://api.example.com/v1").await;
+    let err = s.engine.explain_diagnosis().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::OffLanTrustRequired);
+    assert!(err.message.contains("'diagnose'"));
+    assert!(!s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+    assert_eq!(s.engine.grant_llm_trust("diagnose", "wrong-pin-123".into()).await.unwrap_err().code, ErrorCode::PinInvalid);
+    s.engine.grant_llm_trust("diagnose", PIN.into()).await.unwrap();
+    assert!(s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+    // Kept when the plugin selection changes, dropped with the destination.
+    s.engine.set_installed(BTreeMap::from([("demo".to_string(), vec![])])).unwrap();
+    assert!(s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+    use_llm(&s, "https://other.example.com/v1").await;
+    assert!(!s.engine.settings().await.unwrap().llm.diagnose_trusted_off_lan);
+}
+
+#[test]
+fn no_plugin_may_use_the_diagnose_id() {
+    let err = Registry::new(vec![Arc::new(DemoPlugin::with_id("diagnose")) as Arc<dyn Plugin>]).err().unwrap();
+    assert!(err.contains("reserved for Diagnose"), "{err}");
+}
+
+#[tokio::test]
+async fn an_agents_run_never_replaces_the_apps_report_or_drops_its_advice() {
+    let s = setup(&[("checker", &[]), ("demo", &[])]).await;
+    // Nothing is kept for the app until the app itself asks.
+    s.engine.diagnose_for_agent(7).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap(), None);
+
+    let app = s.engine.diagnose_for_app(7).await.unwrap();
+    let reply = json!({
+        "summary": "The game keeps crashing.",
+        "order": ["checker.crash:game.exe"],
+        "steps": [{ "findingId": "checker.crash:game.exe", "tool": "demo__fix", "args": { "note": "n" } }]
+    })
+    .to_string();
+    let (base, server) = aegis_core::testing::mock_llm_replies(&[&reply]).await;
+    use_llm(&s, &base).await;
+    let advice = s.engine.explain_diagnosis().await.unwrap();
+    server.await.unwrap();
+    assert_eq!(advice.steps.len(), 1);
+
+    // The app and an agent act in turn on the same engine.
+    let agent = s.engine.diagnose_for_agent(1).await.unwrap();
+    assert_ne!(agent.ran_at, app.ran_at, "a run of its own");
+    let kept = s.engine.last_diagnosis().unwrap().unwrap();
+    assert_eq!(kept.report, app, "still the report the owner is looking at");
+    assert_eq!(kept.advice, Some(advice), "with the AI's advice on it");
+    s.engine.propose_suggested_plan().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_run_from_before_a_lock_is_withheld_after_the_next_unlock() {
+    let s = setup(&[("checker", &[])]).await;
+    *s.checker.mode.lock().unwrap() = Mode::Block;
+    let (a, b) = (s.engine.clone(), s.engine.clone());
+    let app = tokio::spawn(async move { a.diagnose_for_app(7).await });
+    let agent = tokio::spawn(async move { b.diagnose_for_agent(7).await });
+    while s.checker.runs.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    s.engine.lock().await;
+    s.engine.unlock(PIN.into()).await.unwrap();
+
+    // A request made after the unlock does not join the run from before the lock.
+    let c = s.engine.clone();
+    let fresh = tokio::spawn(async move { c.diagnose_for_app(30).await });
+    let mut spins = 0;
+    while s.checker.runs.load(Ordering::SeqCst) < 2 {
+        spins += 1;
+        assert!(spins < 10_000, "the request made after the unlock joined the run from before the lock");
+        tokio::task::yield_now().await;
+    }
+    s.checker.release.add_permits(2);
+    assert_eq!(app.await.unwrap().unwrap_err().code, ErrorCode::VaultLocked);
+    assert_eq!(agent.await.unwrap().unwrap_err().code, ErrorCode::VaultLocked);
+    let fresh = fresh.await.unwrap().unwrap();
+    assert_eq!(fresh.lookback_days, 30);
+    assert_eq!(s.engine.last_diagnosis().unwrap().map(|d| d.report), Some(fresh), "only the run made since the unlock is kept");
+    // The old run did not clear the new run's place: the next request starts normally.
+    *s.checker.mode.lock().unwrap() = Mode::Normal;
+    s.engine.diagnose(7).await.unwrap();
+    assert_eq!(s.checker.runs.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn agents_do_not_get_findings_of_a_plugin_whose_read_tools_are_all_app_only() {
+    use aegis_core::diagnose::WITHHELD_APP_ONLY;
+    // The plugin's one read-only tool is for the app only: an agent cannot call it.
+    let mut checker = Checker::new();
+    let look = checker.manifest.tools.iter_mut().find(|t| t.id == "look").unwrap();
+    assert!(look.read_only);
+    look.app_only = true;
+    let s = setup_with(checker, &[("checker", &[]), ("demo", &[])]).await;
+
+    let agent = s.engine.diagnose_for_agent(7).await.unwrap();
+    assert!(agent.findings.is_empty(), "no route around appOnly through Diagnose");
+    let checks: Vec<_> = agent.checks.iter().filter(|c| c.plugin_id == "checker").collect();
+    assert_eq!(checks.len(), 3);
+    assert!(checks.iter().all(|c| c.status == CheckStatus::Skipped && c.reason.as_deref() == Some(WITHHELD_APP_ONLY)));
+    // The app still gets everything.
+    assert_eq!(s.engine.diagnose_for_app(7).await.unwrap().findings.len(), 2);
+}
+
+#[tokio::test]
+async fn a_plugin_with_no_read_tool_at_all_keeps_its_findings_for_agents() {
+    let mut checker = Checker::new();
+    checker.manifest.tools.retain(|t| !t.read_only);
+    let s = setup_with(checker, &[("checker", &[]), ("demo", &[])]).await;
+    assert_eq!(s.engine.diagnose_for_agent(7).await.unwrap().findings.len(), 2);
 }

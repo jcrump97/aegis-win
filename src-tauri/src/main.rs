@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aegis_core::autostart::{Autostart, AutostartState};
-use aegis_core::diagnose::Report;
+use aegis_core::diagnose::ai::Advice;
+use aegis_core::diagnose::{Diagnosis, Report};
 use aegis_core::engine::{DeviceCodeView, Engine, EngineOptions, LlmTest, Origin, PluginView, RunOutcome, SettingsUpdate, SettingsView, Status};
 use aegis_core::mcp::McpStatus;
 use aegis_core::os::{self, Instance, SingleInstance};
@@ -435,13 +436,25 @@ async fn cancel_ticket(engine: EngineState<'_>, ticket_id: String) -> Cmd<Ticket
 /// Runs every installed plugin's read-only checks (ADR 0005). One run at a time.
 #[tauri::command]
 async fn run_diagnosis(engine: EngineState<'_>, lookback_days: u32) -> Cmd<Report> {
-    engine.diagnose(lookback_days).await
+    engine.diagnose_for_app(lookback_days).await
 }
 
-/// The last report since unlocking, if any.
+/// The last report since unlocking, and the AI's advice on it, if any.
 #[tauri::command]
-async fn last_diagnosis(engine: EngineState<'_>) -> Cmd<Option<Report>> {
+async fn last_diagnosis(engine: EngineState<'_>) -> Cmd<Option<Diagnosis>> {
     engine.last_diagnosis()
+}
+
+/// Asks the LLM to rank and explain the last report (ADR 0005 §5).
+#[tauri::command]
+async fn explain_diagnosis(engine: EngineState<'_>) -> Cmd<Advice> {
+    engine.explain_diagnosis().await
+}
+
+/// Opens the AI's checked steps as a plan to review and approve with the PIN.
+#[tauri::command]
+async fn propose_suggested_plan(engine: EngineState<'_>) -> Cmd<TicketView> {
+    engine.propose_suggested_plan().await
 }
 
 /// Lets AI agents run `aegis__diagnose` (needs the PIN) or stops them.
@@ -604,6 +617,8 @@ fn main() {
             propose_plan,
             run_diagnosis,
             last_diagnosis,
+            explain_diagnosis,
+            propose_suggested_plan,
             set_agents_may_diagnose,
             start_mcp,
             set_mcp_plain_http,

@@ -435,6 +435,14 @@ impl LlmHandle {
         }
     }
 
+    /// How many characters a user message may have and still be sent whole
+    /// with `system_prompt` and `options` (see [`fit`](Self::fit)).
+    pub fn room_chars(&self, system_prompt: &str, options: LlmOptions) -> usize {
+        let usable = u64::from(self.config.context_tokens) * 9 / 10;
+        let room = usable.saturating_sub(estimate_tokens(system_prompt) + u64::from(options.max_tokens));
+        usize::try_from(room * CHARS_PER_TOKEN).unwrap_or(usize::MAX).min(MAX_PROMPT_CHARS)
+    }
+
     /// Keeps the request inside the context window: the system prompt, the
     /// user message and room for the answer, with a 10% margin. Shortens the
     /// user message, or refuses when it must be sent whole.

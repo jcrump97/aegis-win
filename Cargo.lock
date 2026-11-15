@@ -22,6 +22,7 @@ dependencies = [
 name = "aegis-core"
 version = "0.1.0"
 dependencies = [
+ "aegis-core",
  "aes-gcm",
  "argon2",
  "async-trait",

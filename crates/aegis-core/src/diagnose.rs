@@ -8,6 +8,8 @@
 //! Next steps are limited here, by the engine, to the tools a check declares
 //! in its manifest (`nextTools`), whatever the check's code returns.
 
+pub mod ai;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -201,6 +203,15 @@ pub struct ReportFinding {
     pub next: Vec<NextStep>,
 }
 
+/// The last report and what the AI made of it, kept for the app until the
+/// next run or the next lock (ADR 0005 D4).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Diagnosis {
+    pub report: Report,
+    pub advice: Option<ai::Advice>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Report {
@@ -212,16 +223,20 @@ pub struct Report {
 }
 
 impl Report {
-    /// The report an agent gets: the findings of `withheld` plugins are left
-    /// out, and their checks listed as skipped, so Diagnose cannot be used to
-    /// get around a read tool the owner set to need the PIN (ADR 0005 §3).
-    pub fn for_agent(&self, withheld: &[String]) -> Report {
+    /// The report an agent gets: the findings of `withheld` plugins (each
+    /// with the reason shown) are left out, and their checks listed as
+    /// skipped, so Diagnose cannot be used to get around a read tool the
+    /// owner set to need the PIN, or one that is for the app only (ADR 0005 §3).
+    pub fn for_agent(&self, withheld: &[(String, &'static str)]) -> Report {
         let mut out = self.clone();
-        for entry in out.checks.iter_mut().filter(|c| withheld.contains(&c.plugin_id)) {
-            entry.status = CheckStatus::Skipped;
-            entry.reason = Some(WITHHELD.to_owned());
+        let reason_for = |plugin: &str| withheld.iter().find(|(id, _)| id == plugin).map(|(_, why)| *why);
+        for entry in out.checks.iter_mut() {
+            if let Some(why) = reason_for(&entry.plugin_id) {
+                entry.status = CheckStatus::Skipped;
+                entry.reason = Some(why.to_owned());
+            }
         }
-        let checks: Vec<&str> = out.checks.iter().filter(|c| withheld.contains(&c.plugin_id)).map(|c| c.id.as_str()).collect();
+        let checks: Vec<&str> = out.checks.iter().filter(|c| reason_for(&c.plugin_id).is_some()).map(|c| c.id.as_str()).collect();
         let kept: Vec<ReportFinding> = out.findings.iter().filter(|f| !checks.contains(&f.check.as_str())).cloned().collect();
         out.findings = kept;
         out
@@ -229,6 +244,7 @@ impl Report {
 }
 
 pub const WITHHELD: &str = "Needs approval for this plugin's tools.";
+pub const WITHHELD_APP_ONLY: &str = "This plugin's readings are for the AegisWin app only.";
 
 /// Where the tools a check may suggest stand at the time of a run.
 pub struct ToolAvailability<'a> {
@@ -347,7 +363,7 @@ fn clean_evidence(mut e: Evidence) -> Evidence {
 }
 
 /// Without hidden or control characters (newlines kept as spaces), cut to `max` characters.
-fn clean(text: &str, max: usize) -> String {
+pub(crate) fn clean(text: &str, max: usize) -> String {
     let flat: String = text.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !is_hidden_char(*c)).collect();
     let flat = flat.split(' ').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {

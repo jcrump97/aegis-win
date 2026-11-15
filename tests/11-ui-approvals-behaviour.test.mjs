@@ -168,10 +168,32 @@ function backend(cmd, args) {
     case 'run_tool':
       if (args.toolId === 'list_monitors') return { status: 'completed', result: { monitors: [], maxMonitors: 20, loadError: null, note: '' } };
       return { status: 'completed', result: {} };
+    case 'run_diagnosis':
+      return diagnosisReport;
     default:
       return null;
   }
 }
+
+const fixStep = (id, name) => ({ kind: 'tool', tool: `windows-health:${id}`, mcpName: `windows-health__${id}`, name, args: { dryRun: false }, why: 'It may help.', available: true });
+const diagnosisReport = {
+  ranAt: '2026-11-15T10:00:00Z',
+  lookbackDays: 7,
+  elevated: true,
+  checks: [{ id: 'event-logs.dns_timeouts', pluginId: 'event-logs', name: 'DNS timeouts', description: 'd', status: 'finding' }],
+  findings: [
+    {
+      id: 'event-logs.dns_timeouts',
+      check: 'event-logs.dns_timeouts',
+      severity: 'warning',
+      title: 'Name lookups keep timing out',
+      detail: '12 lookups timed out.',
+      count: 12,
+      evidence: [{ source: 'System', provider: 'DNS Client Events', eventId: 1014, message: 'Name resolution timed out.' }],
+      next: [fixStep('flush_dns', 'Flush DNS cache'), fixStep('sfc_scan', 'System file check')],
+    },
+  ],
+};
 
 /** Vite's `?raw` imports (the EFF wordlist), as esbuild text. */
 const rawImports = {
@@ -461,4 +483,56 @@ test('a LAN server shows its certificate, and plain HTTP needs the PIN and carri
   await settle();
   assert.deepEqual(mcpCalls.at(-1), { cmd: 'set_mcp_plain_http', on: false, pin: null }, 'going back to HTTPS needs no PIN');
   mcpLan = false;
+});
+
+// Regression for issue #24: Add to plan and Remove redraw the tab, which
+// emptied the draft's title and notes and closed the open Evidence.
+test('changing the plan draft on the Diagnose tab keeps what was typed and the open Evidence', async () => {
+  const { document } = app;
+  nav(document, 'diagnose').click();
+  await settle();
+  const main = () => document.querySelector('main');
+  const button = (label) => main().querySelectorAll('button').find((b) => b.textContent === label);
+  button('Check this PC').click();
+  await settle();
+  assert.ok(main().textContent.includes('Name lookups keep timing out'), 'the finding is shown');
+
+  const evidence = () => main().querySelectorAll('details').find((d) => d.textContent.includes('Evidence (1)'));
+  evidence().open = true;
+  evidence().dispatchEvent({ type: 'toggle' });
+
+  button('Add to plan').click();
+  await settle();
+  const title = () => main().querySelectorAll('input').find((i) => i.id === 'plan-title');
+  const notes = () => main().querySelectorAll('textarea').find((t) => t.id === 'plan-reasoning');
+  assert.equal(title().value, '', 'a new draft starts empty');
+  title().value = 'Fix the lookups';
+  title().dispatchEvent({ type: 'input' });
+  notes().value = 'Flush first, then check the files.';
+  notes().dispatchEvent({ type: 'input' });
+
+  // A second step redraws the tab.
+  button('Add to plan').click();
+  await settle();
+  assert.ok(main().textContent.includes('Your plan: 2 of 5 steps'));
+  assert.equal(title().value, 'Fix the lookups', 'the title survives adding a step');
+  assert.equal(notes().value, 'Flush first, then check the files.', 'the notes survive adding a step');
+  assert.equal(evidence().open, true, 'the Evidence stays open');
+
+  // So does removing one.
+  main().querySelectorAll('button').find((b) => b.textContent === 'Remove').click();
+  await settle();
+  assert.ok(main().textContent.includes('Your plan: 1 of 5 steps'));
+  assert.equal(title().value, 'Fix the lookups', 'the title survives removing a step');
+  assert.equal(evidence().open, true);
+
+  // Clearing the plan drops them with it.
+  button('Clear plan').click();
+  await settle();
+  button('Add to plan').click();
+  await settle();
+  assert.equal(title().value, '', 'a cleared plan does not bring its title back');
+  assert.equal(notes().value, '');
+  button('Clear plan').click();
+  await settle();
 });

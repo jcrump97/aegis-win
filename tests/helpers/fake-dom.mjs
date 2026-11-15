@@ -32,6 +32,10 @@ class Node {
   get textContent() {
     return this.childNodes.map((c) => c.textContent).join('');
   }
+  set textContent(text) {
+    for (const child of [...this.childNodes]) this.removeChild(child);
+    if (text !== '') this.appendChild(new Text(String(text)));
+  }
   get isConnected() {
     let n = this;
     while (n.parentNode) n = n.parentNode;

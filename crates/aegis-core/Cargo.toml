@@ -73,3 +73,5 @@ windows = { version = "0.62", features = [
 tempfile = "3"
 # Paused time for the Diagnose time-limit test.
 tokio = { workspace = true, features = ["test-util"] }
+# The mock LLM server for the Diagnose AI tests.
+aegis-core = { path = ".", features = ["test-util"] }

@@ -681,6 +681,8 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
         (PlanOrigin::Agent, false) => "<h1>Action plan from an AI agent</h1>",
         (PlanOrigin::Owner, true) => "<h1>Approve your action plan?</h1>",
         (PlanOrigin::Owner, false) => "<h1>Your action plan</h1>",
+        (PlanOrigin::Assistant, true) => "<h1>Approve the plan the AI suggested from your diagnosis?</h1>",
+        (PlanOrigin::Assistant, false) => "<h1>Plan the AI suggested from your diagnosis</h1>",
     });
     if let Some((text, ok)) = message {
         body.push_str(&format!("<div class=\"msg{}\">{}</div>", if ok { " ok" } else { "" }, escape_html(text)));
