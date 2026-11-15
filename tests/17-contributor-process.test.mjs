@@ -122,6 +122,62 @@ test('Contributor process: the git guard reads git\'s arguments, not any text in
   }
 });
 
+test('Contributor process: the git guard reads a here-string, config forms, backticks, shell here-documents and aliases (issues #32, #33)', () => {
+  for (const bad of [
+    'grep foo <<< bar\ngit commit --no-verify -m x',
+    'git --config-env=core.hooksPath=X commit -m x',
+    'git --config-env core.hooksPath=X commit -m x',
+    'git --config-env=commit.gpgsign=NOSIGN commit -m x',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false git commit -m x',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x',
+    'echo `git commit --no-verify -m x`',
+    "bash <<'EOF'\ngit commit --no-verify -m x\nEOF",
+    'git -c alias.ci="commit --no-verify" ci -m x',
+    'git -c alias.ci="!git commit -n" ci',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'cat <<< "git commit -n"',
+    "cat <<'EOF'\ngit commit -n\nEOF",
+    "bash <<'EOF'\ngit status\nEOF",
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=true git commit -m x',
+    'git --config-env=user.name=NAME commit -m x',
+    'git -c alias.co=checkout co main',
+    'echo `date`',
+  ]) {
+    assert.equal(refusal(fine), null, fine);
+  }
+});
+
+test('Contributor process: the git guard allows an option value, a comment or a script argument that only mentions a flag (issue #34)', () => {
+  for (const bad of [
+    'git commit -m x -n',
+    'git commit -m a -m b -n',
+    'git commit -m a --no-verify',
+    'git log --grep x --no-verify',
+    'echo hi # note\ngit commit -n -m x',
+    'bash -c "git commit -n"',
+    'bash -lc "git commit -n"',
+    'git -c core.hooksPath=/x commit -m x',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'git commit -m "(fix) x" -m "-n is now refused"',
+    'git commit -m "(fix) x" -m "--no-verify is refused"',
+    'git commit --message "--no-verify"',
+    'git log --grep "--no-verify"',
+    'git log -S --no-verify',
+    'git status # never use --no-verify',
+    'bash scripts/x.sh "explain git commit -n"',
+    'git -c core.hooksPath=.githooks commit -m x',
+    'git commit -m x#y',
+  ]) {
+    assert.equal(refusal(fine), null, fine);
+  }
+});
+
 test('Contributor process: the session-start issue list shows only maintainers\' issues, as data', () => {
   const issues = [
     { number: 23, title: 'Report kept after unlock', author_association: 'OWNER', labels: [{ name: 'bug' }] },
