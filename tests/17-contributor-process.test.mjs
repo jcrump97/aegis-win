@@ -23,48 +23,87 @@ test('Contributor process: CI checks commit messages with the same rules as the 
   assert.deepEqual(checkPrBody(undefined), []);
 
   // A pull request from a clone without the hooks is still checked.
-  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
-  assert.match(ci, /if: github\.event_name == 'pull_request'/);
+  const ci = fs.readFileSync('.github/workflows/check-messages.yml', 'utf8');
   assert.match(ci, /node scripts\/check-commit-messages\.mjs/);
   assert.match(ci, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
   // Untrusted text reaches the script through the environment, never the command line.
   assert.doesNotMatch(ci, /run:.*\$\{\{/);
 });
 
+// The forbidden words are built here so that this file, and the commit and pull request text that
+// quote it, never carry a real footer themselves.
+const GEN = ['Gener', 'ated with'].join('');
+const COA = ['Co-Auth', 'ored-By:'].join('');
+const footers = (name) => [`${GEN} ${name}`, `${GEN} [${name} Code](https://example.com)`, `${GEN} ${name.toLowerCase()}`, `${GEN.toUpperCase()} ${name.toUpperCase()}`];
+
+/** The shell hook's verdict (exit status) for a message, in the UTF-8 locale git runs hooks in. */
+function hookStatus(message) {
+  const file = path.join(os.tmpdir(), `aegis-msg-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  fs.writeFileSync(file, message);
+  const run = spawnSync('sh', ['.githooks/commit-msg', file], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'en_US.UTF-8' } });
+  fs.rmSync(file);
+  return run.status;
+}
+
 test('Contributor process: a message may quote the attribution rule, a real trailer or footer is still refused (issue #37)', () => {
-  // Quoting the rule mid-line is fine.
-  assert.deepEqual(checkMessage('(fix) Refuse a "Generated with Claude Code" footer'), []);
-  assert.deepEqual(checkMessage('(doc) Note\n\nThe check refuses the line Generated with Claude Code and a Co-Authored-By: Claude line.'), []);
-  assert.deepEqual(checkPrBody('The hook refuses footers such as "Generated with [Claude Code](x)" in a description.'), []);
-  // Real trailers and footers, with the markup a tool puts in front, are still refused.
-  for (const line of ['Generated with [Claude Code](https://claude.com/claude-code)', '\u{1F916} Generated with [Claude Code](https://claude.com/claude-code)', '> **Generated with Copilot**', 'GENERATED WITH CHATGPT', 'Co-authored-by: GitHub Copilot <x@y.z>']) {
-    assert.equal(checkMessage(`(feat) Add a thing\n\n${line}`).length, 1, line);
-    assert.equal(checkPrBody(`Text.\n\n${line}`).length, 1, line);
+  // Quoted mentions (double quotes or backticks) pass, in the script, the description check and the hook.
+  const quoted = [
+    `(fix) Refuse a "${GEN} Claude Code" footer`,
+    `(fix) Refuse a \`${GEN} Claude Code\` footer`,
+    `(doc) Note\n\nThe check refuses "${GEN} Claude Code" and a \`${GEN} Copilot\` line.`,
+  ];
+  for (const m of quoted) {
+    assert.deepEqual(checkMessage(m), [], m);
+    assert.equal(hookStatus(m + '\n'), 0, `hook: ${m}`);
   }
-  // The shell hook refuses and accepts the same messages.
-  const hook = (message) => {
-    const file = path.join(os.tmpdir(), `aegis-msg-${process.pid}-${Math.random().toString(36).slice(2)}`);
-    fs.writeFileSync(file, message);
-    const run = spawnSync('sh', ['.githooks/commit-msg', file], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'en_US.UTF-8' } }); // git runs hooks in a UTF-8 locale
-    fs.rmSync(file);
-    return run.status;
-  };
-  assert.equal(hook('(fix) Refuse a "Generated with Claude Code" footer\n'), 0, 'hook allows a quote');
-  assert.equal(hook('(feat) Add\n\n\u{1F916} Generated with [Claude Code](x)\n'), 1, 'hook refuses a footer');
-  assert.equal(hook('(feat) Add\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n'), 1, 'hook refuses a trailer');
+  assert.deepEqual(checkPrBody(`The hook refuses footers such as "${GEN} [Claude Code](x)" in a description.`), []);
+
+  // Every wrapper a footer can sit behind is still refused: main refused all of these.
+  const wrappers = ['', ' ', '\t', '   ', '> ', '>> ', '- ', '* ', '1. ', '**', '__', '~~', '# ', '[', '(', '<p>', '<b>', '<!-- x -->', '![x](y)', '[x](y) ', 'Powered by AI. ', 'x'.repeat(5000), '\u{1F916} ', '\u{1F916}', '\u200b', '\u00a0', '<a href="u">', '&nbsp;', ': '];
+  for (const wrapper of wrappers) {
+    for (const footer of footers('Claude').concat(footers('Copilot'), footers('Gemini'), footers('ChatGPT'))) {
+      const line = wrapper + footer;
+      const label = JSON.stringify(line.length > 80 ? line.slice(-60) : line);
+      for (const message of [`(feat) Add\n\n${line}`, `(feat) Add\n\n${line}\n`, `(feat) Add\r\n\r\n${line}\r\n`]) {
+        assert.equal(checkMessage(message).length, 1, `script: ${label}`);
+        assert.equal(checkPrBody(message).length, 1, `body: ${label}`);
+      }
+      // A line starting with # is a comment to the hook (and to git's default cleanup), on main as well.
+      if (wrapper.length < 100 && wrapper !== '# ') assert.equal(hookStatus(`(feat) Add\n\n${line}`), 1, `hook: ${label}`);
+    }
+  }
+  assert.equal(hookStatus(`(feat) Add\n\n${'x'.repeat(5000)}${GEN} Claude`), 1, 'hook: footer after a long line');
+  // Trailers: at the start of a line, any case, the five names; a human co-author stays allowed.
+  for (const name of ['Claude <a@b.c>', 'Anthropic', 'GitHub Copilot <a@b.c>', 'Gemini', 'OpenAI', 'ChatGPT']) {
+    for (const line of [`${COA} ${name}`, `${COA.toLowerCase()} ${name}`]) {
+      assert.equal(checkMessage(`(feat) Add\n\n${line}`).length, 1, line);
+      assert.equal(hookStatus(`(feat) Add\n\n${line}`), 1, `hook: ${line}`);
+    }
+  }
+  assert.deepEqual(checkMessage(`(feat) Add\n\n${COA} Jane Doe <jane@example.com>`), []);
+  assert.equal(hookStatus(`(feat) Add\n\n${COA} Jane Doe <jane@example.com>\n`), 0);
 });
 
-test('Contributor process: the pull request title is checked and an edit re-runs the check (issue #30)', () => {
+test('Contributor process: the pull request title is checked, and the message check is its own workflow that re-runs on an edit (issues #30, #82, #83)', () => {
   assert.deepEqual(checkPrTitle('(fix) Resolve DNS timeout'), []);
   assert.equal(checkPrTitle('Resolve DNS timeout').length, 1);
   assert.equal(checkPrTitle(undefined).length, 1);
+  const wf = fs.readFileSync('.github/workflows/check-messages.yml', 'utf8');
+  assert.match(wf, /types: \[opened, synchronize, reopened, edited\]/);
+  assert.match(wf, /^  check-messages:/m, 'the job keeps the name check-messages');
+  assert.match(wf, /PR_TITLE: \$\{\{ github\.event\.pull_request\.title \}\}/);
+  assert.match(wf, /PR_BODY: \$\{\{ github\.event\.pull_request\.body \}\}/);
+  assert.match(wf, /cancel-in-progress: true/);
+  assert.match(wf, /group: check-messages-\$\{\{ github\.event\.pull_request\.number \}\}/);
+  assert.doesNotMatch(wf, /run:.*\$\{\{/, 'untrusted text only through env');
+  assert.doesNotMatch(wf, /pull_request_target/);
+  assert.match(wf, /permissions:\r?\n {2}contents: read\r?\n {2}pull-requests: read/);
+  assert.doesNotMatch(wf, /: write/, 'no write permission');
+  // The build workflow keeps main's triggers, so its required job is never skipped by an edit.
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
-  assert.match(ci, /types: \[opened, synchronize, reopened, edited\]/);
-  assert.match(ci, /PR_TITLE: \$\{\{ github\.event\.pull_request\.title \}\}/);
-  // An edit re-runs only the message check, not the Windows build and tests.
-  assert.match(ci, /if: github\.event\.action != 'edited'/);
-  assert.doesNotMatch(ci, /run:.*\$\{\{/);
-  assert.doesNotMatch(ci, /: write/, 'no write permission');
+  assert.doesNotMatch(ci, /edited/);
+  assert.doesNotMatch(ci, /github\.event\.action/);
+  assert.doesNotMatch(ci, /check-commit-messages/);
 });
 
 test('Contributor process: the commit message check passes on this repository\'s own history', () => {

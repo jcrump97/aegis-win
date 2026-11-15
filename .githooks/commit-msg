@@ -9,8 +9,8 @@ if ! echo "$FIRST_LINE" | grep -Eq '^\((feat|fix|doc|chore|test|refactor|securit
 fi
 
 # No AI-tool attribution trailers or footers in commit messages (AGENTS.md section 2)
-ATTRIBUTION_PATTERN='^[^a-z0-9]*(co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|generated with \[?(claude|copilot|gemini|chatgpt))'
-# (LC_ALL=C: in a UTF-8 locale grep reads an emoji as an invalid character and the leading-markup part would not match it.)
+ATTRIBUTION_PATTERN='^co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|(^|[^"`])generated with \[?(claude|copilot|gemini|chatgpt)'
+# (LC_ALL=C: grep reads bytes, so an emoji or other multibyte character before a footer cannot make the match fail.)
 if grep -v '^#' "$COMMIT_MSG_FILE" | LC_ALL=C grep -Eiq "$ATTRIBUTION_PATTERN"; then
   echo "[Git Hook Error] Remove AI attribution trailers/footers from the commit message (credit goes in the README)."
   exit 1

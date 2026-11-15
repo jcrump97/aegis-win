@@ -14,9 +14,10 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const PREFIXES = ['feat', 'fix', 'doc', 'chore', 'test', 'refactor', 'security', 'perf'];
-// Both halves are anchored to the start of a line (after any emoji, quote or markup), so a message that
-// quotes the rule in the middle of a sentence passes and a real trailer or footer does not.
-export const ATTRIBUTION_PATTERN = '^[^a-z0-9]*(co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|generated with \\[?(claude|copilot|gemini|chatgpt))';
+// Strict as before: a trailer is refused at the start of a line, and a "generated with" footer anywhere in a line
+// (behind markup, a tag, a link, other words). The one exemption is a mention right after a double quote or a
+// backtick, which is how a message quotes the rule. When unsure the check refuses.
+export const ATTRIBUTION_PATTERN = '^co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|(^|[^"`])generated with \\[?(claude|copilot|gemini|chatgpt)';
 
 const subject = new RegExp(`^\\((${PREFIXES.join('|')})\\) .+`);
 const attribution = new RegExp(ATTRIBUTION_PATTERN, 'im');
