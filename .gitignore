@@ -10,3 +10,7 @@ data/
 Thumbs.db
 src-tauri/gen/schemas/
 launcher/target/
+
+# Claude Code: personal settings and worktrees stay local; settings.json, hooks/ and skills/ are shared
+.claude/settings.local.json
+.claude/worktrees/

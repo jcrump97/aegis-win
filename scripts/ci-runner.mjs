@@ -3,7 +3,8 @@
  * AegisWin Automated CI Pipeline Runner
  * Runs on every commit via Git hooks and in GitHub Actions.
  * Verifies:
- *  1. Atomic commit message prefix convention: ^(chore|doc|feat|fix|test|refactor|perf|security)\b
+ *  1. (Commit messages are checked elsewhere: .githooks/commit-msg locally,
+ *     scripts/check-commit-messages.mjs for pull requests in GitHub Actions.)
  *  2. Documentation folder integrity & audit synchronization
  *  3. Core & Plugin automated test suites via Node built-in test runner (Vite/Vitest compatible)
  *  4. Frontend typecheck (`tsc`) and production build (`vite build`); the

@@ -12,7 +12,7 @@
 |                                                                                   |
 |  +-----------------------------------------------------------------------------+  |
 |  |                 HIGH-CONTRAST DYNAMIC-SCALE DARK UI (Vite)                  |  |
-|  |  [Startup PIN Gate]  [First-Run Plugin Wizard]  [Dynamic Zoom: 85% - 150%]  |  |
+|  |  [Startup PIN Gate]  [First-Run Plugin Wizard]  [Dynamic Zoom: 80% - 150%]  |  |
 |  |  [Plugin Workspace]  [Off-LAN LLM Trust Modal]  [Live MCP Approval Queue]   |  |
 |  +--------------------------------------+--------------------------------------+  |
 |                                         | IPC / Internal Bridge                   |
