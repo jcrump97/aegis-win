@@ -123,6 +123,41 @@ async fn one_retry_then_a_plain_failure_message() {
     assert!(sent[0].contains("game.exe"));
 }
 
+async fn start_chat(plugin: &UsageMonitorPlugin, base: &str) -> aegis_core::AegisResult<Value> {
+    let ctx = ToolContext { llm: Some(llm_handle(base, "usage-monitor")), enabled_components: vec![COMPONENT_CRASHES.into()], ..Default::default() };
+    let args = schema::validate(&plugin.manifest().tool("monitor_chat_start").unwrap().input_schema, json!({ "request": "Freezes" })).unwrap();
+    plugin.call("monitor_chat_start", args, ctx).await
+}
+
+/// #11: the LLM service asks again once when an answer is cut off; the chat's own retry
+/// for an unusable reply must not stack a second pair of requests on top of it.
+#[tokio::test]
+async fn a_turn_has_one_retry_budget_across_both_retry_layers() {
+    use aegis_core::testing::mock_http_replies;
+    let cut = json!({ "choices": [{ "message": { "content": "{\"a\":" }, "finish_reason": "length" }] }).to_string();
+    let wrong = json!({ "choices": [{ "message": { "content": "Sure, here you go!" }, "finish_reason": "stop" }] }).to_string();
+    let good = json!({ "choices": [{ "message": { "content": questions(&["Which app?"]) }, "finish_reason": "stop" }] }).to_string();
+    // Cut off then unusable already took 2 requests: no further retry, a plain failure.
+    let plugin = UsageMonitorPlugin::default();
+    let (base, server) = mock_http_replies(vec![cut.clone(), wrong.clone()]).await;
+    let out = start_chat(&plugin, &base).await.unwrap();
+    assert_eq!((out["status"].as_str(), out["message"].as_str()), (Some("failed"), Some(UNUSABLE)), "{out}");
+    assert_eq!(server.await.unwrap().len(), 2);
+
+    // An unusable first answer (1 request) still gets the one retry; that retry may be asked
+    // again once if it is cut off: 3 requests at most, never 4.
+    let plugin = UsageMonitorPlugin::default();
+    let (base, server) = mock_http_replies(vec![wrong.clone(), cut.clone(), cut]).await;
+    let out = start_chat(&plugin, &base).await;
+    assert_eq!(server.await.unwrap().len(), 3);
+    assert!(out.is_err(), "cut off twice is an error, not a fourth request");
+
+    let plugin = UsageMonitorPlugin::default();
+    let (base, server) = mock_http_replies(vec![wrong, good]).await;
+    assert_eq!(start_chat(&plugin, &base).await.unwrap()["status"], "questions");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn an_invalid_rule_counts_as_an_unusable_reply() {
     let plugin = UsageMonitorPlugin::default();

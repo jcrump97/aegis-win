@@ -252,6 +252,9 @@ pub struct LlmAnswer {
     pub scrubbed: bool,
     /// Prompt tokens as the server counted them, when it says.
     pub prompt_tokens: Option<u64>,
+    /// Requests this answer took: 2 when the first was cut off and AegisWin
+    /// asked again. A caller with its own retry counts these against its budget.
+    pub generations: u32,
 }
 
 /// The only way a plugin reaches an LLM. Bound to one plugin per call.
@@ -338,6 +341,7 @@ impl LlmHandle {
         };
         let budget = self.reply_budget(system_prompt, &user, options.max_tokens, false);
         let reply = self.ask(&endpoint, ollama.as_ref(), system_prompt, &user, budget, options.json, progress).await?;
+        let mut generations = 1;
         let (text, reply) = match answer_text(&reply, options.json) {
             Some(text) => (text, reply),
             // Cut off, most often while thinking: ask once more for the answer
@@ -346,6 +350,7 @@ impl LlmHandle {
                 let strict = format!("{system_prompt}\n\n{}", if options.json { ANSWER_ONLY_JSON } else { ANSWER_ONLY_TEXT });
                 let bigger = self.reply_budget(&strict, &user, options.max_tokens, true).max(budget);
                 let again = self.ask(&endpoint, ollama.as_ref(), &strict, &user, bigger, options.json, progress).await?;
+                generations = 2;
                 let thought = reply.thought || again.thought;
                 match answer_text(&again, options.json) {
                     Some(text) => (text, again),
@@ -379,6 +384,7 @@ impl LlmHandle {
             off_lan,
             scrubbed: off_lan,
             prompt_tokens: reply.prompt_tokens,
+            generations,
         })
     }
 

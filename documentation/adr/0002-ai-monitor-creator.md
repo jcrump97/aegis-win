@@ -127,7 +127,7 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
   - `{ "proposal": { "rule", "reasoning" } }`
   - `{ "unsupported": { "reason" } }`, for requests outside the vocabulary such as GPU temperature
 
-  Invalid output gets one retry; a second failure ends the turn with "The AI gave an answer AegisWin could not use."
+  Invalid output gets one retry; a second failure ends the turn with "The AI gave an answer AegisWin could not use." The LLM service also asks again once when an answer is cut off (`LlmAnswer.generations` reports 2 then); the two retry layers share one budget: an unusable answer that already took two requests is not retried, so a turn makes at most three requests, never four (ledger row 103).
 
   **Decided in Phase 2:** a fourth reply, `{ "requestRunningApps": { "reason" } }`, is how the AI asks for the one consented lookup below; it is allowed once per conversation. `reasoning` may be a string or 1-3 strings (bullets), cleaned of hidden characters and cut to 600 characters in total. Each reply is one JSON object with exactly one of these keys and no unknown fields; text around it or a code fence is tolerated.
 - **Limits:**
