@@ -191,6 +191,15 @@ test('Contributor process: the git guard reads a command given to any shell invo
     'cmd /k "git commit -n"',
     'cmd /r "git commit -n"',
     'cmd "git commit -n"',
+    // -File only counts before the command: after it, everything is command text.
+    'pwsh -Command "git commit -n" -File',
+    'pwsh -c "git commit --no-verify" -f x.ps1',
+    'powershell -Command "git commit -n" -fi',
+    'pwsh "git commit -n" -File',
+    'pwsh /command "git commit -n" /file',
+    'pwsh -Command "git -c commit.gpgsign=false commit -m x" -File',
+    'pwsh "git commit --no-gpg-sign -m x" -File',
+    'pwsh -ExecutionPolicy Bypass "git commit -n" -File',
   ]) {
     assert.match(refusal(bad) ?? '', /^Refused: /, bad);
   }
@@ -198,6 +207,8 @@ test('Contributor process: the git guard reads a command given to any shell invo
     'bash scripts/x.sh "explain git commit -n"',
     'sh ./x.sh "git commit -n"',
     'pwsh -File x.ps1 "explain git commit -n"',
+    'pwsh -NoProfile -ExecutionPolicy Bypass -File x.ps1 "explain git commit -n"',
+    'powershell /file x.ps1 "explain git commit -n"',
     'bash -c "git status"',
     'pwsh -NoProfile "git status"',
   ]) {

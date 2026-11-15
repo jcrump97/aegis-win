@@ -226,7 +226,14 @@ function gitRefusal(args) {
 function runsArguments(shell, rest) {
   const name = shell.replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
   if (/^(sh|bash|zsh)$/.test(name)) return rest.some((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
-  if (/^(pwsh|powershell)$/.test(name)) return !rest.some((a) => /^[-/]f(i(le?)?)?$/i.test(a));
+  if (/^(pwsh|powershell)$/.test(name)) {
+    // Left to right: -File before any command flag or command text means a script; after it, all is command text.
+    for (const a of rest) {
+      if (/^[-/]f(i(le?)?)?$/i.test(a)) return false;
+      if (/^[-/]c(o(m(m(a(nd?)?)?)?)?)?$/i.test(a) || /\s/.test(a)) return true;
+    }
+    return true;
+  }
   return true;
 }
 
