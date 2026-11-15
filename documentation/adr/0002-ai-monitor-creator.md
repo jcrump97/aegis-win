@@ -58,8 +58,8 @@ The governing rule for every part of this design: **the AI proposes, code valida
 | `process_memory` | `process`, `atLeastMb` 64–1048576, `forSeconds` | |
 | `system_cpu` | `atLeastPercent`, `forSeconds` | |
 | `system_memory` | `atLeastPercent`, `forSeconds` | |
-| `event` | `channel` (`Application`, `System`, `Setup`), `eventId` 0–65535, optional `provider` ≤128 | Security is excluded in v1 (admin only). An event counts as "true" for 10 minutes after it occurs, matching the existing crash correlation window. |
-| `crash` | `process` | Application Error 1000 / Application Hang 1002 for that process |
+| `event` | `channel` (`Application`, `System`, `Setup`), `eventId` 0–65535, optional `provider` ≤128 | Security is excluded in v1 (admin only). An event counts as "true" for 10 minutes after it occurs, matching the existing crash correlation window, so it can combine with a condition that needs time to hold. A log entry fires a rule once: after a hit, an entry it already counted does not count again, so one crash is one hit, not one per cooldown (ledger row 102). |
+| `crash` | `process` | Application Error 1000 / Application Hang 1002 for that process; same 10-minute window and once-per-entry rule as `event` |
 | `foreground` | `process` | Needs the `usage-monitor:active-window` component |
 
 - **Fields**: `process` is an executable name (≤260 characters, no path separators) or `"*"` for any process. `schedule.days` is optional (default every day), and equal start and end means all day, as today. `forSeconds` rounds up to the 5-second sample period. `notify` is `"tray"` or `"none"`.
