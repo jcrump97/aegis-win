@@ -27,6 +27,34 @@ let advice: DiagnosisAdvice | null = null;
 let diagnosisDays = 7;
 let planDraft: Array<{ tool: string; name: string; args: Record<string, unknown> }> = [];
 const MAX_PLAN_STEPS = 5;
+/** The draft's title and notes as typed, kept while the tab is redrawn. Dropped with the draft. */
+let planTitle = '';
+let planNotes = '';
+/** Findings whose Evidence the owner opened, so a redraw does not close them. */
+const openEvidence = new Set<string>();
+
+function clearPlanDraft(): void {
+  planDraft = [];
+  planTitle = '';
+  planNotes = '';
+}
+
+/** Redraws the tab where it is: changing the plan draft must not move the page. */
+function redrawTab(): void {
+  const top = mainEl?.scrollTop ?? 0;
+  renderTab();
+  if (mainEl) mainEl.scrollTop = top;
+}
+
+/** Keeps a finding's Evidence open across redraws of the tab. */
+function keepOpen(id: string, details: HTMLDetailsElement): HTMLDetailsElement {
+  details.open = openEvidence.has(id);
+  details.addEventListener('toggle', () => {
+    if (details.open) openEvidence.add(id);
+    else openEvidence.delete(id);
+  });
+  return details;
+}
 
 const PIN_MIN = 6;
 const PASSPHRASE_MIN = 14;
@@ -218,7 +246,8 @@ function route(): void {
   recordCard = null;
   if (!status.unlocked) {
     // Both are dropped at every lock, like the engine's copy (ADR 0005 D4).
-    planDraft = [];
+    clearPlanDraft();
+    openEvidence.clear();
     diagnosis = null;
     advice = null;
   }
@@ -602,6 +631,7 @@ function diagnoseTab(): HTMLElement {
     try {
       diagnosis = await busy(run, () => api.runDiagnosis(diagnosisDays));
       advice = null;
+      openEvidence.clear();
       renderTab();
     } catch (e) {
       const err = asError(e);
@@ -715,7 +745,7 @@ function findingCard(f: DiagnosisFinding): HTMLElement {
       // The arguments code chose for this finding; the engine checks the plan again when it is proposed.
       planDraft.push({ tool: step.mcpName, name: step.name, args: step.args });
       toast(`${step.name} added to your plan (step ${planDraft.length} of ${MAX_PLAN_STEPS}).`);
-      renderTab();
+      redrawTab();
     });
     return h('li', {}, h('strong', {}, step.name), ` — ${step.why} `, step.available ? null : h('span', { class: 'hint' }, step.reason ?? 'Not available now.'), ' ', add);
   });
@@ -727,7 +757,7 @@ function findingCard(f: DiagnosisFinding): HTMLElement {
     seen ? h('p', { class: 'hint' }, seen) : null,
     steps.length > 0 ? h('div', {}, h('h4', {}, 'What to do'), h('ul', {}, ...steps)) : null,
     f.evidence.length > 0
-      ? h(
+      ? keepOpen(f.id, h(
           'details',
           {},
           h('summary', {}, `Evidence (${f.evidence.length})`),
@@ -738,7 +768,7 @@ function findingCard(f: DiagnosisFinding): HTMLElement {
               h('li', {}, h('strong', {}, [e.source, e.provider, e.eventId != null ? `event ${e.eventId}` : null].filter(Boolean).join(' · ')), e.time ? ` ${when(e.time)}` : '', h('pre', { class: 'evidence' }, e.message)),
             ),
           ),
-        )
+        ))
       : null,
   );
 }
@@ -899,7 +929,7 @@ function toolCard(plugin: PluginView, tool: ToolView): HTMLElement {
       if ('error' in read) return replace(result, errorNotice({ code: 'INVALID_ARGUMENTS', message: read.error }));
       planDraft.push({ tool: tool.mcpName, name: tool.name, args: read.args });
       toast(`${tool.name} added to your plan (step ${planDraft.length} of ${MAX_PLAN_STEPS}).`);
-      renderTab();
+      redrawTab();
     });
     add = addButton;
   }
@@ -917,8 +947,11 @@ function toolCard(plugin: PluginView, tool: ToolView): HTMLElement {
  * checked and dry-run by the engine, to approve with the PIN on the Approvals tab. */
 function planDraftPanel(): HTMLElement | null {
   if (planDraft.length === 0) return null;
-  const title = h('input', { type: 'text', maxlength: 80, id: 'plan-title' });
-  const reasoning = h('textarea', { rows: 2, maxlength: 600, id: 'plan-reasoning' });
+  const title = h('input', { type: 'text', maxlength: 80, id: 'plan-title', value: planTitle });
+  const reasoning = h('textarea', { rows: 2, maxlength: 600, id: 'plan-reasoning', value: planNotes });
+  // Kept as typed: adding or removing a step redraws the tab.
+  title.addEventListener('input', () => (planTitle = title.value));
+  reasoning.addEventListener('input', () => (planNotes = reasoning.value));
   const message = h('div');
   const review = h('button', { class: 'primary' }, 'Review and run');
   const discard = h('button', {}, 'Clear plan');
@@ -927,7 +960,7 @@ function planDraftPanel(): HTMLElement | null {
       const ticket = await busy(review, () =>
         api.proposePlan({ title: title.value.trim() || undefined, reasoning: reasoning.value.trim() || undefined, steps: planDraft.map((s) => ({ tool: s.tool, args: s.args })) }),
       );
-      planDraft = [];
+      clearPlanDraft();
       tickets = await api.listTickets();
       if (!tickets.some((t) => t.ticketId === ticket.ticketId)) tickets = [ticket, ...tickets];
       updateShellBadges();
@@ -939,15 +972,16 @@ function planDraftPanel(): HTMLElement | null {
     }
   });
   discard.addEventListener('click', () => {
-    planDraft = [];
-    renderTab();
+    clearPlanDraft();
+    redrawTab();
   });
   const steps = h('ol', {});
   planDraft.forEach((s, i) => {
     const remove = h('button', { class: 'link' }, 'Remove');
     remove.addEventListener('click', () => {
       planDraft.splice(i, 1);
-      renderTab();
+      if (planDraft.length === 0) clearPlanDraft();
+      redrawTab();
     });
     append(steps, h('li', {}, h('strong', {}, s.name), ' ', h('code', {}, JSON.stringify(s.args)), ' ', remove));
   });

@@ -166,7 +166,9 @@ test('In-app plans: the owner builds a draft in memory and approves it like any 
   assert.doesNotMatch(panel, /askPin|decideTicket|runTool/, 'the draft never runs or approves anything itself');
   // Only eligible tools offer "Add to plan"; the draft is dropped when the vault locks.
   assert.match(main, /if \(tool\.planEligible\) \{\s*const addButton = h\('button', \{\}, 'Add to plan'\);/);
-  assert.match(main, /if \(!status\.unlocked\) \{[^}]*planDraft = \[\];/);
+  // The draft, with its typed title and notes, is dropped at every lock.
+  assert.match(main, /if \(!status\.unlocked\) \{[^}]*clearPlanDraft\(\);/);
+  assert.match(main, /function clearPlanDraft\(\): void \{\s*planDraft = \[\];\s*planTitle = '';\s*planNotes = '';\s*\}/);
 });
 
 test('Diagnose: the first tab after unlock, plain-text findings, and code-chosen plan steps', () => {
