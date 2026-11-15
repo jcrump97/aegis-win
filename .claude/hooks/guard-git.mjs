@@ -5,16 +5,23 @@
 // It reads the arguments of each git command in the line, so a flag that is
 // only text (a commit message, a file body, a search pattern) is not refused.
 // A shell is denied by default: every argument of a command that holds a shell
-// name (sh, bash, zsh, pwsh, powershell, cmd) is read as a possible command.
-// Only `sh|bash|zsh PATH ...` and `pwsh|powershell [-NoProfile|-NonInteractive|
-// -NoLogo]... -File PATH ...` (PATH a plain token, nothing fed to stdin) are
-// script runs whose later arguments are text (isScriptRun). Any other flag
-// before the script, such as bash -x script.sh, is refused even when harmless.
-// Not read: text piped into a shell (echo "..." | bash, cat <<EOF | bash), a
-// command inside $(...) within a quoted argument, a command inside
-// backticks within a quoted argument, a value set earlier with `export` or in
-// the environment, an alias set with `git config alias.x ...`, and a script
-// file's contents.
+// name (sh, bash, zsh, pwsh, powershell, cmd), and any here-string or
+// here-document text fed to it, is read as a possible command. So text that
+// only mentions a flag in a shell's arguments (bash script.sh "git commit -n")
+// is refused too: a false refusal, kept because no safe exception was found.
+// Not read, each tracked in an issue:
+//   #66  text piped into a shell (echo "..." | bash, cat <<EOF | bash), and a
+//        PowerShell here-string after -Command
+//   #67  an alias whose flag is added at the call, GIT_CONFIG_PARAMETERS,
+//        GIT_CONFIG_GLOBAL, $env: assignments, eval
+//   #70  a command inside $(...) or backticks within a quoted argument outside
+//        a shell's arguments, git config alias.x, values set earlier with
+//        `export`, a script file's contents
+//   #81  a PowerShell -EncodedCommand (base64) command
+//   #90  other interpreters and launchers (dash, ksh, fish, python -c,
+//        node -e, env -S, watch, ssh, iex, Start-Process)
+//   #93  a quote the reader mis-tracks (bash $'a\'b', a PowerShell
+//        backtick-quote), which hides the rest of the line
 // It is a reminder for a session, not a security boundary: CI checks commit
 // messages again (scripts/check-commit-messages.mjs).
 import { pathToFileURL } from 'node:url';
@@ -224,33 +231,6 @@ function gitRefusal(args) {
   return null;
 }
 
-// A script path with no quote, `$`, brace, glob or redirection character, not starting with - or +.
-const PLAIN_PATH = /^[A-Za-z0-9_./][A-Za-z0-9_./\\:-]*$/;
-const PS_VALUELESS_FLAGS = new Set(['-noprofile', '-noninteractive', '-nologo']);
-
-/**
- * Whether a command is a shell running a script file, so that its later arguments are the script's
- * arguments and never a command. Anything else that holds a shell name is denied by default: the
- * guard reads every argument as a possible command. Only two forms are recognised, each the only
- * shell word on the command and the first word:
- *   sh|bash|zsh PATH ...                         (no flag at all, so the first argument is the script)
- *   pwsh|powershell [-NoProfile|-NonInteractive|-NoLogo]... -File PATH ...
- * PATH is a plain token (PLAIN_PATH). No later argument may contain `<`, so nothing feeds stdin.
- */
-function isScriptRun(args) {
-  if (!SHELLS.test(args[0]) || args.filter((a) => SHELLS.test(a)).length !== 1) return false;
-  const name = args[0].replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
-  let i = 1;
-  if (/^(pwsh|powershell)$/.test(name)) {
-    while (i < args.length && PS_VALUELESS_FLAGS.has(args[i].toLowerCase())) i += 1;
-    if (args[i]?.toLowerCase() !== '-file') return false;
-    i += 1;
-  } else if (!/^(sh|bash|zsh)$/.test(name)) {
-    return false;
-  }
-  return PLAIN_PATH.test(args[i] ?? '') && !args.slice(i + 1).some((a) => a.includes('<'));
-}
-
 function why(command, depth) {
   for (const args of commands(withoutBodies(command))) {
     const git = args.findIndex((a) => GIT.test(a));
@@ -259,7 +239,8 @@ function why(command, depth) {
       if (reason) return reason;
     }
     // A command handed to another shell as one argument, e.g. bash -c "git commit ...".
-    if (depth < 2 && args.some((a) => SHELLS.test(a)) && !isScriptRun(args)) {
+    // Denied by default: any argument of a command holding a shell name may be a command, flags or not.
+    if (depth < 2 && args.some((a) => SHELLS.test(a))) {
       for (const arg of args) {
         const reason = /\s/.test(arg) ? why(arg, depth + 1) : null;
         if (reason) return reason;

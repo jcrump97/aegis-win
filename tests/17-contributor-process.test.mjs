@@ -170,7 +170,6 @@ test('Contributor process: the git guard allows an option value, a comment or a 
     'git log --grep "--no-verify"',
     'git log -S --no-verify',
     'git status # never use --no-verify',
-    'bash scripts/x.sh "explain git commit -n"',
     'git -c core.hooksPath=.githooks commit -m x',
     'git commit -m x#y',
   ]) {
@@ -223,17 +222,25 @@ test('Contributor process: the git guard reads a command given to any shell invo
     'pwsh -File x.ps1 -File "git commit -n" <<< y',
     'bash script.sh bash "git commit -n"',
     'sudo bash script.sh "git commit -n"',
-  ]) {
-    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
-  }
-  for (const fine of [
-    'bash scripts/x.sh',
+    // Fourth review: a shell's later arguments are expanded by the outer shell, and a script path can read stdin.
+    'bash x.sh "$(git commit -n)"',
+    'bash x.sh "`git commit -n`"',
+    'bash x.sh "a${b:-$(git commit -n)}"',
+    'pwsh -File x.ps1 "$(git commit -n)"',
+    "bash x.sh $'a\\'b'; git commit -n",
+    'echo "git commit -n" | bash /dev/stdin "git commit -n"',
+    // No script-run exception: text mentioning a flag is refused too (a false refusal, accepted; part of #34 not delivered).
     'bash scripts/x.sh "explain git commit -n"',
     'sh ./x.sh "git commit -n"',
     'zsh x.sh -c "explain git commit -n"',
     'pwsh -File x.ps1 "explain git commit -n"',
     'pwsh -NoProfile -NonInteractive -File x.ps1 "explain git commit -n"',
     'powershell -NoLogo -file scripts\\x.ps1 "explain git commit -n"',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'bash scripts/x.sh',
     'bash -c "git status"',
     'pwsh -NoProfile "git status"',
   ]) {
