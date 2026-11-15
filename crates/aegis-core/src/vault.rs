@@ -83,6 +83,10 @@ impl KdfParams {
     /// The parameters for a new key. [`Self::DEFAULT`] drops to [`Self::FLOOR`]
     /// when one derivation takes over 1.5 s here; measured once per run.
     /// Other parameters (tests) are used as given.
+    ///
+    /// The benchmark derives with a random salt, never a fixed one: the value
+    /// is thrown away, but a constant salt in source trips CodeQL's
+    /// hard-coded-cryptographic-value rule.
     pub fn tuned(self) -> Self {
         if self != Self::DEFAULT {
             return self;
@@ -90,7 +94,7 @@ impl KdfParams {
         static TUNED: OnceLock<KdfParams> = OnceLock::new();
         *TUNED.get_or_init(|| {
             let start = Instant::now();
-            let slow = derive_key("aegis-win-tuning", &[0u8; SALT_LEN], &Self::DEFAULT).is_err() || start.elapsed() > Duration::from_millis(1500);
+            let slow = derive_key("aegis-win-tuning", &random_bytes::<SALT_LEN>(), &Self::DEFAULT).is_err() || start.elapsed() > Duration::from_millis(1500);
             if slow { Self::FLOOR } else { Self::DEFAULT }
         })
     }
@@ -776,6 +780,17 @@ mod tests {
     fn real_parameters_are_tuned_to_the_floor_or_above() {
         assert_eq!(KdfParams::INSECURE_TEST.tuned(), KdfParams::INSECURE_TEST);
         assert!(KdfParams::FLOOR.m_kib >= 128 * 1024 && KdfParams::DEFAULT.m_kib == 256 * 1024);
+    }
+
+    #[test]
+    fn the_tuning_benchmark_never_uses_a_fixed_salt() {
+        // CodeQL rust/hard-coded-cryptographic-value: the benchmark salt must
+        // come from the OS RNG, not a literal in source.
+        let src = include_str!("vault.rs");
+        let tuned = src.split("pub fn tuned").nth(1).unwrap();
+        let body = &tuned[..tuned.find("\n    }").unwrap()];
+        assert!(!body.contains("&[0u8; SALT_LEN]"), "tuned() must not derive with a zero salt");
+        assert!(body.contains("random_bytes::<SALT_LEN>()"), "tuned() must salt the benchmark with random bytes");
     }
 
     #[test]
