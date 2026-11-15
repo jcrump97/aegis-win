@@ -1,0 +1,54 @@
+# Dependabot: weekly version updates, and the settings its security updates use.
+#
+# Commit messages and pull request titles must start with a type tag
+# (AGENTS.md section 2; CI checks it). The prefix ends with a space on purpose:
+# without it Dependabot adds a colon, "(chore): Bump ...", which the check refuses.
+#
+# Minor and patch updates of one ecosystem come as one pull request. A major
+# update comes alone, so it can be read and tested by itself.
+version: 2
+updates:
+  # The app and its plugins: the Cargo workspace at the root.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "(chore) "
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  # The launcher sits outside the workspace and keeps its own lockfile.
+  - package-ecosystem: cargo
+    directory: /launcher
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "(chore) "
+    groups:
+      launcher-minor-and-patch:
+        update-types: [minor, patch]
+
+  # The UI build: Vite, TypeScript and the Tauri JavaScript packages.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "(chore) "
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+
+  # The actions the CI workflow uses.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "(chore) "
