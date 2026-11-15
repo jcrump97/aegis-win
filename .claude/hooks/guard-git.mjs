@@ -4,7 +4,14 @@
 //
 // It reads the arguments of each git command in the line, so a flag that is
 // only text (a commit message, a file body, a search pattern) is not refused.
-// Not read: a command inside $(...) within a quoted argument, a command inside
+// A shell is denied by default: every argument of a command that holds a shell
+// name (sh, bash, zsh, pwsh, powershell, cmd) is read as a possible command.
+// Only `sh|bash|zsh PATH ...` and `pwsh|powershell [-NoProfile|-NonInteractive|
+// -NoLogo]... -File PATH ...` (PATH a plain token, nothing fed to stdin) are
+// script runs whose later arguments are text (isScriptRun). Any other flag
+// before the script, such as bash -x script.sh, is refused even when harmless.
+// Not read: text piped into a shell (echo "..." | bash, cat <<EOF | bash), a
+// command inside $(...) within a quoted argument, a command inside
 // backticks within a quoted argument, a value set earlier with `export` or in
 // the environment, an alias set with `git config alias.x ...`, and a script
 // file's contents.
@@ -217,24 +224,31 @@ function gitRefusal(args) {
   return null;
 }
 
+// A script path with no quote, `$`, brace, glob or redirection character, not starting with - or +.
+const PLAIN_PATH = /^[A-Za-z0-9_./][A-Za-z0-9_./\\:-]*$/;
+const PS_VALUELESS_FLAGS = new Set(['-noprofile', '-noninteractive', '-nologo']);
+
 /**
- * Whether a shell may run one of its arguments as a command. When unsure, yes (the guard then reads it).
- * sh, bash and zsh run an argument only with -c (in any short-flag group, e.g. -ec); without it the
- * first argument is a script file and the rest are its arguments. PowerShell takes its first
- * positional argument as the command unless -File is given. cmd (/c, /k, /r) and anything else: yes.
+ * Whether a command is a shell running a script file, so that its later arguments are the script's
+ * arguments and never a command. Anything else that holds a shell name is denied by default: the
+ * guard reads every argument as a possible command. Only two forms are recognised, each the only
+ * shell word on the command and the first word:
+ *   sh|bash|zsh PATH ...                         (no flag at all, so the first argument is the script)
+ *   pwsh|powershell [-NoProfile|-NonInteractive|-NoLogo]... -File PATH ...
+ * PATH is a plain token (PLAIN_PATH). No later argument may contain `<`, so nothing feeds stdin.
  */
-function runsArguments(shell, rest) {
-  const name = shell.replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
-  if (/^(sh|bash|zsh)$/.test(name)) return rest.some((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+function isScriptRun(args) {
+  if (!SHELLS.test(args[0]) || args.filter((a) => SHELLS.test(a)).length !== 1) return false;
+  const name = args[0].replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
+  let i = 1;
   if (/^(pwsh|powershell)$/.test(name)) {
-    // Left to right: -File before any command flag or command text means a script; after it, all is command text.
-    for (const a of rest) {
-      if (/^[-/]f(i(le?)?)?$/i.test(a)) return false;
-      if (/^[-/]c(o(m(m(a(nd?)?)?)?)?)?$/i.test(a) || /\s/.test(a)) return true;
-    }
-    return true;
+    while (i < args.length && PS_VALUELESS_FLAGS.has(args[i].toLowerCase())) i += 1;
+    if (args[i]?.toLowerCase() !== '-file') return false;
+    i += 1;
+  } else if (!/^(sh|bash|zsh)$/.test(name)) {
+    return false;
   }
-  return true;
+  return PLAIN_PATH.test(args[i] ?? '') && !args.slice(i + 1).some((a) => a.includes('<'));
 }
 
 function why(command, depth) {
@@ -245,9 +259,8 @@ function why(command, depth) {
       if (reason) return reason;
     }
     // A command handed to another shell as one argument, e.g. bash -c "git commit ...".
-    const shell = args.findIndex((a) => SHELLS.test(a));
-    if (depth < 2 && shell !== -1 && runsArguments(args[shell], args.slice(shell + 1))) {
-      for (const arg of args.slice(shell + 1)) {
+    if (depth < 2 && args.some((a) => SHELLS.test(a)) && !isScriptRun(args)) {
+      for (const arg of args) {
         const reason = /\s/.test(arg) ? why(arg, depth + 1) : null;
         if (reason) return reason;
       }
