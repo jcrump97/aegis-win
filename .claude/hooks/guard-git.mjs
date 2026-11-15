@@ -217,6 +217,19 @@ function gitRefusal(args) {
   return null;
 }
 
+/**
+ * Whether a shell may run one of its arguments as a command. When unsure, yes (the guard then reads it).
+ * sh, bash and zsh run an argument only with -c (in any short-flag group, e.g. -ec); without it the
+ * first argument is a script file and the rest are its arguments. PowerShell takes its first
+ * positional argument as the command unless -File is given. cmd (/c, /k, /r) and anything else: yes.
+ */
+function runsArguments(shell, rest) {
+  const name = shell.replace(/^.*[\\/]/, '').replace(/\.exe$/i, '').toLowerCase();
+  if (/^(sh|bash|zsh)$/.test(name)) return rest.some((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+  if (/^(pwsh|powershell)$/.test(name)) return !rest.some((a) => /^[-/]f(i(le?)?)?$/i.test(a));
+  return true;
+}
+
 function why(command, depth) {
   for (const args of commands(withoutBodies(command))) {
     const git = args.findIndex((a) => GIT.test(a));
@@ -225,11 +238,9 @@ function why(command, depth) {
       if (reason) return reason;
     }
     // A command handed to another shell as one argument, e.g. bash -c "git commit ...".
-    // Only the arguments after -c / -Command / /c are commands; a script's argument is text.
     const shell = args.findIndex((a) => SHELLS.test(a));
-    if (depth < 2 && shell !== -1) {
-      const run = args.findIndex((a, i) => i > shell && /^[-/]([A-Za-z]*c|com\w*)$/i.test(a));
-      for (const arg of run === -1 ? [] : args.slice(run + 1)) {
+    if (depth < 2 && shell !== -1 && runsArguments(args[shell], args.slice(shell + 1))) {
+      for (const arg of args.slice(shell + 1)) {
         const reason = /\s/.test(arg) ? why(arg, depth + 1) : null;
         if (reason) return reason;
       }

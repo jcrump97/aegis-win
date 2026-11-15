@@ -178,6 +178,33 @@ test('Contributor process: the git guard allows an option value, a comment or a 
   }
 });
 
+test('Contributor process: the git guard reads a command given to any shell invocation form (issue #65)', () => {
+  for (const bad of [
+    'powershell "git commit -n"',
+    'pwsh -NoProfile "git commit -n"',
+    'pwsh -NoProfile -Command "git commit -n"',
+    'powershell.exe -ExecutionPolicy Bypass "git commit --no-verify -m x"',
+    'bash -ce "git commit -n"',
+    'sh -ec "git commit --no-verify -m x"',
+    'bash -o pipefail -c "git commit -n"',
+    'cmd /c "git commit -n"',
+    'cmd /k "git commit -n"',
+    'cmd /r "git commit -n"',
+    'cmd "git commit -n"',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'bash scripts/x.sh "explain git commit -n"',
+    'sh ./x.sh "git commit -n"',
+    'pwsh -File x.ps1 "explain git commit -n"',
+    'bash -c "git status"',
+    'pwsh -NoProfile "git status"',
+  ]) {
+    assert.equal(refusal(fine), null, fine);
+  }
+});
+
 test('Contributor process: the session-start issue list shows only maintainers\' issues, as data', () => {
   const issues = [
     { number: 23, title: 'Report kept after unlock', author_association: 'OWNER', labels: [{ name: 'bug' }] },
