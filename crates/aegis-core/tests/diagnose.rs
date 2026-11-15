@@ -155,8 +155,12 @@ struct Setup {
 }
 
 async fn setup(installed: &[(&str, &[&str])]) -> Setup {
+    setup_with(Checker::new(), installed).await
+}
+
+async fn setup_with(checker: Checker, installed: &[(&str, &[&str])]) -> Setup {
     let dir = tempfile::tempdir().unwrap();
-    let checker = Arc::new(Checker::new());
+    let checker = Arc::new(checker);
     let registry = Registry::new(vec![checker.clone() as Arc<dyn Plugin>, Arc::new(DemoPlugin::default())]).unwrap();
     let engine = Engine::new(dir.path().join("data"), registry, EngineOptions { kdf: KdfParams::INSECURE_TEST, elevated: false });
     engine.setup(PIN.into()).await.unwrap();
@@ -517,4 +521,31 @@ async fn a_run_from_before_a_lock_is_withheld_after_the_next_unlock() {
     *s.checker.mode.lock().unwrap() = Mode::Normal;
     s.engine.diagnose(7).await.unwrap();
     assert_eq!(s.checker.runs.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn agents_do_not_get_findings_of_a_plugin_whose_read_tools_are_all_app_only() {
+    use aegis_core::diagnose::WITHHELD_APP_ONLY;
+    // The plugin's one read-only tool is for the app only: an agent cannot call it.
+    let mut checker = Checker::new();
+    let look = checker.manifest.tools.iter_mut().find(|t| t.id == "look").unwrap();
+    assert!(look.read_only);
+    look.app_only = true;
+    let s = setup_with(checker, &[("checker", &[]), ("demo", &[])]).await;
+
+    let agent = s.engine.diagnose_for_agent(7).await.unwrap();
+    assert!(agent.findings.is_empty(), "no route around appOnly through Diagnose");
+    let checks: Vec<_> = agent.checks.iter().filter(|c| c.plugin_id == "checker").collect();
+    assert_eq!(checks.len(), 3);
+    assert!(checks.iter().all(|c| c.status == CheckStatus::Skipped && c.reason.as_deref() == Some(WITHHELD_APP_ONLY)));
+    // The app still gets everything.
+    assert_eq!(s.engine.diagnose_for_app(7).await.unwrap().findings.len(), 2);
+}
+
+#[tokio::test]
+async fn a_plugin_with_no_read_tool_at_all_keeps_its_findings_for_agents() {
+    let mut checker = Checker::new();
+    checker.manifest.tools.retain(|t| !t.read_only);
+    let s = setup_with(checker, &[("checker", &[]), ("demo", &[])]).await;
+    assert_eq!(s.engine.diagnose_for_agent(7).await.unwrap().findings.len(), 2);
 }

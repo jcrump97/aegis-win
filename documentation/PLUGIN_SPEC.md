@@ -68,6 +68,7 @@ A `Finding` has a `key` (tells findings of one check apart, such as a program; `
 - a `tool` step is dropped unless it is in the check's `nextTools`, its plugin is installed, and its `args` pass the tool's schema (defaults filled in); a step whose tool's component is off or that needs administrator rights is kept and marked unavailable, with the reason;
 - text is flattened and cut (titles 160, details 600, evidence messages 300 characters), hidden characters are removed, and the finding id becomes `<plugin>.<check>` or `<plugin>.<check>:<key>`, with duplicates dropped;
 - a plugin's checks get 20 seconds in all; past that, each is reported as failed ("Timed out.").
+- **what agents get** (`aegis__diagnose`) follows the plugin's read tools: if one is gated `pin_required`, or if every read-only tool is `appOnly`, the plugin's checks are listed as skipped and its findings are left out, because an agent could not have read that data by calling a tool. A plugin with no read-only tool at all is not left out. So mark a read tool `appOnly` only when its checks' findings should stay in the app as well.
 
 ## 3. Tool Gate Policy Values
 - `"auto"`: Executes immediately when invoked from the UI or MCP server (ideal for read-only log queries or telemetry snapshots).

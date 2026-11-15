@@ -2877,7 +2877,8 @@ impl Engine {
     }
 
     /// `aegis__diagnose`: the same run, without the findings of any plugin
-    /// whose read tools the owner set to need the PIN (ADR 0005 §3).
+    /// whose read tools the owner set to need the PIN, or whose read tools
+    /// are all for the app only (ADR 0005 §3).
     pub async fn diagnose_for_agent(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {
         let off = || AegisError::new(ErrorCode::PluginDisabled, "The owner turned off Diagnose for AI agents. Ask them to run Check this PC in the AegisWin app.");
         if !self.agents_may_diagnose()? {
@@ -2892,15 +2893,29 @@ impl Engine {
         Ok(report.for_agent(&withheld))
     }
 
-    /// Installed plugins with a read-only tool whose gate is `pin_required`.
-    fn withheld_from_agents(&self, s: &VaultState) -> Vec<String> {
+    /// Installed plugins whose findings agents do not get, each with the
+    /// reason: a read-only tool whose gate is `pin_required`, or read-only
+    /// tools that are all `appOnly`, so an agent could not have read any of
+    /// it by calling a tool. A plugin with no read-only tool at all is not
+    /// withheld: its checks are the only way to read it, for the app too.
+    fn withheld_from_agents(&self, s: &VaultState) -> Vec<(String, &'static str)> {
         self.registry
             .plugins()
             .iter()
             .map(|p| p.manifest())
             .filter(|m| s.is_installed(&m.id))
-            .filter(|m| m.tools.iter().any(|t| t.read_only && registry::effective_policy(&m.id, t, &s.tool_gate_overrides) == GatePolicy::PinRequired))
-            .map(|m| m.id.clone())
+            .filter_map(|m| {
+                let read: Vec<_> = m.tools.iter().filter(|t| t.read_only).collect();
+                if read.is_empty() {
+                    None
+                } else if read.iter().any(|t| registry::effective_policy(&m.id, t, &s.tool_gate_overrides) == GatePolicy::PinRequired) {
+                    Some((m.id.clone(), diagnose::WITHHELD))
+                } else if read.iter().all(|t| t.app_only) {
+                    Some((m.id.clone(), diagnose::WITHHELD_APP_ONLY))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
