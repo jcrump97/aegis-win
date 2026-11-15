@@ -165,3 +165,21 @@ test('Contributor process: the review-pr skill and the agent docs point at each 
   assert.match(fs.readFileSync('AGENTS.md', 'utf8'), /scripts\/check-commit-messages\.mjs/);
   assert.match(fs.readFileSync('README.md', 'utf8'), /\/review-pr/);
 });
+
+test('Contributor process: Dependabot covers every manifest and its commits and titles pass the commit message check', () => {
+  const config = fs.readFileSync('.github/dependabot.yml', 'utf8');
+  const entries = config.split(/^  - package-ecosystem: /m).slice(1);
+  const covered = entries.map((e) => `${e.match(/^(\S+)/)[1]} ${e.match(/^    directory: (\S+)/m)[1]}`).sort();
+  assert.deepEqual(covered, ['cargo /', 'cargo /launcher', 'github-actions /', 'npm /']);
+  for (const [ecosystem, dir, manifest] of [['cargo', '/', 'Cargo.lock'], ['cargo', '/launcher', 'launcher/Cargo.lock'], ['npm', '/', 'package-lock.json'], ['github-actions', '/', '.github/workflows/ci.yml']]) {
+    assert.ok(fs.existsSync(manifest), `${ecosystem} ${dir} has ${manifest}`);
+  }
+  // The prefix ends with a space: without it Dependabot writes "(chore): Bump ...", which the check refuses.
+  for (const entry of entries) {
+    const prefix = entry.match(/^      prefix: "(.*)"\r?$/m)?.[1];
+    assert.equal(prefix, '(chore) ', 'every entry sets the type tag, ending with a space');
+    assert.deepEqual(checkMessage(`${prefix}Bump serde from 1.0.0 to 1.0.1`), []);
+    assert.match(entry, /^      interval: weekly\r?$/m);
+  }
+  assert.equal(checkMessage('(chore): Bump serde from 1.0.0 to 1.0.1').length, 1, 'the colon form is refused');
+});
