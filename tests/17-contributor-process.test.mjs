@@ -150,8 +150,31 @@ test('Contributor process: the git guard reads a here-string, config forms, back
   }
 });
 
-test('Contributor process: the git guard allows an option value, a comment or a script argument that only mentions a flag (issue #34)', () => {
+test('Contributor process: the git guard allows an option value or a comment that only mentions a flag (issue #34)', () => {
   for (const bad of [
+    // A `#` is a comment only after whitespace, `;`, `&`, `|` or at the line start, and never on a cmd line.
+    'echo ${#a}; git commit -n',
+    'echo ${#}; git commit -n',
+    'x=(1 2); echo ${#x[@]}; git commit -n',
+    'echo $(date)#x; git commit -n',
+    'echo ${a}#x; git commit -n',
+    'echo `date`#x; git commit -n',
+    'cmd /c "echo # & git commit -n"',
+    'cmd /c "echo # && git commit -n"',
+    // A backtick is a separator in bash and an escape in PowerShell: both readings are checked.
+    'git `commit --no-verify -m x',
+    'git commit `-m x -n',
+    'git commit --no-verify `-m x',
+    // -S is --gpg-sign (attached value) outside log, diff, show, grep and reflog.
+    'git merge -S --no-verify x',
+    'git rebase -S --no-verify main',
+    'git pull -S --no-verify',
+    'git am -S --no-gpg-sign x',
+    'git merge -S --no-gpg-sign x',
+    'git revert -S --no-verify x',
+    'git cherry-pick -S --no-verify x',
+    'git rebase -G --no-verify',
+    'git push --author --no-verify',
     'git commit -m x -n',
     'git commit -m a -m b -n',
     'git commit -m a --no-verify',
@@ -169,7 +192,12 @@ test('Contributor process: the git guard allows an option value, a comment or a 
     'git commit --message "--no-verify"',
     'git log --grep "--no-verify"',
     'git log -S --no-verify',
+    'git diff -G --no-verify',
+    'git show -S --no-verify',
+    'git rev-list --author --no-verify HEAD',
     'git status # never use --no-verify',
+    'git status;# git commit -n',
+    'git status && # git commit -n',
     'git -c core.hooksPath=.githooks commit -m x',
     'git commit -m x#y',
   ]) {

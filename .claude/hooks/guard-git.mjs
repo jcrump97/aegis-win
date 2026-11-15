@@ -9,6 +9,10 @@
 // here-document text fed to it, is read as a possible command. So text that
 // only mentions a flag in a shell's arguments (bash script.sh "git commit -n")
 // is refused too: a false refusal, kept because no safe exception was found.
+// A `#` starts a comment only at a line start or after whitespace, `;`, `&` or
+// `|`, and never on a line that names cmd. An unquoted backtick is read both as
+// a separator (bash) and as PowerShell's escape (dropped); either reading may
+// refuse the line.
 // Not read, each tracked in an issue:
 //   #66  text piped into a shell (echo "..." | bash, cat <<EOF | bash), and a
 //        PowerShell here-string after -Command
@@ -37,8 +41,15 @@ const COMMIT_VALUE_FLAGS = 'mFCctSu';
 // Of those, the ones whose value may be the next argument (-S and -u only take an attached value).
 const SEPARATE_VALUE_FLAGS = 'mFCct';
 const COMMIT_LONG_VALUE_FLAGS = new Set(['--message', '--file', '--template', '--author', '--date', '--reuse-message', '--reedit-message']);
-// Options of `git log` and `git grep` whose value is the next argument: a search text, not an option.
-const SEARCH_VALUE_FLAGS = new Set(['--grep', '-S', '-G', '--author', '--committer']);
+// Options whose value is the next argument (a search text or a name, not an option), by subcommand.
+// Elsewhere -S is --gpg-sign with an attached value only, so `merge -S --no-verify` has a real option.
+const SEARCH_VALUE_FLAGS = new Map([
+  ['--grep', ['log', 'rev-list']],
+  ['-S', ['log', 'diff', 'show', 'grep', 'reflog']],
+  ['-G', ['log', 'diff', 'show', 'grep', 'reflog']],
+  ['--author', ['log', 'rev-list']],
+  ['--committer', ['log', 'rev-list']],
+]);
 // core.hooksPath set to the repo's own hooks is what `git config` is allowed to do too.
 const HOOKS_OK = /^(\.\/)?\.githooks\/?$/;
 // Options of `git` itself whose value is the next argument.
@@ -71,8 +82,12 @@ function withoutBodies(command) {
   return out.join('\n');
 }
 
-/** The commands in a shell line, each a list of arguments with the quotes removed. */
-export function commands(line) {
+/**
+ * The commands in a shell line, each a list of arguments with the quotes removed.
+ * `hash: false` reads no `#` comments (cmd has none). `ticks` is how an unquoted backtick is read:
+ * 'split' as a command separator (bash), 'drop' as PowerShell's escape that vanishes from the word.
+ */
+export function commands(line, { hash = true, ticks = 'split' } = {}) {
   const all = [];
   let args = [];
   let arg = null;
@@ -112,8 +127,15 @@ export function commands(line) {
     } else if (ch === '\\' && (next === '"' || next === "'")) {
       arg = (arg ?? '') + next;
       i += 1;
-    } else if (ch === '#' && arg === null) {
-      // A comment runs to the end of the line.
+    } else if (ch === '`' && ticks === 'drop') {
+      // PowerShell: a backtick escapes the next character, so it is dropped from the word.
+      if (next !== undefined) {
+        arg = (arg ?? '') + next;
+        i += 1;
+      }
+    } else if (ch === '#' && hash && arg === null && (i === 0 || /[\s;&|]/.test(line[i - 1]))) {
+      // A comment starts only at a word start after whitespace or a separator (not after `{`, `)` or a backtick,
+      // where the shell keeps the `#`), and runs to the end of the line.
       while (i + 1 < line.length && line[i + 1] !== '\n' && line[i + 1] !== '\r') i += 1;
     } else if (/\s/.test(ch) && ch !== '\n') {
       endArg();
@@ -169,7 +191,7 @@ function optionsOf(sub, rest) {
       const first = [...group].findIndex((f) => COMMIT_VALUE_FLAGS.includes(f));
       takes = COMMIT_LONG_VALUE_FLAGS.has(arg) || (first !== -1 && first === group.length - 1 && SEPARATE_VALUE_FLAGS.includes(group[first]));
     } else {
-      takes = SEARCH_VALUE_FLAGS.has(arg) || (sub === 'grep' && arg === '-e');
+      takes = SEARCH_VALUE_FLAGS.get(arg)?.includes(sub) === true || (sub === 'grep' && arg === '-e');
     }
     if (takes) i += 1;
   }
@@ -231,19 +253,25 @@ function gitRefusal(args) {
   return null;
 }
 
-function why(command, depth) {
-  for (const args of commands(withoutBodies(command))) {
-    const git = args.findIndex((a) => GIT.test(a));
-    if (git !== -1) {
-      const reason = envRefusal(args.slice(0, git)) ?? gitRefusal(args.slice(git + 1));
-      if (reason) return reason;
-    }
-    // A command handed to another shell as one argument, e.g. bash -c "git commit ...".
-    // Denied by default: any argument of a command holding a shell name may be a command, flags or not.
-    if (depth < 2 && args.some((a) => SHELLS.test(a))) {
-      for (const arg of args) {
-        const reason = /\s/.test(arg) ? why(arg, depth + 1) : null;
+function why(command, depth, noHash = false) {
+  // cmd has no `#` comments: a line that names cmd (or is read for cmd) is read without them.
+  const hash = !(noHash || /\bcmd(\.exe)?\b/i.test(command));
+  const text = withoutBodies(command);
+  // A backtick is a separator in bash and an escape in PowerShell: refuse if either reading is refused.
+  for (const ticks of ['split', 'drop']) {
+    for (const args of commands(text, { hash, ticks })) {
+      const git = args.findIndex((a) => GIT.test(a));
+      if (git !== -1) {
+        const reason = envRefusal(args.slice(0, git)) ?? gitRefusal(args.slice(git + 1));
         if (reason) return reason;
+      }
+      // A command handed to another shell as one argument, e.g. bash -c "git commit ...".
+      // Denied by default: any argument of a command holding a shell name may be a command, flags or not.
+      if (depth < 2 && args.some((a) => SHELLS.test(a))) {
+        for (const arg of args) {
+          const reason = /\s/.test(arg) ? why(arg, depth + 1, !hash) : null;
+          if (reason) return reason;
+        }
       }
     }
   }
