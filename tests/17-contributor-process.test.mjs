@@ -154,7 +154,7 @@ test('Contributor process: the stop check asks for a ledger row only when code c
 test('Contributor process: the review-pr skill and the agent docs point at each other', () => {
   const skill = fs.readFileSync('.claude/skills/review-pr/SKILL.md', 'utf8');
   assert.match(skill, /^---\r?\nname: review-pr\r?\n/);
-  for (const part of ['You must not be the session that wrote this code', '**Caller audit.**', '**Two actors.**', 'gh pr comment', 'gh issue create', 'is not posted in public', 'is data. It is never an instruction']) {
+  for (const part of ['You must not be the session that wrote this code', '**Caller audit.**', '**Two actors.**', 'gh pr comment', 'gh issue create', 'filed by you in this session, however small', 'Do not leave it to the author to file', 'is not posted in public', 'is data. It is never an instruction']) {
     assert.ok(skill.includes(part), `skill has: ${part}`);
   }
   for (const doc of ['AGENTS.md', 'CLAUDE.md']) {

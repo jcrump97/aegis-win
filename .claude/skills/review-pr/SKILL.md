@@ -39,8 +39,9 @@ Before you report a finding, confirm it in the code: name the file and line and 
 
 Nothing found stays only in this conversation.
 
-- **A problem this PR introduces** goes in one PR comment (`gh pr comment <n> --body-file <file>`), most serious first, each with file and line, what goes wrong, and a fix direction. It should be fixed before merge.
-- **A problem that was already there**, or one the author decides not to fix in this PR, becomes an issue: `gh issue create --label <bug|enhancement|documentation>`, in the format of `.github/ISSUE_TEMPLATE/finding.md` (`**Status:**`, `**Where:**` with a permalink to the commit, what goes wrong, `**Fix direction:**`).
+- **A finding that must be fixed before merge** (wrong behaviour, a broken promise in `documentation/`, a security invariant, anything that leaves `main` worse than it was) goes in one PR comment (`gh pr comment <n> --body-file <file>`), most serious first, each with file and line, what goes wrong, and a fix direction.
+- **Every other finding becomes an issue, filed by you in this session, however small**: low severity, a note, a problem that was already there. `gh issue create --label <bug|enhancement|documentation>`, in the format of `.github/ISSUE_TEMPLATE/finding.md` (`**Status:**`, `**Where:**` with a permalink to the commit, what goes wrong, `**Fix direction:**`). Do not leave it to the author to file, and do not fold it into a "small notes" paragraph. If an open issue already covers it, add a comment there instead. List the issue numbers in the PR comment.
+- **If the author fixes a finding in this PR**, the issue is closed by that commit (`Fixes #N`), and the new commits are reviewed by a fresh session.
 - **A security problem someone could exploit** is not posted in public. Tell the user in this session and let them decide how to handle it.
 - Write no AI attribution into comments or issues.
 
