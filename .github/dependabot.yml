@@ -6,6 +6,13 @@
 #
 # Minor and patch updates of one ecosystem come as one pull request. A major
 # update comes alone, so it can be read and tested by itself.
+#
+# Tauri: the tauri and tauri-build crates and the @tauri-apps npm packages must share
+# a major.minor version, or the Tauri CLI refuses to build. Dependabot groups cannot
+# span ecosystems, so minor and major bumps of these are ignored here and made
+# together by hand: change the crate and the npm packages in one pull request
+# (tests/17-contributor-process.test.mjs fails when the lockfiles differ). Patch
+# updates still arrive.
 version: 2
 updates:
   # The app and its plugins: the Cargo workspace at the root.
@@ -19,6 +26,11 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "tauri"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "tauri-build"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   # The launcher sits outside the workspace and keeps its own lockfile.
   - package-ecosystem: cargo
@@ -43,6 +55,9 @@ updates:
     groups:
       npm-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      - dependency-name: "@tauri-apps/*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   # The actions the CI workflow uses.
   - package-ecosystem: github-actions
@@ -52,3 +67,6 @@ updates:
     open-pull-requests-limit: 2
     commit-message:
       prefix: "(chore) "
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
