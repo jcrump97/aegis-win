@@ -82,6 +82,46 @@ test('Contributor process: the git guard refuses commands that skip hooks or sig
   }
 });
 
+test('Contributor process: the git guard reads git\'s arguments, not any text in the command (issue #27)', () => {
+  // Short flags, the `git config` forms, and a command handed to another shell skip the hooks or signing too.
+  for (const bad of [
+    'git commit -n -m "(fix) x"',
+    'git commit -nm "(fix) x"',
+    'git commit -anm "(fix) x"',
+    'git commit --no-verif -m "(fix) x"',
+    'git config core.hooksPath /dev/null',
+    'git config --local core.hookspath ""',
+    'git config --unset core.hooksPath',
+    'git config commit.gpgsign false',
+    'git config set commit.gpgSign off',
+    'git -c "core.hooksPath=/dev/null" commit -m "(fix) x"',
+    'git -C repo -c commit.gpgsign=0 commit -m "(fix) x"',
+    'bash -c "git commit --no-verify -m x"',
+    'npm test && & "C:\\Program Files\\Git\\cmd\\git.exe" commit --no-gpg-sign -m x',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  // A flag that is only text (a message, a file body, a search) skips nothing.
+  for (const fine of [
+    'git commit -m "(doc) Say why --no-verify and -n are refused"',
+    'git commit -mnote',
+    'git commit -F notes.txt -- -n',
+    "git commit -m @'\n(doc) Guard\n\nRefuses --no-verify and commit.gpgsign=false.\n'@",
+    "cat > body.md <<'EOF'\nThe guard misses git commit -n and --no-verify.\nEOF\ngh issue create --body-file body.md",
+    'grep -rn -- --no-verify .githooks',
+    'git grep -n -- --no-verify',
+    'git push -n origin main',
+    'git merge -n topic',
+    'git log -n 5',
+    'git config core.hooksPath',
+    'git config --get commit.gpgsign',
+    'git config commit.gpgsign true',
+    'git config core.hooksPath ./.githooks',
+  ]) {
+    assert.equal(refusal(fine), null, fine);
+  }
+});
+
 test('Contributor process: the session-start issue list shows only maintainers\' issues, as data', () => {
   const issues = [
     { number: 23, title: 'Report kept after unlock', author_association: 'OWNER', labels: [{ name: 'bug' }] },
