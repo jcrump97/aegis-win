@@ -107,6 +107,16 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.match(mainRs, /CloseRequested \{ api, \.\. \} = event \{\s*if window\.state::<Arc<Engine>>\(\)\.background_active\(\) \{\s*api\.prevent_close\(\);/);
   // The elevated restart releases the claim so the elevated copy can start.
   assert.match(mainRs, /drop\(claim\.0\.lock\(\)\.unwrap\(\)\.take\(\)\);\s*let reclaim[\s\S]*?relaunch_elevated\(\)/);
+  // #10: nothing is stopped or recorded until Windows has accepted the elevated launch. A cancelled
+  // UAC prompt (ERROR_CANCELLED, reported as ErrorKind::Interrupted) leaves monitoring running.
+  const restart = mainRs.slice(mainRs.indexOf('async fn restart_as_admin'), mainRs.indexOf('fn main()'));
+  const launchAt = restart.indexOf('relaunch_elevated()');
+  assert.ok(launchAt > 0, 'restart_as_admin launches the elevated copy');
+  assert.equal(restart.slice(0, launchAt).includes('engine.exit('), false, 'no exit record before the launch is accepted');
+  assert.equal(restart.slice(0, launchAt).includes('request_quit('), false, 'no quit before the launch is accepted');
+  // The quit (whose exit handler writes the clean-stop record) is only in the Ok arm.
+  assert.match(restart, /Ok\(\(\)\) => \{\s*request_quit\(&app\);/);
+  assert.equal(restart.slice(restart.indexOf('Err(e) if')).includes('request_quit('), false, 'failure paths do not quit');
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   // Only input in the app window counts as activity.
   assert.match(main, /document\.addEventListener\('pointerdown', noteActivity, true\);/);

@@ -501,13 +501,16 @@ async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim:
     if engine.elevated() {
         return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is already running as administrator."));
     }
-    // Restarting would cut the running change off; waiting ones are cancelled by the lock below.
+    // Restarting would cut the running change off; waiting ones are cancelled when this copy exits.
     if let Some(tool) = engine.change_running() {
         return Err(AegisError::new(ErrorCode::Conflict, format!("Wait for {tool} to finish before restarting as administrator.")));
     }
-    // Stop the MCP server first so the elevated copy can bind the same port,
-    // and stop monitoring here so only one copy writes the history.
-    engine.exit(ExitReason::Quit).await;
+    // Nothing is stopped or recorded until Windows has accepted the launch: a
+    // cancelled UAC prompt must leave monitoring running and no "quit" in the
+    // history. On success `request_quit` below ends the app, and the exit
+    // handler stops the MCP server and monitoring and writes the quit record
+    // (the elevated copy needs the owner's PIN before it binds a port or writes
+    // history, which is later than that).
     // Let go of this install before the elevated copy starts and checks it.
     drop(claim.0.lock().unwrap().take());
     let reclaim = || {
@@ -522,7 +525,7 @@ async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim:
         }
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
             reclaim();
-            Err(AegisError::new(ErrorCode::AccessDenied, "The administrator prompt was cancelled. AegisWin is locked; unlock to continue."))
+            Err(AegisError::new(ErrorCode::AccessDenied, "The administrator prompt was cancelled. AegisWin is still running as before."))
         }
         Err(e) => {
             reclaim();
