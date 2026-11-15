@@ -1,5 +1,11 @@
 name: AegisWin Atomic CI Pipeline
 
+# Least privilege: the pipeline only reads the repo and the pull request, so the
+# token gets no write scopes (CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+  pull-requests: read
+
 on:
   push:
     branches: [main]
@@ -19,6 +25,15 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      # Git does not clone core.hooksPath, so a contributor's commits may never have met .githooks/commit-msg.
+      - name: Check Commit Messages (type tag, no AI attribution)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node scripts/check-commit-messages.mjs
 
       - name: Setup Rust Toolchain (Tauri v2 Backend)
         uses: dtolnay/rust-toolchain@stable

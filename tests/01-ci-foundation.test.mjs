@@ -17,6 +17,16 @@ test('CI Foundation: repository configuration and Vite/Tauri scaffolding exist',
   assert.ok(pkg.scripts.ci, 'ci script must be defined');
 });
 
+test('CI Foundation: the workflow grants GITHUB_TOKEN least privilege (CodeQL actions/missing-workflow-permissions)', () => {
+  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+  // Top-level `permissions:` (column 0), followed by its indented entries (CRLF or LF).
+  const block = ci.match(/^permissions:\r?\n((?:[ \t]+\S[^\r\n]*\r?\n)+)/m);
+  assert.ok(block, 'ci.yml must declare a top-level permissions block');
+  assert.match(block[1], /^[ \t]+contents: read[ \t]*\r?$/m, 'contents must be read-only');
+  // No write scope anywhere in the block.
+  assert.doesNotMatch(block[1], /write/, 'the token must get no write scope');
+});
+
 test('CI Foundation: commit-msg regex enforces prepended (type) convention', () => {
   const hook = fs.readFileSync('.githooks/commit-msg', 'utf8');
   assert.match(hook, /\(feat\|fix\|doc\|chore\|test\|refactor\|security\|perf\)/);
@@ -68,7 +78,7 @@ test('Rust core only: the Node.js prototype is gone and live docs no longer poin
     assert.ok(fs.existsSync(`plugins/${plugin}/src/lib.rs`), `plugins/${plugin} is missing src/lib.rs`);
   }
   // The ADR keeps the history; the operating docs must describe what ships.
-  for (const doc of ['AGENT.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
+  for (const doc of ['AGENTS.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
     assert.doesNotMatch(fs.readFileSync(doc, 'utf8'), /src\/core\/|index\.mjs|CentralLlmService/, `${doc} still references the prototype`);
   }
 });

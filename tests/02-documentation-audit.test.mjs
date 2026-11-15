@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const REQUIRED_DOCS = [
-  'AGENT.md',
+  'AGENTS.md',
   'CLAUDE.md',
   'documentation/GUIDING_PRINCIPLES.md',
   'documentation/ARCHITECTURE.md',
@@ -14,6 +14,7 @@ const REQUIRED_DOCS = [
   'documentation/adr/0002-ai-monitor-creator.md',
   'documentation/adr/0003-action-plans.md',
   'documentation/adr/0004-approval-channel-and-key-hardening.md',
+  'documentation/adr/0005-diagnose-this-pc.md',
 ];
 
 test('Documentation Audit: all required agent and architecture docs exist and are non-empty', () => {
@@ -43,7 +44,7 @@ test('Documentation Audit: ADR 0001 records the accepted Rust-core decision and 
   const adr = fs.readFileSync('documentation/adr/0001-rust-core.md', 'utf8');
   assert.match(adr, /\*\*Status\*\*: Accepted/);
   assert.match(adr, /## Migration plan/);
-  for (const doc of ['documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md', 'documentation/SECURITY_MODEL.md', 'AGENT.md', 'CLAUDE.md']) {
+  for (const doc of ['documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md', 'documentation/SECURITY_MODEL.md', 'AGENTS.md', 'CLAUDE.md']) {
     assert.match(fs.readFileSync(doc, 'utf8'), /adr\/0001-rust-core\.md/, `${doc} must link ADR 0001`);
   }
 });
@@ -52,7 +53,7 @@ test('Documentation Audit: agent docs list every commit prefix the hook allows a
   const hook = fs.readFileSync('.githooks/commit-msg', 'utf8');
   const prefixes = hook.match(/\((feat\|[a-z|]+)\)/)[1].split('|');
   assert.ok(prefixes.length >= 8, 'Expected the full prefix alternation from the hook');
-  for (const doc of ['AGENT.md', 'CLAUDE.md']) {
+  for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
     for (const p of prefixes) assert.ok(text.includes(`(${p})`), `${doc} must document the (${p}) prefix`);
     assert.match(text, /No AI Attribution/, `${doc} must state the no-AI-attribution rule`);
@@ -147,4 +148,38 @@ test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestio
       assert.ok(readme.includes(`\`${check.id}\``), `${plugin} README documents ${check.id}`);
     }
   }
+});
+
+test('Documentation Audit: agent docs keep the review and findings rules, and no doc describes removed behaviour', () => {
+  // Findings are filed as issues, reviews come from a fresh session, and shared functions get a caller audit.
+  for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
+    const text = fs.readFileSync(doc, 'utf8');
+    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Caller Audit', 'Two-Actor Test', 'Fixes Start with a Failing Test']) {
+      assert.ok(text.includes(`**${rule}**`), `${doc} must name the ${rule} rule`);
+    }
+  }
+  // The rules are written once, in the file other AI tools look for, and CLAUDE.md loads it.
+  assert.ok(!fs.existsSync('AGENT.md'), 'the singular name is gone');
+  assert.match(fs.readFileSync('CLAUDE.md', 'utf8'), /^@AGENTS\.md\r?$/m, 'CLAUDE.md imports AGENTS.md on a line of its own');
+  assert.doesNotMatch(fs.readFileSync('CLAUDE.md', 'utf8'), /\*\*Status:\*\*/, 'the issue format is not repeated in CLAUDE.md');
+  assert.match(fs.readFileSync('AGENTS.md', 'utf8'), /\*\*Two-Actor Test\*\*/);
+  assert.match(fs.readFileSync('README.md', 'utf8'), /filed as a \[GitHub issue\]/, 'README tells contributors where findings go');
+  // Behaviour that was removed: the elevated helper, an approval link for agents, the PIN on a web page.
+  const agent = fs.readFileSync('AGENTS.md', 'utf8');
+  assert.doesNotMatch(agent, /--elevate-tool/);
+  assert.doesNotMatch(agent, /returns an approval URL/);
+  assert.match(agent, /No web page ever takes the PIN/);
+  // The UI scale range is the one the engine enforces (80 to 150).
+  assert.match(fs.readFileSync('crates/aegis-core/src/engine.rs', 'utf8'), /\(80\.\.=150\)\.contains\(&scale\)/);
+  assert.match(agent, /`80%`–`150%`/);
+  assert.match(fs.readFileSync('documentation/ARCHITECTURE.md', 'utf8'), /Dynamic Zoom: 80% - 150%/);
+  assert.match(fs.readFileSync('documentation/GUIDING_PRINCIPLES.md', 'utf8'), /`--ui-scale: 0\.80` to `1\.50`/);
+});
+
+test('Documentation Audit: the guiding principles in AGENTS.md are numbered in order', () => {
+  // Rendered Markdown renumbers a list, so an out-of-order source shows different numbers than it says (issue #28).
+  const section = fs.readFileSync('AGENTS.md', 'utf8').split(/^## /m).find((s) => s.startsWith('1. Guiding Engineering Principles'));
+  const numbers = [...section.matchAll(/^(\d+)\. \*\*/gm)].map((m) => Number(m[1]));
+  assert.ok(numbers.length >= 7, 'the principles are found');
+  assert.deepEqual(numbers, numbers.map((_, i) => i + 1));
 });
