@@ -500,7 +500,7 @@ async fn tools_call(state: &AppState, id: &Value, params: &Value) -> Response {
     }
     if name == CANCEL_TICKET_TOOL {
         let ticket_id = args.get("ticketId").and_then(Value::as_str).unwrap_or_default();
-        return match state.engine.cancel_ticket(ticket_id) {
+        return match state.engine.cancel_ticket_for(&crate::engine::Origin::Mcp, ticket_id) {
             Ok(ticket) => rpc_result(id, tool_text(&ticket_payload(&ticket), false)),
             Err(e) if e.code == ErrorCode::NotFound => rpc_result(id, tool_error(&not_found())),
             Err(e) => rpc_result(id, tool_error(&e)),
