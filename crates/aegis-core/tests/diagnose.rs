@@ -313,7 +313,7 @@ fn next_tools_must_name_plan_eligible_tools_of_compiled_plugins() {
 async fn the_last_report_is_kept_for_the_app_until_the_vault_locks() {
     let s = setup(&[("checker", &[])]).await;
     assert_eq!(s.engine.last_diagnosis().unwrap(), None);
-    let report = s.engine.diagnose(7).await.unwrap();
+    let report = s.engine.diagnose_for_app(7).await.unwrap();
     assert_eq!(s.engine.last_diagnosis().unwrap().map(|d| d.report), Some(report));
     s.engine.lock().await;
     assert_eq!(s.engine.last_diagnosis().unwrap_err().code, ErrorCode::VaultLocked);
@@ -332,7 +332,7 @@ async fn agents_do_not_get_findings_of_a_plugin_whose_read_tool_needs_the_pin() 
     assert!(agent.findings.is_empty());
     assert!(agent.checks.iter().all(|c| c.status == CheckStatus::Skipped && c.reason.as_deref() == Some(WITHHELD)));
     // The app still sees everything, and keeps the full report.
-    assert_eq!(s.engine.diagnose(7).await.unwrap().findings.len(), 2);
+    assert_eq!(s.engine.diagnose_for_app(7).await.unwrap().findings.len(), 2);
     assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().report.findings.len(), 2);
 }
 
@@ -364,7 +364,7 @@ async fn the_ai_explains_the_last_report_and_only_code_linked_fixes_are_kept() {
     use aegis_core::plan::PlanOrigin;
     let s = setup(&[("checker", &[]), ("demo", &[])]).await;
     assert_eq!(s.engine.explain_diagnosis().await.unwrap_err().code, ErrorCode::NotFound, "run Check this PC first");
-    s.engine.diagnose(7).await.unwrap();
+    s.engine.diagnose_for_app(7).await.unwrap();
     let reply = json!({
         "summary": "Game.EXE keeps crashing.",
         "order": ["checker.crash:older.exe", "made-up"],
@@ -408,7 +408,7 @@ async fn the_ai_explains_the_last_report_and_only_code_linked_fixes_are_kept() {
     assert_eq!(ticket.steps.len(), 1);
 
     // A new run and a lock both drop the advice.
-    s.engine.diagnose(7).await.unwrap();
+    s.engine.diagnose_for_app(7).await.unwrap();
     assert_eq!(s.engine.last_diagnosis().unwrap().unwrap().advice, None);
     assert_eq!(s.engine.propose_suggested_plan().await.unwrap_err().code, ErrorCode::NotFound);
 }
@@ -416,11 +416,11 @@ async fn the_ai_explains_the_last_report_and_only_code_linked_fixes_are_kept() {
 #[tokio::test]
 async fn nothing_to_explain_and_replies_that_never_fit_are_refused() {
     let s = setup(&[("demo", &[])]).await;
-    s.engine.diagnose(7).await.unwrap();
+    s.engine.diagnose_for_app(7).await.unwrap();
     assert_eq!(s.engine.explain_diagnosis().await.unwrap_err().code, ErrorCode::InvalidArguments, "no findings");
 
     let s = setup(&[("checker", &[])]).await;
-    s.engine.diagnose(7).await.unwrap();
+    s.engine.diagnose_for_app(7).await.unwrap();
     let (base, server) = aegis_core::testing::mock_llm_replies(&["Run winsock reset now.", "Still not JSON."]).await;
     use_llm(&s, &base).await;
     let err = s.engine.explain_diagnosis().await.unwrap_err();
@@ -433,7 +433,7 @@ async fn nothing_to_explain_and_replies_that_never_fit_are_refused() {
 #[tokio::test]
 async fn diagnose_needs_its_own_off_lan_trust_which_survives_plugin_changes() {
     let s = setup(&[("checker", &[])]).await;
-    s.engine.diagnose(7).await.unwrap();
+    s.engine.diagnose_for_app(7).await.unwrap();
     use_llm(&s, "https://api.example.com/v1").await;
     let err = s.engine.explain_diagnosis().await.unwrap_err();
     assert_eq!(err.code, ErrorCode::OffLanTrustRequired);
@@ -453,4 +453,68 @@ async fn diagnose_needs_its_own_off_lan_trust_which_survives_plugin_changes() {
 fn no_plugin_may_use_the_diagnose_id() {
     let err = Registry::new(vec![Arc::new(DemoPlugin::with_id("diagnose")) as Arc<dyn Plugin>]).err().unwrap();
     assert!(err.contains("reserved for Diagnose"), "{err}");
+}
+
+#[tokio::test]
+async fn an_agents_run_never_replaces_the_apps_report_or_drops_its_advice() {
+    let s = setup(&[("checker", &[]), ("demo", &[])]).await;
+    // Nothing is kept for the app until the app itself asks.
+    s.engine.diagnose_for_agent(7).await.unwrap();
+    assert_eq!(s.engine.last_diagnosis().unwrap(), None);
+
+    let app = s.engine.diagnose_for_app(7).await.unwrap();
+    let reply = json!({
+        "summary": "The game keeps crashing.",
+        "order": ["checker.crash:game.exe"],
+        "steps": [{ "findingId": "checker.crash:game.exe", "tool": "demo__fix", "args": { "note": "n" } }]
+    })
+    .to_string();
+    let (base, server) = aegis_core::testing::mock_llm_replies(&[&reply]).await;
+    use_llm(&s, &base).await;
+    let advice = s.engine.explain_diagnosis().await.unwrap();
+    server.await.unwrap();
+    assert_eq!(advice.steps.len(), 1);
+
+    // The app and an agent act in turn on the same engine.
+    let agent = s.engine.diagnose_for_agent(1).await.unwrap();
+    assert_ne!(agent.ran_at, app.ran_at, "a run of its own");
+    let kept = s.engine.last_diagnosis().unwrap().unwrap();
+    assert_eq!(kept.report, app, "still the report the owner is looking at");
+    assert_eq!(kept.advice, Some(advice), "with the AI's advice on it");
+    s.engine.propose_suggested_plan().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_run_from_before_a_lock_is_withheld_after_the_next_unlock() {
+    let s = setup(&[("checker", &[])]).await;
+    *s.checker.mode.lock().unwrap() = Mode::Block;
+    let (a, b) = (s.engine.clone(), s.engine.clone());
+    let app = tokio::spawn(async move { a.diagnose_for_app(7).await });
+    let agent = tokio::spawn(async move { b.diagnose_for_agent(7).await });
+    while s.checker.runs.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+    s.engine.lock().await;
+    s.engine.unlock(PIN.into()).await.unwrap();
+
+    // A request made after the unlock does not join the run from before the lock.
+    let c = s.engine.clone();
+    let fresh = tokio::spawn(async move { c.diagnose_for_app(30).await });
+    let mut spins = 0;
+    while s.checker.runs.load(Ordering::SeqCst) < 2 {
+        spins += 1;
+        assert!(spins < 10_000, "the request made after the unlock joined the run from before the lock");
+        tokio::task::yield_now().await;
+    }
+    s.checker.release.add_permits(2);
+    assert_eq!(app.await.unwrap().unwrap_err().code, ErrorCode::VaultLocked);
+    assert_eq!(agent.await.unwrap().unwrap_err().code, ErrorCode::VaultLocked);
+    let fresh = fresh.await.unwrap().unwrap();
+    assert_eq!(fresh.lookback_days, 30);
+    assert_eq!(s.engine.last_diagnosis().unwrap().map(|d| d.report), Some(fresh), "only the run made since the unlock is kept");
+    // The old run did not clear the new run's place: the next request starts normally.
+    *s.checker.mode.lock().unwrap() = Mode::Normal;
+    s.engine.diagnose(7).await.unwrap();
+    assert_eq!(s.checker.runs.load(Ordering::SeqCst), 3);
 }

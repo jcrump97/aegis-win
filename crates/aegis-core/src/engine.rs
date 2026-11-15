@@ -94,10 +94,12 @@ pub struct Engine {
     record_hard_bytes: AtomicU64,
     /// Held events dropped because too many were waiting; noted in the record once it can be written.
     unwritten_lost: AtomicU64,
-    /// The Diagnose run in progress, if any: a second request shares its
+    /// The Diagnose run in progress, if any, with the executor epoch it
+    /// started in: a second request made before the next lock shares its
     /// report instead of starting another (ADR 0005 §2).
-    diagnosis: Mutex<Option<tokio::sync::watch::Receiver<Option<AegisResult<diagnose::Report>>>>>,
-    /// The last Diagnose report, for the app. Memory only: dropped at every lock (ADR 0005 D4).
+    diagnosis: Mutex<Option<(u64, tokio::sync::watch::Receiver<Option<AegisResult<diagnose::Report>>>)>>,
+    /// The last report the app asked for (`diagnose_for_app`), with the AI's
+    /// advice on it. Memory only: dropped at every lock (ADR 0005 D4).
     last_diagnosis: Mutex<Option<Diagnosis>>,
 }
 
@@ -2726,26 +2728,35 @@ impl Engine {
 
     /// Runs every installed plugin's checks and returns the report. Read-only:
     /// no executor turn, no ticket. One run at a time: a request made while
-    /// one runs waits for it and gets its report.
+    /// one runs waits for it and gets its report. Keeps nothing: the app's
+    /// own requests go through [`diagnose_for_app`](Self::diagnose_for_app).
     pub async fn diagnose(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {
         if !diagnose::LOOKBACK_DAYS.contains(&lookback_days) {
             return Err(AegisError::invalid(format!("Look back 1, 7 or 30 days, not {lookback_days}.")));
         }
         self.with_state(|_| ())?;
+        // Every lock moves the epoch on, so it names the time between two locks.
+        let epoch = self.executor.epoch();
         let mut rx = {
             let mut slot = lock(&self.diagnosis);
-            // A closed channel means the last run's task ended without a report.
-            match slot.as_ref().filter(|rx| rx.has_changed().is_ok()) {
-                Some(rx) => rx.clone(),
+            // Shared only with a run started since the last lock. A closed
+            // channel means the last run's task ended without a report.
+            match slot.as_ref().filter(|(started, rx)| *started == epoch && rx.has_changed().is_ok()) {
+                Some((_, rx)) => rx.clone(),
                 None => {
                     let (tx, rx) = tokio::sync::watch::channel(None);
-                    *slot = Some(rx.clone());
+                    *slot = Some((epoch, rx.clone()));
                     let engine = self.self_arc()?;
                     // On its own task, so a caller that goes away does not leave the others waiting.
                     tokio::spawn(async move {
                         let report = engine.run_diagnosis(lookback_days).await;
-                        // Cleared before the result is sent, so a later request starts a fresh run.
-                        *lock(&engine.diagnosis) = None;
+                        // Cleared before the result is sent, so a later request starts a fresh
+                        // run; left alone when a run started after a lock has taken the slot.
+                        let mut slot = lock(&engine.diagnosis);
+                        if slot.as_ref().is_some_and(|(started, _)| *started == epoch) {
+                            *slot = None;
+                        }
+                        drop(slot);
                         let _ = tx.send(Some(report));
                     });
                     rx
@@ -2753,10 +2764,25 @@ impl Engine {
             }
         };
         let report = rx.wait_for(Option::is_some).await.map_err(|_| internal("the diagnosis stopped"))?.clone().expect("waited for Some")?;
-        // The vault may have locked while the checks ran. Stored under the
-        // vault lock, so a lock cannot slip in between the check and the store.
+        // The vault may have locked while the checks ran, and may be open again
+        // by now: a report from before a lock is withheld either way.
+        self.with_state(|_| ())?;
+        if self.executor.epoch() != epoch {
+            return Err(locked());
+        }
+        Ok(report)
+    }
+
+    /// `run_diagnosis` for the app: the same run, and the report is kept for
+    /// the Diagnose tab until the next one or the next lock. Only this path
+    /// keeps a report, so an agent's `aegis__diagnose` never replaces what
+    /// the owner is looking at or drops the AI's advice on it.
+    pub async fn diagnose_for_app(&self, lookback_days: u32) -> AegisResult<diagnose::Report> {
+        let epoch = self.executor.epoch();
+        let report = self.diagnose(lookback_days).await?;
+        // Stored under the vault lock, so a lock cannot slip in between the check and the store.
         let vault = lock(&self.vault);
-        if vault.is_none() {
+        if vault.is_none() || self.executor.epoch() != epoch {
             return Err(locked());
         }
         *lock(&self.last_diagnosis) = Some(Diagnosis { report: report.clone(), advice: None });
@@ -2764,7 +2790,7 @@ impl Engine {
         Ok(report)
     }
 
-    /// The last report since unlocking, if any. For the app only.
+    /// The last report the app asked for since unlocking, if any. For the app only.
     pub fn last_diagnosis(&self) -> AegisResult<Option<Diagnosis>> {
         self.with_state(|_| ())?;
         Ok(lock(&self.last_diagnosis).clone())

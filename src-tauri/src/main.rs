@@ -436,7 +436,7 @@ async fn cancel_ticket(engine: EngineState<'_>, ticket_id: String) -> Cmd<Ticket
 /// Runs every installed plugin's read-only checks (ADR 0005). One run at a time.
 #[tauri::command]
 async fn run_diagnosis(engine: EngineState<'_>, lookback_days: u32) -> Cmd<Report> {
-    engine.diagnose(lookback_days).await
+    engine.diagnose_for_app(lookback_days).await
 }
 
 /// The last report since unlocking, and the AI's advice on it, if any.
