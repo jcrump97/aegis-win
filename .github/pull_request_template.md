@@ -4,7 +4,7 @@
 
 <!-- What it does and why. Link the ADR section or the issue (Fixes #N). -->
 
-## Checklist (AGENT.md §2 and §3)
+## Checklist (AGENTS.md §2 and §3)
 
 - [ ] `npm run ci` passes, and every commit adds or updates a test.
 - [ ] `documentation/AUDIT_LEDGER.md` has a row for each commit, and the specs in `documentation/` match the code.

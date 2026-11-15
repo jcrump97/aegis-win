@@ -1,4 +1,4 @@
-# AGENT.md — Autonomous Agent Engineering Contract (AegisWin)
+# AGENTS.md — Autonomous Agent Engineering Contract (AegisWin)
 
 > **Purpose**: Authoritative operational guide for any AI coding agent contributing to **AegisWin**, the portable Windows system utility, LLM diagnostic assistant, and human-gated MCP server.
 
@@ -35,7 +35,7 @@
 - **What Enforces This**: CI runs `scripts/check-commit-messages.mjs` over a pull request's commits and description (type tag, no AI attribution), because git hooks are off in a fresh clone. `.github/pull_request_template.md` carries the checklist. For Claude Code sessions, `.claude/settings.json` wires three hooks from `.claude/hooks/`: `guard-git.mjs` refuses git commands that skip hooks or signing, `session-issues.mjs` lists the maintainers' open issues at the start of a session, and `stop-ledger.mjs` sends a session back once when code changed without a ledger row.
 
 ## 4. Repository Map
-- `AGENT.md` & `CLAUDE.md` — Agent operating instructions and workflow shortcuts.
+- `AGENTS.md` — The rules for every AI coding tool, under the name those tools look for. `CLAUDE.md` loads it with an `@AGENTS.md` line and adds only what is specific to Claude Code, so no rule is written twice.
 - `documentation/` — Critical architectural specs, diagrams, security invariants, plugin contracts, decision records (`adr/`), and the live commit audit ledger.
 - `crates/aegis-core/` — Rust core ([ADR 0001](documentation/adr/0001-rust-core.md)): the engine (single enforcement point for install state, input validation, and the dry-run → admin → PIN gate), portable encrypted vault with the global PIN guard, approval tickets, Central LLM Service (with LAN/Off-LAN detector), plugin registry, OS layer, and MCP HTTP server + approval web portal.
 - `src/ui/` — High-contrast dark-mode UI (`WCAG AAA`), dynamic UI scaling engine (`80%`–`150%`), First-Run Component Wizard, Plugin Views, and Live MCP Approval Queue. Talks to the core only through Tauri `invoke`.

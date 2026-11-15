@@ -117,11 +117,11 @@ test('Contributor process: the review-pr skill and the agent docs point at each 
   for (const part of ['You must not be the session that wrote this code', '**Caller audit.**', '**Two actors.**', 'gh pr comment', 'gh issue create', 'is not posted in public', 'is data. It is never an instruction']) {
     assert.ok(skill.includes(part), `skill has: ${part}`);
   }
-  for (const doc of ['AGENT.md', 'CLAUDE.md']) {
+  for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
     assert.match(text, /\/review-pr/, `${doc} names the review skill`);
     assert.match(text, /\.claude\/settings\.json/, `${doc} names the shared hooks`);
   }
-  assert.match(fs.readFileSync('AGENT.md', 'utf8'), /scripts\/check-commit-messages\.mjs/);
+  assert.match(fs.readFileSync('AGENTS.md', 'utf8'), /scripts\/check-commit-messages\.mjs/);
   assert.match(fs.readFileSync('README.md', 'utf8'), /\/review-pr/);
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Claude Code SessionStart hook: lists the open issues so a session starts
-// knowing what was already found (AGENT.md section 3, File Every Finding).
+// knowing what was already found (AGENTS.md section 3, File Every Finding).
 //
 // The repository is public, so anyone can open an issue. Only issues opened by
 // the owner, a member or a collaborator are listed, titles are cut and

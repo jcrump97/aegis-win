@@ -68,7 +68,7 @@ test('Rust core only: the Node.js prototype is gone and live docs no longer poin
     assert.ok(fs.existsSync(`plugins/${plugin}/src/lib.rs`), `plugins/${plugin} is missing src/lib.rs`);
   }
   // The ADR keeps the history; the operating docs must describe what ships.
-  for (const doc of ['AGENT.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
+  for (const doc of ['AGENTS.md', 'CLAUDE.md', 'README.md', 'documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md']) {
     assert.doesNotMatch(fs.readFileSync(doc, 'utf8'), /src\/core\/|index\.mjs|CentralLlmService/, `${doc} still references the prototype`);
   }
 });

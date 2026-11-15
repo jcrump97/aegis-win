@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const REQUIRED_DOCS = [
-  'AGENT.md',
+  'AGENTS.md',
   'CLAUDE.md',
   'documentation/GUIDING_PRINCIPLES.md',
   'documentation/ARCHITECTURE.md',
@@ -44,7 +44,7 @@ test('Documentation Audit: ADR 0001 records the accepted Rust-core decision and 
   const adr = fs.readFileSync('documentation/adr/0001-rust-core.md', 'utf8');
   assert.match(adr, /\*\*Status\*\*: Accepted/);
   assert.match(adr, /## Migration plan/);
-  for (const doc of ['documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md', 'documentation/SECURITY_MODEL.md', 'AGENT.md', 'CLAUDE.md']) {
+  for (const doc of ['documentation/ARCHITECTURE.md', 'documentation/PLUGIN_SPEC.md', 'documentation/SECURITY_MODEL.md', 'AGENTS.md', 'CLAUDE.md']) {
     assert.match(fs.readFileSync(doc, 'utf8'), /adr\/0001-rust-core\.md/, `${doc} must link ADR 0001`);
   }
 });
@@ -53,7 +53,7 @@ test('Documentation Audit: agent docs list every commit prefix the hook allows a
   const hook = fs.readFileSync('.githooks/commit-msg', 'utf8');
   const prefixes = hook.match(/\((feat\|[a-z|]+)\)/)[1].split('|');
   assert.ok(prefixes.length >= 8, 'Expected the full prefix alternation from the hook');
-  for (const doc of ['AGENT.md', 'CLAUDE.md']) {
+  for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
     for (const p of prefixes) assert.ok(text.includes(`(${p})`), `${doc} must document the (${p}) prefix`);
     assert.match(text, /No AI Attribution/, `${doc} must state the no-AI-attribution rule`);
@@ -152,16 +152,20 @@ test('Documentation Audit: ADR 0005 keeps findings code-written and AI suggestio
 
 test('Documentation Audit: agent docs keep the review and findings rules, and no doc describes removed behaviour', () => {
   // Findings are filed as issues, reviews come from a fresh session, and shared functions get a caller audit.
-  for (const doc of ['AGENT.md', 'CLAUDE.md']) {
+  for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
-    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Caller Audit', 'Fixes Start with a Failing Test']) {
-      assert.ok(text.includes(`**${rule}**`), `${doc} must state the ${rule} rule`);
+    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Caller Audit', 'Two-Actor Test', 'Fixes Start with a Failing Test']) {
+      assert.ok(text.includes(`**${rule}**`), `${doc} must name the ${rule} rule`);
     }
   }
-  assert.match(fs.readFileSync('AGENT.md', 'utf8'), /\*\*Two-Actor Test\*\*/);
+  // The rules are written once, in the file other AI tools look for, and CLAUDE.md loads it.
+  assert.ok(!fs.existsSync('AGENT.md'), 'the singular name is gone');
+  assert.match(fs.readFileSync('CLAUDE.md', 'utf8'), /^@AGENTS\.md\r?$/m, 'CLAUDE.md imports AGENTS.md on a line of its own');
+  assert.doesNotMatch(fs.readFileSync('CLAUDE.md', 'utf8'), /\*\*Status:\*\*/, 'the issue format is not repeated in CLAUDE.md');
+  assert.match(fs.readFileSync('AGENTS.md', 'utf8'), /\*\*Two-Actor Test\*\*/);
   assert.match(fs.readFileSync('README.md', 'utf8'), /filed as a \[GitHub issue\]/, 'README tells contributors where findings go');
   // Behaviour that was removed: the elevated helper, an approval link for agents, the PIN on a web page.
-  const agent = fs.readFileSync('AGENT.md', 'utf8');
+  const agent = fs.readFileSync('AGENTS.md', 'utf8');
   assert.doesNotMatch(agent, /--elevate-tool/);
   assert.doesNotMatch(agent, /returns an approval URL/);
   assert.match(agent, /No web page ever takes the PIN/);

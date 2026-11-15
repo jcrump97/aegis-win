@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Claude Code PreToolUse hook (Bash, PowerShell): refuses git commands that
-// skip the repo's hooks or commit signing (AGENT.md section 2).
+// skip the repo's hooks or commit signing (AGENTS.md section 2).
 import { pathToFileURL } from 'node:url';
 
 const SKIPS = [
@@ -14,7 +14,7 @@ const SKIPS = [
 export function refusal(command) {
   if (typeof command !== 'string' || !/\bgit\b/.test(command)) return null;
   const hit = SKIPS.find(([pattern]) => pattern.test(command));
-  return hit ? `Refused: ${hit[1]}. If a hook fails, fix what it reports (AGENT.md section 2). Only the maintainer may bypass it, by running the command themselves.` : null;
+  return hit ? `Refused: ${hit[1]}. If a hook fails, fix what it reports (AGENTS.md section 2). Only the maintainer may bypass it, by running the command themselves.` : null;
 }
 
 async function main() {

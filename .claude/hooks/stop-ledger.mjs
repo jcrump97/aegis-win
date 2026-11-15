@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Claude Code Stop hook: when code was changed but documentation/AUDIT_LEDGER.md
 // was not, sends the session back once to update the ledger or to say why not
-// (AGENT.md section 2, Mandatory Documentation Audit). Looks at uncommitted
+// (AGENTS.md section 2, Mandatory Documentation Audit). Looks at uncommitted
 // changes only, and never blocks twice in a row.
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
