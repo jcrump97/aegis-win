@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 import { ATTRIBUTION_PATTERN, PREFIXES, checkMessage, checkPrBody } from '../scripts/check-commit-messages.mjs';
-import { refusal } from '../.claude/hooks/guard-git.mjs';
+import { isPlain, refusal } from '../.claude/hooks/guard-git.mjs';
+// origin/main's guard before PR #56, untouched: the guard must refuse at least what this refuses on a non-plain line.
+import { refusal as mainRefusal } from './helpers/guard-git-origin-main.mjs';
 import { summary } from '../.claude/hooks/session-issues.mjs';
 import { changedPaths, reason } from '../.claude/hooks/stop-ledger.mjs';
 
@@ -162,6 +164,7 @@ test('Contributor process: the git guard allows an option value or a comment tha
     'cmd /c "echo # & git commit -n"',
     'cmd /c "echo # && git commit -n"',
     // A backtick is a separator in bash and an escape in PowerShell: both readings are checked.
+    'git status;# git commit -n',
     'git `commit --no-verify -m x',
     'git commit `-m x -n',
     'git commit --no-verify `-m x',
@@ -187,8 +190,8 @@ test('Contributor process: the git guard allows an option value or a comment tha
     assert.match(refusal(bad) ?? '', /^Refused: /, bad);
   }
   for (const fine of [
-    'git commit -m "(fix) x" -m "-n is now refused"',
-    'git commit -m "(fix) x" -m "--no-verify is refused"',
+    'git commit -m "fix x" -m "-n is now refused"',
+    'git commit -m "fix x" -m "--no-verify is refused"',
     'git commit --message "--no-verify"',
     'git log --grep "--no-verify"',
     'git log -S --no-verify',
@@ -196,13 +199,62 @@ test('Contributor process: the git guard allows an option value or a comment tha
     'git show -S --no-verify',
     'git rev-list --author --no-verify HEAD',
     'git status # never use --no-verify',
-    'git status;# git commit -n',
     'git status && # git commit -n',
     'git -c core.hooksPath=.githooks commit -m x',
     'git commit -m x#y',
   ]) {
+    assert.ok(isPlain(fine), fine);
     assert.equal(refusal(fine), null, fine);
   }
+  // Only a plain line gets the lenient reading: one character outside the allow-list (here a parenthesis, `;#`) keeps it refused.
+  for (const stillRefused of ['git commit -m "(fix) x" -m "-n is now refused"', 'git status;# git commit -n']) {
+    assert.ok(!isPlain(stillRefused) || stillRefused.includes(';#'), stillRefused);
+    assert.match(refusal(stillRefused) ?? '', /^Refused: /, stillRefused);
+  }
+});
+
+test('Contributor process: a line with a character outside the plain set is refused whenever origin/main refused it (review 6 of PR 56)', () => {
+  for (const bad of [
+    'git commit -m x `true` -n',
+    'git push `x` --no-verify',
+    'git commit -m x `a b` -n',
+    'git commit -m x ` -n',
+    'git commit -m a\\ #b -n',
+    'git commit -m a\\\t#b -n',
+    'git commit -m a # -n',
+    'git commit -m a # -n',
+    'git commit -m a\f# -n',
+  ]) {
+    assert.ok(!isPlain(bad), bad);
+    assert.ok(mainRefusal(bad), `origin/main refuses: ${bad}`);
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const plainLine of ['git status', 'git commit -m "a b" -m c', "git log --grep 'x y'", 'git status # c\ngit log']) assert.ok(isPlain(plainLine), plainLine);
+  for (const notPlain of ['git status `x`', 'git status $x', 'git status (x)', 'git status\r', 'git status é', 'bash x.sh', 'git commit -m "a', "git commit -m ''", 'git commit -m "" -n', 'git status | sh', 'git status\\']) {
+    assert.ok(!isPlain(notPlain), notPlain);
+  }
+  // Property: insert one character outside the plain set anywhere in a set of commands; the guard refuses whatever origin/main refuses.
+  const bases = [
+    'git commit -n -m x', 'git commit --no-verify -m x', 'git commit -m x --no-gpg-sign', 'git -c commit.gpgsign=false commit -m x', 'git -c core.hooksPath=/dev/null commit -m x',
+    'git config core.hooksPath /dev/null', 'git commit -m a -n', 'git push --no-verify', 'git merge -S --no-verify x', 'git commit -m a -m "-n x"', 'git log --grep "--no-verify"',
+    'git status # git commit -n', 'echo a; git commit -n', 'git commit -m "x y" -n', "git commit -m 'x y' --no-verify", 'git commit -anm x', 'git commit -m x\ngit commit -n',
+  ];
+  const odd = ['`', '\\', '$', '(', ')', '{', '}', '<', '>', '%', '^', '!', '*', '?', '~', '@', ' ', ' ', '\f', '\r', 'é', '\u0000', '[', ']'];
+  let checked = 0;
+  for (const base of bases) {
+    for (let i = 0; i <= base.length; i += 1) {
+      for (const c of odd) {
+        for (const line of [base.slice(0, i) + c + base.slice(i), base.slice(0, i) + ' ' + c + ' ' + base.slice(i)]) {
+          assert.ok(!isPlain(line), JSON.stringify(line));
+          if (mainRefusal(line)) {
+            checked += 1;
+            assert.match(refusal(line) ?? '', /^Refused: /, JSON.stringify(line));
+          }
+        }
+      }
+    }
+  }
+  assert.ok(checked > 1000, `the property test exercised ${checked} lines`);
 });
 
 test('Contributor process: the git guard reads a command given to any shell invocation form (issue #65)', () => {

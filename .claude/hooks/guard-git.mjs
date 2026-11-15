@@ -2,17 +2,18 @@
 // Claude Code PreToolUse hook (Bash, PowerShell): refuses git commands that
 // skip the repo's hooks or commit signing (AGENTS.md section 2).
 //
-// It reads the arguments of each git command in the line, so a flag that is
-// only text (a commit message, a file body, a search pattern) is not refused.
-// A shell is denied by default: every argument of a command that holds a shell
-// name (sh, bash, zsh, pwsh, powershell, cmd), and any here-string or
-// here-document text fed to it, is read as a possible command. So text that
-// only mentions a flag in a shell's arguments (bash script.sh "git commit -n")
-// is refused too: a false refusal, kept because no safe exception was found.
-// A `#` starts a comment only at a line start or after whitespace, `;`, `&` or
-// `|`, and never on a line that names cmd. An unquoted backtick is read both as
-// a separator (bash) and as PowerShell's escape (dropped); either reading may
-// refuse the line.
+// Two readings, so the guard is at least as strict as before by construction:
+//  - A line that is not "plain" (isPlain below: anything but ASCII letters,
+//    digits, blanks and a few punctuation marks, any shell or launcher word,
+//    unbalanced or doubled quotes) gets origin/main's rule unchanged
+//    (guard-git-strict.mjs).
+//  - A plain line is read by the parser below, which reads the arguments of
+//    each git command, so a flag that is only text (a message or search value,
+//    a `#` comment after a blank) is not refused. That is all of issue #34 that
+//    is delivered: for a line with any other character it stays refused.
+// The parser also runs on every line and only adds refusals: --config-env, a
+// GIT_CONFIG_KEY_n assignment, a `-c alias.x=...`, a backtick as a command
+// separator, a here-document fed to a shell, a here-string (issue #32).
 // Not read, each tracked in an issue:
 //   #66  text piped into a shell (echo "..." | bash, cat <<EOF | bash), and a
 //        PowerShell here-string after -Command
@@ -29,6 +30,7 @@
 // It is a reminder for a session, not a security boundary: CI checks commit
 // messages again (scripts/check-commit-messages.mjs).
 import { pathToFileURL } from 'node:url';
+import { strictRefusal } from './guard-git-strict.mjs';
 
 const NO_VERIFY = 'skips the commit-msg and pre-commit hooks';
 const NO_SIGN = 'makes an unsigned commit';
@@ -82,12 +84,8 @@ function withoutBodies(command) {
   return out.join('\n');
 }
 
-/**
- * The commands in a shell line, each a list of arguments with the quotes removed.
- * `hash: false` reads no `#` comments (cmd has none). `ticks` is how an unquoted backtick is read:
- * 'split' as a command separator (bash), 'drop' as PowerShell's escape that vanishes from the word.
- */
-export function commands(line, { hash = true, ticks = 'split' } = {}) {
+/** The commands in a shell line, each a list of arguments with the quotes removed. */
+export function commands(line) {
   const all = [];
   let args = [];
   let arg = null;
@@ -127,15 +125,9 @@ export function commands(line, { hash = true, ticks = 'split' } = {}) {
     } else if (ch === '\\' && (next === '"' || next === "'")) {
       arg = (arg ?? '') + next;
       i += 1;
-    } else if (ch === '`' && ticks === 'drop') {
-      // PowerShell: a backtick escapes the next character, so it is dropped from the word.
-      if (next !== undefined) {
-        arg = (arg ?? '') + next;
-        i += 1;
-      }
-    } else if (ch === '#' && hash && arg === null && (i === 0 || /[\s;&|]/.test(line[i - 1]))) {
-      // A comment starts only at a word start after whitespace or a separator (not after `{`, `)` or a backtick,
-      // where the shell keeps the `#`), and runs to the end of the line.
+    } else if (ch === '#' && arg === null && (i === 0 || ' \t\n'.includes(line[i - 1]))) {
+      // A comment starts only at a word start after an ASCII blank or at a line start, and runs to the end of the line.
+      // (Only a plain line relies on this; any other line is also read by the strict rule.)
       while (i + 1 < line.length && line[i + 1] !== '\n' && line[i + 1] !== '\r') i += 1;
     } else if (/\s/.test(ch) && ch !== '\n') {
       endArg();
@@ -160,7 +152,7 @@ function configRefusal(key, value) {
   if (/^core\.hookspath$/i.test(key) && !HOOKS_OK.test(value)) return HOOKS_PATH;
   // An alias is a git command line (or, after `!`, a shell command line) that runs under another name.
   if (/^alias\./i.test(key)) {
-    if (value.startsWith('!')) return why(value.slice(1), 1);
+    if (value.startsWith('!')) return why(value.slice(1));
     return gitRefusal(commands(value)[0] ?? []);
   }
   return null;
@@ -253,35 +245,44 @@ function gitRefusal(args) {
   return null;
 }
 
-function why(command, depth, noHash = false) {
-  // cmd has no `#` comments: a line that names cmd (or is read for cmd) is read without them.
-  const hash = !(noHash || /\bcmd(\.exe)?\b/i.test(command));
-  const text = withoutBodies(command);
-  // A backtick is a separator in bash and an escape in PowerShell: refuse if either reading is refused.
-  for (const ticks of ['split', 'drop']) {
-    for (const args of commands(text, { hash, ticks })) {
-      const git = args.findIndex((a) => GIT.test(a));
-      if (git !== -1) {
-        const reason = envRefusal(args.slice(0, git)) ?? gitRefusal(args.slice(git + 1));
-        if (reason) return reason;
-      }
-      // A command handed to another shell as one argument, e.g. bash -c "git commit ...".
-      // Denied by default: any argument of a command holding a shell name may be a command, flags or not.
-      if (depth < 2 && args.some((a) => SHELLS.test(a))) {
-        for (const arg of args) {
-          const reason = /\s/.test(arg) ? why(arg, depth + 1, !hash) : null;
-          if (reason) return reason;
-        }
-      }
+/** Why the parser refuses the line, or null. It reads every git command's arguments; it does not read a shell's. */
+function why(command) {
+  for (const args of commands(withoutBodies(command))) {
+    const git = args.findIndex((a) => GIT.test(a));
+    if (git !== -1) {
+      const reason = envRefusal(args.slice(0, git)) ?? gitRefusal(args.slice(git + 1));
+      if (reason) return reason;
     }
   }
   return null;
 }
 
+// The only characters a plain line holds: ASCII letters, digits, space, tab, newline and `- _ . / : = , + ' " ; & | #`.
+// Backtick, backslash, `$`, brackets, `< >`, `%`, `^`, `!`, `*`, `?`, `~`, `@`, non-ASCII and control characters are not here.
+const PLAIN_CHARS = /^[A-Za-z0-9 \t\n\-_./:=,+'";&|#]*$/;
+// A shell, or a program that runs a command line, anywhere in the line.
+const SHELL_WORD = /(?<![A-Za-z0-9_])(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|nu|xonsh|pwsh|powershell|cmd|env|sudo|eval|exec|xargs|watch|ssh|iex|invoke-expression|start-process|python\d*|node|perl|ruby|command|builtin)(?![A-Za-z0-9_])/i;
+
+/**
+ * Whether a line is plain enough for the parser's reading to stand alone. Its quotes must be balanced
+ * with no doubled quote (`''` and `""` mean different things to bash and PowerShell).
+ */
+export function isPlain(line) {
+  if (!PLAIN_CHARS.test(line) || SHELL_WORD.test(line) || /''|""/.test(line)) return false;
+  let quote = null;
+  for (const ch of line) {
+    if (quote === null && (ch === "'" || ch === '"')) quote = ch;
+    else if (ch === quote) quote = null;
+  }
+  return quote === null;
+}
+
 /** Why the command is refused, or null when it may run. */
 export function refusal(command) {
   if (typeof command !== 'string' || !/\bgit\b/i.test(command)) return null;
-  const reason = why(command, 0);
+  const parsed = why(command);
+  if (parsed === null && !isPlain(command)) return strictRefusal(command);
+  const reason = parsed;
   return reason ? `Refused: ${reason}. If a hook fails, fix what it reports (AGENTS.md section 2). Only the maintainer may bypass it, by running the command themselves.` : null;
 }
 
