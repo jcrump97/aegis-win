@@ -229,6 +229,22 @@ test('Contributor process: a line with a character outside the plain set is refu
     assert.ok(mainRefusal(bad), `origin/main refuses: ${bad}`);
     assert.match(refusal(bad) ?? '', /^Refused: /, bad);
   }
+  // Review 7: a quote glued into a word (a shell spelled `"b"ash`, a flag spelled `--no-"verify"`) makes the line non-plain.
+  for (const bad of [
+    '"b"ash -c "git commit -n"',
+    "s'h' -c \"git commit -n\"",
+    "busybox s'h' -c \"git commit -n\"",
+    'git commit -m x --no-"verify"',
+    "git commit -m x --no-'verify'",
+    'git commit -"n" -m x',
+    'git commit -m a"b"c -n',
+    "git \"commit\" -n",
+  ]) {
+    assert.ok(mainRefusal(bad), `origin/main refuses: ${bad}`);
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+    // A quote only opens at a word start and closes at a word end; `"commit"` alone is fine.
+    assert.equal(isPlain(bad), bad === 'git "commit" -n', bad);
+  }
   for (const plainLine of ['git status', 'git commit -m "a b" -m c', "git log --grep 'x y'", 'git status # c\ngit log']) assert.ok(isPlain(plainLine), plainLine);
   for (const notPlain of ['git status `x`', 'git status $x', 'git status (x)', 'git status\r', 'git status é', 'bash x.sh', 'git commit -m "a', "git commit -m ''", 'git commit -m "" -n', 'git status | sh', 'git status\\']) {
     assert.ok(!isPlain(notPlain), notPlain);
@@ -255,6 +271,27 @@ test('Contributor process: a line with a character outside the plain set is refu
     }
   }
   assert.ok(checked > 1000, `the property test exercised ${checked} lines`);
+  // Property: quote characters inserted at every position, and single characters of each word wrapped in quotes,
+  // in commands with and without a shell: the guard still refuses whatever origin/main refuses.
+  const quoteBases = [...bases, 'bash -c "git commit -n"', 'sh -c "git commit --no-verify -m x"', 'busybox sh -c "git commit -n"', 'env bash -c "git commit -n"', 'sudo git commit -n', 'cmd /c "git commit -n"', 'pwsh -c "git commit --no-verify"', 'git commit -m x -n'];
+  let quoted = 0;
+  const variants = (base) => {
+    const out = [];
+    for (let i = 0; i <= base.length; i += 1) for (const q of ["'", '"']) out.push(base.slice(0, i) + q + base.slice(i), base.slice(0, i) + q + q + base.slice(i));
+    for (let i = 0; i < base.length; i += 1) for (const q of ["'", '"']) if (/\S/.test(base[i])) out.push(base.slice(0, i) + q + base[i] + q + base.slice(i + 1));
+    for (let i = 0; i + 1 < base.length; i += 1) for (const q of ["'", '"']) if (/\S\S/.test(base.slice(i, i + 2))) out.push(base.slice(0, i) + q + base.slice(i, i + 2) + q + base.slice(i + 2));
+    return out;
+  };
+  for (const base of quoteBases) {
+    for (const line of variants(base)) {
+      // A plain line may be allowed where main refused it: that is the #34 allowance (e.g. `-m "-n' x"`).
+      if (!isPlain(line) && mainRefusal(line)) {
+        quoted += 1;
+        assert.match(refusal(line) ?? '', /^Refused: /, JSON.stringify(line));
+      }
+    }
+  }
+  assert.ok(quoted > 1000, `the quote property test exercised ${quoted} lines`);
 });
 
 test('Contributor process: the git guard reads a command given to any shell invocation form (issue #65)', () => {

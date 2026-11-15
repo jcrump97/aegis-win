@@ -30,7 +30,7 @@
 // It is a reminder for a session, not a security boundary: CI checks commit
 // messages again (scripts/check-commit-messages.mjs).
 import { pathToFileURL } from 'node:url';
-import { strictRefusal } from './guard-git-strict.mjs';
+import { commands as strictCommands, strictRefusal } from './guard-git-strict.mjs';
 
 const NO_VERIFY = 'skips the commit-msg and pre-commit hooks';
 const NO_SIGN = 'makes an unsigned commit';
@@ -265,16 +265,25 @@ const SHELL_WORD = /(?<![A-Za-z0-9_])(?:sh|bash|zsh|dash|ksh|fish|csh|tcsh|nu|xo
 
 /**
  * Whether a line is plain enough for the parser's reading to stand alone. Its quotes must be balanced
- * with no doubled quote (`''` and `""` mean different things to bash and PowerShell).
+ * with no doubled quote (`''` and `""` mean different things to bash and PowerShell), and a quote may
+ * only open at a word start (line start, after a blank or `=`) and close at a word end (before a blank,
+ * newline, `;`, `&`, `|` or line end), so no word is spelled across quotes (`"b"ash`, `--no-"verify"`).
+ * No word of the line, read with its quotes removed as the strict rule reads it, may be a shell or launcher.
  */
 export function isPlain(line) {
   if (!PLAIN_CHARS.test(line) || SHELL_WORD.test(line) || /''|""/.test(line)) return false;
   let quote = null;
-  for (const ch of line) {
-    if (quote === null && (ch === "'" || ch === '"')) quote = ch;
-    else if (ch === quote) quote = null;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quote === null && (ch === "'" || ch === '"')) {
+      if (i > 0 && !' \t\n='.includes(line[i - 1])) return false;
+      quote = ch;
+    } else if (ch === quote) {
+      if (i + 1 < line.length && !' \t\n;&|'.includes(line[i + 1])) return false;
+      quote = null;
+    }
   }
-  return quote === null;
+  return quote === null && !strictCommands(line).some((args) => args.some((a) => SHELLS.test(a) || SHELL_WORD.test(a)));
 }
 
 /** Why the command is refused, or null when it may run. */

@@ -1,8 +1,10 @@
 // What origin/main's git guard refused (.claude/hooks/guard-git.mjs before PR #56), kept as it was so the
 // guard is at least as strict as before by construction: guard-git.mjs uses this for every line that is not
-// "plain" (see isPlain there). The only change is marked (?<!<) below: a here-string is not a here-document
-// (issue #32), which makes this rule read more lines, never fewer. tests/helpers/guard-git-origin-main.mjs is
-// the untouched copy that the tests compare against.
+// "plain" (see isPlain there). The only change in the text is marked (?<!<) below: a here-string is not a
+// here-document (issue #32). It makes this rule read the lines after `grep x <<< y`, but it can also change which
+// lines a here-document skips when a `<<<word` comes before a real `<<EOF` on one line (issue #100), so this
+// rule is not strictly at least as strict as origin/main there. `commands` is exported for isPlain.
+// tests/helpers/guard-git-origin-main.mjs is the untouched copy that the tests compare against.
 const NO_VERIFY = 'skips the commit-msg and pre-commit hooks';
 const NO_SIGN = 'makes an unsigned commit';
 const HOOKS_PATH = 'pointing core.hooksPath away from .githooks skips the repo hooks';
@@ -32,7 +34,7 @@ function withoutBodies(command) {
 }
 
 /** The commands in a shell line, each a list of arguments with the quotes removed. */
-function commands(line) {
+export function commands(line) {
   const all = [];
   let args = [];
   let arg = null;
