@@ -61,6 +61,30 @@ pub async fn mock_http_replies(bodies: Vec<String>) -> (String, JoinHandle<Vec<S
 /// `POST /api/show` are answered on the side without using a response: with
 /// 404 normally, or as Ollama when `ollama_show` is set.
 async fn serve_as(ollama_show: Option<String>, responses: Vec<(&'static str, String)>) -> (String, JoinHandle<Vec<String>>) {
+    let (base, handle, _) = serve_counting(ollama_show, responses).await;
+    (base, handle)
+}
+
+/// Answers successive requests with the given `(status, body)` pairs, as a
+/// server that is not Ollama.
+pub async fn mock_replies(responses: Vec<(&'static str, String)>) -> (String, JoinHandle<Vec<String>>) {
+    serve_as(None, responses).await
+}
+
+/// Like [`mock_ollama`] (no thinking capability), also counting the
+/// `/api/version` and `/api/show` probes it receives.
+pub async fn mock_ollama_counting(answers: &[&str]) -> (String, JoinHandle<Vec<String>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let show = serde_json::json!({ "model_info": { "general.architecture": "llama", "llama.context_length": 8192 } }).to_string();
+    let replies = answers
+        .iter()
+        .map(|a| ("200 OK", serde_json::json!({ "message": { "role": "assistant", "content": a }, "done": true, "done_reason": "stop", "prompt_eval_count": 100 }).to_string()))
+        .collect();
+    serve_counting(Some(show), replies).await
+}
+
+async fn serve_counting(ollama_show: Option<String>, responses: Vec<(&'static str, String)>) -> (String, JoinHandle<Vec<String>>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = probes.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://127.0.0.1:{}/v1", listener.local_addr().unwrap().port());
     let handle = tokio::spawn(async move {
@@ -70,6 +94,9 @@ async fn serve_as(ollama_show: Option<String>, responses: Vec<(&'static str, Str
         while let Some((status, body)) = next.take() {
             let (mut sock, _) = listener.accept().await.unwrap();
             let request = read_request(&mut sock).await;
+            if request.starts_with("GET /api/version ") || request.starts_with("POST /api/show ") {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let side = if request.starts_with("GET /api/version ") {
                 Some(ollama_show.as_ref().map(|_| ("200 OK", r#"{"version":"0.12.0"}"#.to_owned())).unwrap_or(("404 Not Found", "404 page not found".to_owned())))
             } else if request.starts_with("POST /api/show ") {
@@ -96,7 +123,7 @@ async fn serve_as(ollama_show: Option<String>, responses: Vec<(&'static str, Str
         }
         requests
     });
-    (base_url, handle)
+    (base_url, handle, probes)
 }
 
 async fn read_request(sock: &mut TcpStream) -> String {

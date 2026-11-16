@@ -208,16 +208,24 @@ pub fn foreground_process_id() -> Option<u32> {
     }
 }
 
-/// Starts a second copy of this exe through the UAC "runas" verb. The caller
-/// should exit once this returns `Ok`. `ErrorKind::Interrupted` means the user
-/// declined the UAC prompt.
+/// The one argument the elevated copy is started with. It carries no data (no
+/// PIN, no process id): it tells the new copy to wait for the old one to let
+/// go of the install claim before it starts anything.
+pub const AFTER_RESTART_ARG: &str = "--after-restart";
+
+/// Starts a second copy of this exe through the UAC "runas" verb, with
+/// [`AFTER_RESTART_ARG`]. The caller should release the install claim and exit
+/// once this returns `Ok`. `ErrorKind::Interrupted` means the user declined the
+/// UAC prompt.
 pub fn relaunch_elevated() -> io::Result<()> {
     let exe = HSTRING::from(std::env::current_exe()?.as_os_str());
     let verb = HSTRING::from("runas");
+    let args = HSTRING::from(AFTER_RESTART_ARG);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(exe.as_ptr()),
+        lpParameters: PCWSTR(args.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
@@ -256,6 +264,44 @@ pub enum Instance {
 /// process. The first copy gets `on_second_launch` called, on its own
 /// thread, each time another copy starts.
 pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) -> io::Result<Instance> {
+    claim(key, on_second_launch, true)
+}
+
+/// Retries `try_once` every `poll` until it gives `Some` or `timeout` passes
+/// (then `None`). The wait is bounded: nothing here can block forever.
+pub fn wait_until<T>(timeout: Duration, poll: Duration, mut try_once: impl FnMut() -> io::Result<Option<T>>) -> io::Result<Option<T>> {
+    let start = Instant::now();
+    loop {
+        if let Some(found) = try_once()? {
+            return Ok(Some(found));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Like [`single_instance`], for the copy [`relaunch_elevated`] starts: the old
+/// copy still holds the claim until it has stopped monitoring and written its
+/// quit record, so this waits up to `timeout` for it to let go, without waking
+/// the old copy's window. Once it holds the claim it is the one running copy.
+/// If the claim does not come free in time (the argument is not secret, so
+/// anyone can start the exe with it), this is an ordinary second launch: the
+/// running copy is asked to show its window and `AlreadyRunning` comes back,
+/// so the caller exits without starting anything. It never runs without the claim.
+pub fn single_instance_after_restart(key: &str, on_second_launch: impl Fn() + Send + Clone + 'static, timeout: Duration) -> io::Result<Instance> {
+    let quiet = on_second_launch.clone();
+    match wait_until(timeout, Duration::from_millis(100), || match claim(key, quiet.clone(), false)? {
+        Instance::First(guard) => Ok(Some(guard)),
+        Instance::AlreadyRunning => Ok(None),
+    })? {
+        Some(guard) => Ok(Instance::First(guard)),
+        None => claim(key, on_second_launch, true),
+    }
+}
+
+fn claim(key: &str, on_second_launch: impl Fn() + Send + 'static, wake_running: bool) -> io::Result<Instance> {
     let mutex_name = HSTRING::from(format!(r"Local\AegisWin-{key}-instance"));
     let event_name = HSTRING::from(format!(r"Local\AegisWin-{key}-show"));
     // Only this user may open either object (ADR 0004 Phase 6).
@@ -268,6 +314,9 @@ pub fn single_instance(key: &str, on_second_launch: impl Fn() + Send + 'static) 
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         let _ = unsafe { CloseHandle(mutex) };
+        if !wake_running {
+            return Ok(Instance::AlreadyRunning);
+        }
         if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(event_name.as_ptr())) } {
             let _ = unsafe { SetEvent(event) };
             let _ = unsafe { CloseHandle(event) };
@@ -855,6 +904,46 @@ mod tests {
         bad[last] ^= 1;
         assert!(dpapi_unprotect(&bad).is_none());
         assert!(dpapi_unprotect(b"not a blob").is_none());
+    }
+
+    #[test]
+    fn the_elevated_copy_waits_for_the_old_one_to_let_go_and_never_waits_forever() {
+        let key = format!("test-restart-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Instance::First(old) = single_instance(&key, move || tx.send(()).unwrap()).unwrap() else { panic!("old copy") };
+        // The old copy lets go after a moment (it has written its quit record by then).
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(old);
+        });
+        let started = Instant::now();
+        let new = single_instance_after_restart(&key, || {}, Duration::from_secs(10)).unwrap();
+        assert!(matches!(new, Instance::First(_)), "it starts only once it holds the claim");
+        assert!(started.elapsed() >= Duration::from_millis(300), "and not before the old copy let go");
+        assert!(rx.try_recv().is_err(), "waiting did not wake the old copy's window");
+        letting_go.join().unwrap();
+
+        // The argument is not secret: when the claim never frees, the wait ends and the copy steps aside.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let key = format!("{key}-held");
+        let Instance::First(_held) = single_instance(&key, move || tx.send(()).unwrap()).unwrap() else { panic!("holder") };
+        let started = Instant::now();
+        let late = single_instance_after_restart(&key, || {}, Duration::from_millis(500)).unwrap();
+        assert!(matches!(late, Instance::AlreadyRunning), "never runs without the claim");
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+        rx.recv_timeout(Duration::from_secs(5)).expect("after the timeout it is an ordinary second launch: the running copy shows its window");
+    }
+
+    #[test]
+    fn wait_until_retries_then_gives_up() {
+        let mut tries = 0;
+        let found = wait_until(Duration::from_secs(5), Duration::from_millis(1), || {
+            tries += 1;
+            Ok((tries == 4).then_some(tries))
+        });
+        assert_eq!(found.unwrap(), Some(4));
+        assert_eq!(wait_until::<()>(Duration::from_millis(30), Duration::from_millis(5), || Ok(None)).unwrap(), None);
+        assert!(wait_until::<()>(Duration::from_secs(5), Duration::from_millis(5), || Err(io::Error::other("x"))).is_err());
     }
 
     #[test]

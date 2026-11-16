@@ -1990,6 +1990,7 @@ impl Engine {
             // Not a code at all (empty or mistyped length): costs no attempt.
             return Err(AegisError::new(ErrorCode::CodeInvalid, "Type the 8-character code shown in the AegisWin app, like K7QM-4XRT."));
         }
+        let mut held = None;
         if approve {
             let now = Instant::now();
             let mut store = lock(&self.tickets);
@@ -1998,8 +1999,9 @@ impl Engine {
                 return Err(ticket_conflict(ticket.status));
             }
             if ticket.device_code.as_ref().is_some_and(|c| c.matches(code, now)) {
-                // Single use.
-                ticket.device_code = None;
+                // Taken while the decision is applied, so two submissions
+                // together cannot both use it; given back below if applying fails.
+                held = ticket.device_code.take();
             } else {
                 drop(store);
                 self.device_miss(now);
@@ -2012,7 +2014,18 @@ impl Engine {
                 }));
             }
         }
-        self.apply_decision(epoch, id, approve, comment, VIA)
+        let result = self.apply_decision(epoch, id, approve, comment, VIA);
+        if let (Err(_), Some(code)) = (&result, held) {
+            // Applying failed (queue full, record not written) and the ticket is
+            // still pending: the owner's code stays good until it expires, so
+            // the page can be tried again. A wrong code still strikes, and a
+            // decision that was applied keeps the code used up.
+            let mut store = lock(&self.tickets);
+            if let Some(ticket) = store.get_mut(id, Instant::now()).filter(|t| t.status == TicketStatus::PendingApproval && t.device_code.is_none()) {
+                ticket.device_code = Some(code);
+            }
+        }
+        result
     }
 
     /// Checked before any PIN or code, so a stale page costs no attempt.
@@ -2324,8 +2337,19 @@ impl Engine {
     /// its next step. Needs no PIN: it can only make less happen. A running
     /// single action is not stopped, since killing a repair mid-run is unsafe.
     pub fn cancel_ticket(&self, id: &str) -> AegisResult<TicketView> {
+        self.cancel_ticket_for(&Origin::Ui { pin: None }, id)
+    }
+
+    /// As `cancel_ticket`, for a caller of known origin. An agent (MCP) may
+    /// cancel only what an agent made: a plan the owner or the assistant
+    /// wrote is cancelled from the app, and an agent is told "no such
+    /// request" so it learns nothing about it.
+    pub fn cancel_ticket_for(&self, origin: &Origin, id: &str) -> AegisResult<TicketView> {
         let mut store = lock(&self.tickets);
         let ticket = store.get_mut(id, Instant::now()).ok_or_else(ticket_not_found)?;
+        if matches!(origin, Origin::Mcp) && ticket.plan.as_ref().is_some_and(|p| p.origin != PlanOrigin::Agent) {
+            return Err(ticket_not_found());
+        }
         match ticket.status {
             TicketStatus::PendingApproval | TicketStatus::Queued => {
                 let queued = ticket.status == TicketStatus::Queued;
