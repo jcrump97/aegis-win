@@ -7,14 +7,17 @@
  *   node scripts/check-commit-messages.mjs <base>..<head>
  *   BASE_SHA=... HEAD_SHA=... [PR_BODY=...] node scripts/check-commit-messages.mjs
  *
- * Merge commits are skipped. tests/17-contributor-process.test.mjs keeps the
+ * PR_TITLE (when set) and PR_BODY are checked too. Merge commits are skipped. tests/17-contributor-process.test.mjs keeps the
  * two patterns below equal to the hook's.
  */
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const PREFIXES = ['feat', 'fix', 'doc', 'chore', 'test', 'refactor', 'security', 'perf'];
-export const ATTRIBUTION_PATTERN = '^co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|generated with \\[?(claude|copilot|gemini|chatgpt)';
+// Strict as before: a trailer is refused at the start of a line, and a "generated with" footer anywhere in a line
+// (behind markup, a tag, a link, other words). The one exemption is a mention right after a double quote or a
+// backtick, which is how a message quotes the rule. When unsure the check refuses.
+export const ATTRIBUTION_PATTERN = '^co-authored-by:.*(claude|anthropic|copilot|gemini|openai|chatgpt)|(^|[^"`])generated with \\[?(claude|copilot|gemini|chatgpt)';
 
 const subject = new RegExp(`^\\((${PREFIXES.join('|')})\\) .+`);
 const attribution = new RegExp(ATTRIBUTION_PATTERN, 'im');
@@ -33,6 +36,14 @@ export function checkPrBody(body) {
   return attribution.test(body ?? '') ? ['the pull request description carries an AI attribution footer (credit goes in the README)'] : [];
 }
 
+/** A pull request title is the first line of the squash commit, so it needs the same type tag. */
+export function checkPrTitle(title) {
+  const problems = [];
+  if (!subject.test(title ?? '')) problems.push(`the pull request title must start with a type tag, e.g. "(fix) Describe the change" (got: ${title ?? ''})`);
+  if (attribution.test(title ?? '')) problems.push('the pull request title carries an AI attribution (credit goes in the README)');
+  return problems;
+}
+
 function main() {
   const range = process.argv[2] ?? (process.env.BASE_SHA && process.env.HEAD_SHA ? `${process.env.BASE_SHA}..${process.env.HEAD_SHA}` : null);
   if (!range || !/^[\w./~^-]+\.\.[\w./~^-]+$/.test(range)) {
@@ -49,7 +60,8 @@ function main() {
       failed += 1;
     }
   }
-  for (const problem of checkPrBody(process.env.PR_BODY)) {
+  const prProblems = [...(process.env.PR_TITLE === undefined ? [] : checkPrTitle(process.env.PR_TITLE)), ...checkPrBody(process.env.PR_BODY)];
+  for (const problem of prProblems) {
     console.error(`[pull request] ${problem}`);
     failed += 1;
   }

@@ -464,10 +464,11 @@ fn running_app_names(mention_text: &str) -> Vec<String> {
     chat::pick_app_names(samples, mention_text)
 }
 
-/// A chat reply is one small JSON object; 1024 tokens leaves room for a short
+/// A chat reply is one small JSON object; 2048 tokens leaves room for a short
 /// thinking phase and stops a looping model long before the request times out.
 /// The conversation is sent whole or not at all: a cut one loses the rules.
-/// At least 2048 tokens for a reply; more when the context window has room.
+/// The LLM service asks for more when the context window has room, and for
+/// less (a quarter of the window) when the window is small.
 const CHAT_REPLY: LlmOptions = LlmOptions { max_tokens: 2048, json: true, must_fit: true };
 
 /// Where the next LLM request would go, without sending anything.

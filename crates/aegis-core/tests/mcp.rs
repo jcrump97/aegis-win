@@ -601,3 +601,76 @@ async fn agents_run_diagnose_read_only_unless_the_owner_turned_it_off() {
     assert_eq!(off["isError"], true);
     assert!(off["structuredContent"]["error"]["message"].as_str().unwrap().contains("turned off Diagnose"));
 }
+
+#[tokio::test]
+async fn a_device_code_survives_a_failed_decision_but_is_still_single_use_and_still_limited() {
+    use aegis_core::tickets::TicketStatus;
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "retry" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+
+    // Applying fails (the approval record cannot be written): the ticket stays pending.
+    s.f.engine.set_approval_record_limits(0, 0);
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    assert!(err.message.contains("approval record"), "{err:?}");
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, TicketStatus::PendingApproval);
+
+    // The same code still works once the fault is gone, and a wrong code still strikes.
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    let wrong = if code == "ZZZZ-ZZZZ" { "YYYY-YYYY" } else { "ZZZZ-ZZZZ" };
+    let err = s.f.engine.decide_on_device(&id, true, wrong, None, None).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid);
+    let approved = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap();
+    assert_ne!(approved.status, TicketStatus::PendingApproval);
+
+    // Single use once a decision is applied: replaying the code is refused.
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::Conflict);
+}
+
+#[tokio::test]
+async fn failed_decisions_do_not_give_unlimited_guesses_at_a_kept_code() {
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "guess" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    s.f.engine.set_approval_record_limits(0, 0);
+    let _ = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    let wrong = if code == "ZZZZ-ZZZZ" { "YYYY-YYYY" } else { "ZZZZ-ZZZZ" };
+    for _ in 0..3 {
+        let _ = s.f.engine.decide_on_device(&id, true, wrong, None, None).unwrap_err();
+    }
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, aegis_core::tickets::TicketStatus::LockedOut, "three wrong codes lock it, whatever failed before");
+}
+
+#[tokio::test]
+async fn cancelling_a_ticket_checks_who_made_it_with_the_app_and_an_agent_acting_in_turn() {
+    use aegis_core::plan::PlanOrigin;
+    use aegis_core::tickets::TicketStatus;
+    let s = server().await;
+    // The owner writes a plan in the app; an agent also asks for a fix.
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "mine" } }] })).await.unwrap();
+    let agent_own = s.call("demo__fix", json!({ "note": "theirs" })).await["structuredContent"].clone();
+    let agent_id = agent_own["ticketId"].as_str().unwrap().to_owned();
+
+    // The agent cannot touch the owner's plan, and is told only that there is no such request.
+    let r = s.call("aegis__cancel_ticket", json!({ "ticketId": owner.ticket_id })).await;
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r["content"][0]["text"].as_str().unwrap().contains("No such"), "{r}");
+    assert_eq!(s.f.engine.ticket(&owner.ticket_id).unwrap().status, TicketStatus::PendingApproval);
+
+    // The agent can withdraw its own request.
+    let r = s.call("aegis__cancel_ticket", json!({ "ticketId": agent_id })).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert_eq!(s.f.engine.ticket(&agent_id).unwrap().status, TicketStatus::Cancelled);
+
+    // The owner, in the app, still cancels the owner's plan.
+    assert_eq!(s.f.engine.cancel_ticket(&owner.ticket_id).unwrap().status, TicketStatus::Cancelled);
+
+    // An agent's plan is cancelled by the agent too.
+    let plan = s.f.engine.propose_plan(PlanOrigin::Agent, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "p" } }] })).await.unwrap();
+    let r = s.call("aegis__cancel_ticket", json!({ "ticketId": plan.ticket_id })).await;
+    assert_ne!(r["isError"], true, "{r}");
+}

@@ -332,12 +332,10 @@ impl LlmHandle {
             other => serde_json::to_string(&other).unwrap_or_default(),
         };
         let user = self.fit(system_prompt, user, options)?;
+        // The LAN check above has already run; the cache only skips the probes.
         let ollama = match ollama_root(&self.config.base_url).filter(|_| endpoint.is_lan) {
-            Some(root) if is_ollama(&self.client, &root).await => {
-                let think = ollama_think_off(&self.client, &root, &self.config.model).await;
-                Some(Ollama { root, think })
-            }
-            _ => None,
+            Some(root) => self.ollama_for(root).await,
+            None => None,
         };
         let budget = self.reply_budget(system_prompt, &user, options.max_tokens, false);
         let reply = self.ask(&endpoint, ollama.as_ref(), system_prompt, &user, budget, options.json, progress).await?;
@@ -388,6 +386,31 @@ impl LlmHandle {
         })
     }
 
+    /// The reply room set aside for a request that asks for `max_tokens`: that
+    /// many, but never more than a quarter of the context window, so a small
+    /// window still has room for the prompt.
+    fn reserved_reply(&self, max_tokens: u32) -> u32 {
+        max_tokens.min(self.config.context_tokens / 4)
+    }
+
+    /// Whether `root` is Ollama, and what `think` to send for the model. The
+    /// two probes (`/api/version`, `/api/show`) are remembered per (root,
+    /// model) for [`PROBE_TTL`]; only a positive answer is kept, so an Ollama
+    /// that was down, or a changed endpoint or model, is probed afresh.
+    async fn ollama_for(&self, root: String) -> Option<Ollama> {
+        let key = (root.clone(), self.config.model.trim().to_owned());
+        let cached = OLLAMA_PROBES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).filter(|(at, _)| at.elapsed() < PROBE_TTL).map(|(_, think)| think.clone());
+        if let Some(think) = cached {
+            return Some(Ollama { root, think });
+        }
+        if !is_ollama(&self.client, &root).await {
+            return None;
+        }
+        let think = ollama_think_off(&self.client, &root, &self.config.model).await;
+        OLLAMA_PROBES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, (Instant::now(), think.clone()));
+        Some(Ollama { root, think })
+    }
+
     /// Tokens the model may write: what the context window has left after the
     /// prompt (with the 10% margin), at least `floor`, and at most a quarter
     /// of the window or [`REPLY_CEILING`]. A retry may use up to half the
@@ -395,6 +418,7 @@ impl LlmHandle {
     /// and OpenAI-style servers count that reasoning against `max_tokens` too.
     fn reply_budget(&self, system_prompt: &str, user: &str, floor: u32, retry: bool) -> u32 {
         let context = u64::from(self.config.context_tokens);
+        let floor = self.reserved_reply(floor);
         let left = (context * 9 / 10).saturating_sub(estimate_tokens(system_prompt) + estimate_tokens(user));
         let ceiling = if retry { (context / 2).min(2 * REPLY_CEILING) } else { (context / 4).min(REPLY_CEILING) };
         u32::try_from(left.min(ceiling).max(u64::from(floor))).unwrap_or(u32::MAX)
@@ -429,13 +453,17 @@ impl LlmHandle {
             // rejects one for models that do not reason), so none is sent: the
             // reply budget leaves room for reasoning instead.
             None => {
-                let body = json!({
+                // OpenAI deprecated `max_tokens` for `max_completion_tokens`, and
+                // its reasoning models reject the old name. Other servers know
+                // `max_tokens`; `stream` retries with the new name if one refuses it.
+                let field = token_limit_field(&endpoint.host);
+                let mut body = json!({
                     "model": self.config.model,
                     "temperature": 0.2,
-                    "max_tokens": max_tokens,
                     "stream": true,
                     "messages": messages,
                 });
+                body[field] = json!(max_tokens);
                 self.stream(endpoint, api_url(&self.config.base_url, "chat/completions"), &body, Wire::Sse, progress).await
             }
         }
@@ -445,7 +473,7 @@ impl LlmHandle {
     /// with `system_prompt` and `options` (see [`fit`](Self::fit)).
     pub fn room_chars(&self, system_prompt: &str, options: LlmOptions) -> usize {
         let usable = u64::from(self.config.context_tokens) * 9 / 10;
-        let room = usable.saturating_sub(estimate_tokens(system_prompt) + u64::from(options.max_tokens));
+        let room = usable.saturating_sub(estimate_tokens(system_prompt) + u64::from(self.reserved_reply(options.max_tokens)));
         usize::try_from(room * CHARS_PER_TOKEN).unwrap_or(usize::MAX).min(MAX_PROMPT_CHARS)
     }
 
@@ -455,11 +483,19 @@ impl LlmHandle {
     fn fit(&self, system_prompt: &str, user: String, options: LlmOptions) -> AegisResult<String> {
         let context = self.config.context_tokens;
         let usable = u64::from(context) * 9 / 10;
-        let fixed = estimate_tokens(system_prompt) + u64::from(options.max_tokens);
+        let fixed = estimate_tokens(system_prompt) + u64::from(self.reserved_reply(options.max_tokens));
         let room = usable.saturating_sub(fixed);
         let needed = estimate_tokens(&user);
-        if needed <= room && user.chars().count() <= MAX_PROMPT_CHARS {
+        let chars = user.chars().count();
+        if needed <= room && chars <= MAX_PROMPT_CHARS {
             return Ok(user);
+        }
+        if options.must_fit && needed <= room {
+            // The window has room; the fixed size cap is what refuses it.
+            return Err(AegisError::new(
+                ErrorCode::LlmFailed,
+                format!("This request is {chars} characters, more than the {MAX_PROMPT_CHARS} AegisWin sends to a model in one request. Raising the setting on the LLM tab does not change that; send less, or start a new conversation."),
+            ));
         }
         if options.must_fit || room < 256 {
             return Err(AegisError::new(
@@ -487,6 +523,7 @@ impl LlmHandle {
         progress.begin(self.config.first_token_secs);
         let _done = ProgressDone(progress);
 
+        let url_again = url.clone();
         let mut request = self.client.post(url).json(body);
         if let Some(key) = self.config.api_key.as_ref().filter(|k| !k.is_empty()) {
             request = request.bearer_auth(key.expose());
@@ -505,7 +542,7 @@ impl LlmHandle {
             Ok(Err(e)) => return Err(send_failed(endpoint, &e)),
             Ok(Ok(r)) => r,
         };
-        let status = response.status();
+        let mut status = response.status();
         if !status.is_success() {
             let raw = tokio::time::timeout(Duration::from_secs(30), response.text()).await.ok().and_then(Result::ok).unwrap_or_default();
             let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -514,7 +551,33 @@ impl LlmHandle {
                 .or_else(|| value.get("error"))
                 .and_then(Value::as_str)
                 .unwrap_or("request rejected");
-            return Err(self.rejected(endpoint, status, detail));
+            // A server that rejects `max_tokens` by name: ask once more with `max_completion_tokens`.
+            let renamed = (status == reqwest::StatusCode::BAD_REQUEST && detail.contains("max_tokens") && body.get("max_tokens").is_some()).then(|| {
+                let mut body = body.clone();
+                if let Some(n) = body.as_object_mut().and_then(|o| o.remove("max_tokens")) {
+                    body["max_completion_tokens"] = n;
+                }
+                body
+            });
+            let Some(renamed) = renamed else {
+                return Err(self.rejected(endpoint, status, detail));
+            };
+            let mut again = self.client.post(url_again).json(&renamed);
+            if let Some(key) = self.config.api_key.as_ref().filter(|k| !k.is_empty()) {
+                again = again.bearer_auth(key.expose());
+            }
+            response = match tokio::time::timeout_at(first_deadline.into(), again.send()).await {
+                Err(_) => return Err(first_wait_error()),
+                Ok(Err(e)) => return Err(send_failed(endpoint, &e)),
+                Ok(Ok(r)) => r,
+            };
+            status = response.status();
+            if !status.is_success() {
+                let raw = tokio::time::timeout(Duration::from_secs(30), response.text()).await.ok().and_then(Result::ok).unwrap_or_default();
+                let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                let detail = value.pointer("/error/message").or_else(|| value.get("error")).and_then(Value::as_str).unwrap_or("request rejected");
+                return Err(self.rejected(endpoint, status, detail));
+            }
         }
 
         let mut parser = StreamParser::new(wire);
@@ -541,6 +604,23 @@ impl LlmHandle {
         parser.finish().map_err(|detail| llm_failed(endpoint, &detail))
     }
 }
+
+/// The request field that caps the reply: OpenAI's name for it, or the
+/// common one every other OpenAI-style server knows.
+fn token_limit_field(host: &str) -> &'static str {
+    if host == "api.openai.com" {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// How long a successful Ollama probe is remembered.
+const PROBE_TTL: Duration = Duration::from_secs(600);
+
+type ProbeKey = (String, String);
+/// Ollama probe answers, by (server root, model): when learned, and the `think` value.
+static OLLAMA_PROBES: std::sync::LazyLock<Mutex<std::collections::HashMap<ProbeKey, (Instant, Option<Value>)>>> = std::sync::LazyLock::new(Default::default);
 
 struct Reply {
     text: Option<String>,
@@ -1125,7 +1205,10 @@ long</think>
         // What the window has left after a long prompt (90% of it, 3 characters a token).
         assert_eq!(budget(32768, 75_000, 2048, true), 32768 * 9 / 10 - 25_000);
         // Never under the floor.
-        assert_eq!(budget(4096, 300, 2048, false), 2048);
+        assert_eq!(budget(8192, 300, 2048, false), 2048);
+        // ...but the floor itself is held to a quarter of a small window.
+        assert_eq!(budget(4096, 300, 2048, false), 1024);
+        assert_eq!(budget(2048, 300, 2048, false), 512);
         assert_eq!(budget(32768, 90_000, 2048, false), 2048);
     }
 
@@ -1379,5 +1462,71 @@ long</think>
         let info = server_info(&http_client(), &config(&base, 8192)).await;
         assert!(!info.ollama);
         assert!(info.warnings[0].starts_with("AegisWin can set the context window only on Ollama."));
+    }
+
+    #[tokio::test]
+    async fn the_smallest_context_window_still_sends_requests() {
+        let (base, server) = crate::testing::mock_llm("ok").await;
+        let answer = sized(&base, MIN_CONTEXT_TOKENS).complete("sys", json!({ "q": 1 })).await.unwrap();
+        assert_eq!(answer.text, "ok");
+        // The reply is held to a quarter of the window, not the 2048 default.
+        assert_eq!(body_of(&server.await.unwrap())["max_tokens"], 512);
+        let small = sized("http://127.0.0.1:9/v1", MIN_CONTEXT_TOKENS);
+        let must = LlmOptions { must_fit: true, ..LlmOptions::default() };
+        assert!(small.room_chars("sys", must) > 1000);
+        // Reaches the network (refused connection), not the size check.
+        let err = small.complete_with("sys", json!("x".repeat(500)), must).await.unwrap_err();
+        assert!(!err.message.contains("context window set"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn a_must_fit_request_over_the_character_cap_gets_its_own_error() {
+        let big = "x".repeat(MAX_PROMPT_CHARS + 2000); // fits a 32768-token window
+        let options = LlmOptions { must_fit: true, ..LlmOptions::default() };
+        let err = sized("http://127.0.0.1:9/v1", 32768).complete_with("sys", json!(big), options).await.unwrap_err();
+        assert!(err.message.contains("characters") && !err.message.contains("context window"), "{}", err.message);
+    }
+
+    #[test]
+    fn openai_gets_max_completion_tokens() {
+        assert_eq!(token_limit_field("api.openai.com"), "max_completion_tokens");
+        assert_eq!(token_limit_field("api.example.com"), "max_tokens");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_rejects_max_tokens_is_asked_again_with_the_new_name() {
+        let refused = json!({ "error": { "message": "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." } }).to_string();
+        let ok = json!({ "choices": [{ "message": { "content": "fine" } }] }).to_string();
+        let (base, server) = crate::testing::mock_replies(vec![("400 Bad Request", refused), ("200 OK", ok)]).await;
+        assert_eq!(handle(&base, false).complete("sys", json!({})).await.unwrap().text, "fine");
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(body_of(&requests[0]).get("max_tokens").is_some());
+        let second = body_of(&requests[1]);
+        assert!(second.get("max_tokens").is_none() && second["max_completion_tokens"].as_u64() > Some(0), "{second}");
+    }
+
+    #[tokio::test]
+    async fn ollama_probes_are_remembered_per_endpoint_and_model() {
+        let (base, server, probes) = crate::testing::mock_ollama_counting(&["{}", "{}", "{}"]).await;
+        let options = LlmOptions { json: true, ..LlmOptions::default() };
+        named(&base, "m1", 8192).complete_with("sys", json!({}), options).await.unwrap();
+        let first = probes.load(Ordering::SeqCst);
+        assert_eq!(first, 2, "version and show");
+        named(&base, "m1", 8192).complete_with("sys", json!({}), options).await.unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), first, "second call reuses the probes");
+        // Another model at the same endpoint is probed again.
+        named(&base, "m2", 8192).complete_with("sys", json!({}), options).await.unwrap();
+        assert!(probes.load(Ordering::SeqCst) > first);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cached_probes_never_skip_the_off_lan_check() {
+        let (base, _server, _) = crate::testing::mock_ollama_counting(&["{}", "{}"]).await;
+        // Warm the cache for a local model, then ask for a cloud model on the same server.
+        named(&base, "m1", 8192).complete("sys", json!({})).await.unwrap();
+        let err = named(&base, "m1:cloud", 8192).complete("sys", json!({})).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::OffLanTrustRequired);
     }
 }
