@@ -796,18 +796,24 @@ impl UsageMonitorPlugin {
         Ok(propose_now)
     }
 
-    /// One AI turn: at most two LLM requests (one retry), each checked
-    /// against the reply format, the conversation, and the rule language.
+    /// One AI turn, each answer checked against the reply format, the
+    /// conversation, and the rule language. One retry budget covers both retry
+    /// layers: the LLM service asks again when an answer is cut off, and this
+    /// turn asks again when an answer is unusable. An unusable answer that
+    /// already took two requests is not retried, and the retry of one that
+    /// took one may itself be asked again once, so at most three requests.
     async fn chat_turn(&self, ctx: &ToolContext, propose_now: bool) -> AegisResult<Value> {
         let llm = ctx.llm()?;
         let session = lock(&self.chat).clone().ok_or_else(chat_ended)?;
         let must = session.must_conclude(propose_now);
         let mut problem: Option<String> = None;
         let mut sent = Value::Null;
+        let mut requests = 0;
         for _ in 0..2 {
             let payload = session.payload(&ctx.enabled_components, must, problem.as_deref());
             let answer = llm.complete_watched(chat::SYSTEM_PROMPT, payload, CHAT_REPLY, &self.chat_progress).await?;
             sent = json!({ "offLan": answer.off_lan, "host": answer.endpoint_host, "model": answer.model, "scrubbed": answer.scrubbed });
+            requests += answer.generations;
             let checked = creator::parse_reply(&answer.text).and_then(|reply| session.accept(&reply, must).map(|()| reply)).and_then(|reply| match reply {
                 creator::Reply::Proposal { rule, reasoning } => rules::validate(&rule, &ctx.enabled_components)
                     .map(|rule| Checked::Proposal(rule, reasoning))
@@ -822,6 +828,9 @@ impl UsageMonitorPlugin {
                     return Ok(view);
                 }
                 Err(p) => problem = Some(p),
+            }
+            if requests >= 2 {
+                break;
             }
         }
         // The owner can reply again (or press "Propose now") to retry.

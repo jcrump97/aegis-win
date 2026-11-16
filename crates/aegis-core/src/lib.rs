@@ -18,6 +18,7 @@ pub mod plan;
 pub mod plugin_data;
 pub mod qr;
 pub mod registry;
+pub mod restart;
 pub mod schema;
 pub mod secret;
 pub mod state;

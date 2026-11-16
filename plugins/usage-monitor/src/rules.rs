@@ -537,13 +537,16 @@ pub struct Evaluator {
     streaks: Vec<u32>,
     last_tick: Option<DateTime<Utc>>,
     last_fired: Option<DateTime<Utc>>,
+    /// Per condition: the newest event the last hit already counted. One log
+    /// entry stays true for [`EVENT_HOLD_MINUTES`], but fires a rule once.
+    counted: Vec<Option<DateTime<Utc>>>,
 }
 
 impl Evaluator {
     /// Takes a rule that has passed [`validate`].
     pub fn new(rule: Rule) -> Self {
         let n = rule.trigger.conditions().len();
-        Self { rule, streaks: vec![0; n], last_tick: None, last_fired: None }
+        Self { rule, streaks: vec![0; n], last_tick: None, last_fired: None, counted: vec![None; n] }
     }
 
     pub fn rule(&self) -> &Rule {
@@ -564,9 +567,25 @@ impl Evaluator {
         s.days.iter().any(|d| d.weekday() == day)
     }
 
+    /// Time of the newest recent log entry an event or crash condition matches.
+    fn newest_event(c: &Condition, tick: &Tick) -> Option<DateTime<Utc>> {
+        let recent = |e: &&ObservedEvent| e.time <= tick.now && (tick.now - e.time).num_minutes() < EVENT_HOLD_MINUTES;
+        let times = |matches: &dyn Fn(&ObservedEvent) -> bool| tick.events.iter().filter(recent).filter(|e| matches(e)).map(|e| e.time).max();
+        match c {
+            Condition::Event { channel, event_id, provider } => {
+                times(&|e| e.channel == *channel && e.event_id == *event_id && provider.as_ref().is_none_or(|p| p.eq_ignore_ascii_case(&e.provider)))
+            }
+            Condition::Crash { process } => times(&|e| {
+                e.channel == Channel::Application
+                    && matches!((e.event_id, e.provider.as_str()), (1000, "Application Error") | (1002, "Application Hang"))
+                    && (process == "*" || names_process(&e.message, process))
+            }),
+            _ => None,
+        }
+    }
+
     fn holds_now(c: &Condition, tick: &Tick) -> bool {
         let named = |process: &str, name: &str| process == "*" || process.eq_ignore_ascii_case(name);
-        let recent = |e: &ObservedEvent| e.time <= tick.now && (tick.now - e.time).num_minutes() < EVENT_HOLD_MINUTES;
         match c {
             Condition::ProcessCpu { process, at_least_percent, .. } => {
                 tick.processes.iter().any(|p| named(process, &p.name) && p.cpu_percent >= *at_least_percent)
@@ -574,15 +593,7 @@ impl Evaluator {
             Condition::ProcessMemory { process, at_least_mb, .. } => tick.processes.iter().any(|p| named(process, &p.name) && p.ram_mb >= *at_least_mb),
             Condition::SystemCpu { at_least_percent, .. } => tick.system_cpu_percent >= *at_least_percent,
             Condition::SystemMemory { at_least_percent, .. } => tick.system_memory_percent >= *at_least_percent,
-            Condition::Event { channel, event_id, provider } => tick.events.iter().any(|e| {
-                e.channel == *channel && e.event_id == *event_id && provider.as_ref().is_none_or(|p| p.eq_ignore_ascii_case(&e.provider)) && recent(e)
-            }),
-            Condition::Crash { process } => tick.events.iter().any(|e| {
-                e.channel == Channel::Application
-                    && matches!((e.event_id, e.provider.as_str()), (1000, "Application Error") | (1002, "Application Hang"))
-                    && (process == "*" || names_process(&e.message, process))
-                    && recent(e)
-            }),
+            Condition::Event { .. } | Condition::Crash { .. } => Self::newest_event(c, tick).is_some(),
             Condition::Foreground { process } => tick.foreground.is_some_and(|f| f.eq_ignore_ascii_case(process)),
         }
     }
@@ -592,6 +603,10 @@ impl Evaluator {
         // A gap breaks every streak; the current sample still counts as the first of a new one.
         // The clock moving backwards counts as a gap too.
         let gap = self.last_tick.is_some_and(|t| !(0..=MAX_TICK_GAP_SECONDS).contains(&(tick.now - t).num_seconds()));
+        // After a backwards step an entry older than the last hit may be a new one.
+        if self.last_tick.is_some_and(|t| tick.now < t) {
+            self.counted.iter_mut().for_each(|c| *c = None);
+        }
         self.last_tick = Some(tick.now);
         let scheduled = self.scheduled(tick);
         if gap || !scheduled {
@@ -606,9 +621,13 @@ impl Evaluator {
             let needed = c.for_seconds().map_or(1, |s| s / SAMPLE_SECONDS).max(1);
             met.push(self.streaks[i] >= needed);
         }
+        // A condition on a log entry only counts while its entry is one no earlier hit used.
+        let conds = self.rule.trigger.conditions();
+        let newest: Vec<Option<DateTime<Utc>>> = conds.iter().map(|c| Self::newest_event(c, tick)).collect();
+        let counts: Vec<bool> = met.iter().enumerate().map(|(i, m)| *m && (newest[i].is_none() || newest[i] > self.counted[i])).collect();
         let fires = match self.rule.trigger {
-            Trigger::All(_) => met.iter().all(|m| *m),
-            Trigger::Any(_) => met.iter().any(|m| *m),
+            Trigger::All(_) => counts.iter().all(|m| *m),
+            Trigger::Any(_) => counts.iter().any(|m| *m),
         };
         // A backwards clock jump ends the cooldown instead of stretching it.
         let cooling = self.last_fired.is_some_and(|t| (0..i64::from(self.rule.cooldown_seconds)).contains(&(tick.now - t).num_seconds()));
@@ -616,7 +635,12 @@ impl Evaluator {
             return None;
         }
         self.last_fired = Some(tick.now);
-        let matched = self.rule.trigger.conditions().iter().zip(&met).filter(|(_, m)| **m).map(|(c, _)| describe_condition(c)).collect();
+        for (i, c) in counts.iter().enumerate() {
+            if *c && newest[i].is_some() {
+                self.counted[i] = newest[i];
+            }
+        }
+        let matched = conds.iter().zip(&counts).filter(|(_, m)| **m).map(|(c, _)| describe_condition(c)).collect();
         Some(Hit { time: tick.now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true), matched })
     }
 }
@@ -844,6 +868,40 @@ mod tests {
         let mut ev2 = Evaluator::new(validate(&any, &all()).unwrap());
         let other_id = ObservedEvent { event_id: 1001, ..crash };
         assert!(ev2.tick(&tick(at(21, 6, 20), &[], &[other_id])).is_none());
+    }
+
+    #[test]
+    fn one_log_entry_fires_a_rule_once_not_every_cooldown() {
+        // #9: the entry stays true for 10 minutes; a 60 s cooldown used to fire about 10 times.
+        let rule = with(example(), |v| {
+            v["trigger"] = json!({ "any": [{ "type": "crash", "process": "game.exe" }] });
+            v["cooldownSeconds"] = json!(60);
+        });
+        let mut ev = Evaluator::new(validate(&rule, &all()).unwrap());
+        let first = [hang(at(21, 0, 0))];
+        let hits = (0..120).filter(|i| ev.tick(&tick(at(21, 0, 5) + chrono::Duration::seconds(5 * i), &[], &first)).is_some()).count();
+        assert_eq!(hits, 1, "one crash, one hit");
+        // A second, later crash fires again.
+        let both = [hang(at(21, 0, 0)), hang(at(21, 9, 0))];
+        assert!(ev.tick(&tick(at(21, 9, 30), &[], &both)).is_some());
+        assert!(ev.tick(&tick(at(21, 10, 40), &[], &both)).is_none());
+        // An entry that arrives during the cooldown fires once, when it ends.
+        let mut ev = Evaluator::new(validate(&rule, &all()).unwrap());
+        assert!(ev.tick(&tick(at(21, 0, 5), &[], &first)).is_some());
+        let later = [hang(at(21, 0, 0)), hang(at(21, 0, 30))];
+        assert!(ev.tick(&tick(at(21, 0, 35), &[], &later)).is_none(), "cooling");
+        assert!(ev.tick(&tick(at(21, 1, 10), &[], &later)).is_some());
+        assert!(ev.tick(&tick(at(21, 1, 15), &[], &later)).is_none());
+    }
+
+    #[test]
+    fn an_event_and_a_sustained_condition_fire_once_per_entry() {
+        // The example rule: busy game.exe for 12 s while an event 1002 is logged.
+        let mut ev = Evaluator::new(validate(&example(), &all()).unwrap());
+        let hot = [proc("game.exe", 90.0, 1)];
+        let events = [hang(at(20, 59, 0))];
+        let hits = (0..200).filter(|i| ev.tick(&tick(at(21, 0, 0) + chrono::Duration::seconds(5 * i), &hot, &events)).is_some()).count();
+        assert_eq!(hits, 1);
     }
 
     #[test]

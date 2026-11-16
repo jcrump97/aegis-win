@@ -58,8 +58,8 @@ The governing rule for every part of this design: **the AI proposes, code valida
 | `process_memory` | `process`, `atLeastMb` 64–1048576, `forSeconds` | |
 | `system_cpu` | `atLeastPercent`, `forSeconds` | |
 | `system_memory` | `atLeastPercent`, `forSeconds` | |
-| `event` | `channel` (`Application`, `System`, `Setup`), `eventId` 0–65535, optional `provider` ≤128 | Security is excluded in v1 (admin only). An event counts as "true" for 10 minutes after it occurs, matching the existing crash correlation window. |
-| `crash` | `process` | Application Error 1000 / Application Hang 1002 for that process |
+| `event` | `channel` (`Application`, `System`, `Setup`), `eventId` 0–65535, optional `provider` ≤128 | Security is excluded in v1 (admin only). An event counts as "true" for 10 minutes after it occurs, matching the existing crash correlation window, so it can combine with a condition that needs time to hold. A log entry fires a rule once: after a hit, an entry it already counted does not count again, so one crash is one hit, not one per cooldown (ledger row 102). |
+| `crash` | `process` | Application Error 1000 / Application Hang 1002 for that process; same 10-minute window and once-per-entry rule as `event` |
 | `foreground` | `process` | Needs the `usage-monitor:active-window` component |
 
 - **Fields**: `process` is an executable name (≤260 characters, no path separators) or `"*"` for any process. `schedule.days` is optional (default every day), and equal start and end means all day, as today. `forSeconds` rounds up to the 5-second sample period. `notify` is `"tray"` or `"none"`.
@@ -127,7 +127,7 @@ The loop is driven by Tauri commands (`monitor_chat_start`, `monitor_chat_reply`
   - `{ "proposal": { "rule", "reasoning" } }`
   - `{ "unsupported": { "reason" } }`, for requests outside the vocabulary such as GPU temperature
 
-  Invalid output gets one retry; a second failure ends the turn with "The AI gave an answer AegisWin could not use."
+  Invalid output gets one retry; a second failure ends the turn with "The AI gave an answer AegisWin could not use." The LLM service also asks again once when an answer is cut off (`LlmAnswer.generations` reports 2 then); the two retry layers share one budget: an unusable answer that already took two requests is not retried, so a turn makes at most three LLM generations, never four (ledger row 103; a request an endpoint rejects for its parameter names before generating anything is not a generation).
 
   **Decided in Phase 2:** a fourth reply, `{ "requestRunningApps": { "reason" } }`, is how the AI asks for the one consented lookup below; it is allowed once per conversation. `reasoning` may be a string or 1-3 strings (bullets), cleaned of hidden characters and cut to 600 characters in total. Each reply is one JSON object with exactly one of these keys and no unknown fields; text around it or a code fence is tolerated.
 - **Limits:**
