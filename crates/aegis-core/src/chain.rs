@@ -471,6 +471,15 @@ mod tests {
     }
 
     #[test]
+    fn the_ratchet_and_the_mac_match_known_answers() {
+        // SHA-256 and HMAC-SHA256 values computed with another implementation (Node's crypto), so a
+        // sha2 or hmac bump that changes them is caught: stored history would stop verifying (issue #94).
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        assert_eq!(hex::encode(ratchet(&key).as_ref()), "3150cc39cc5a0636a194cb983850eebfac87ecf444eec7a51d6f9c5047d3ad6b");
+        assert_eq!(hex::encode(mac(&key, b"aegis known answer")), "5bba3b950ef4ff9e9f3c7c0cd8c6b6247c40707301679b06851c9566acb3291d");
+    }
+
+    #[test]
     fn records_link_and_verify_and_the_ratchet_moves_on() {
         let (mut w, vault) = writer();
         let mut check = MacCheck::new(Some(&vault));
