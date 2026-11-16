@@ -715,9 +715,10 @@ mod tests {
         assert!(cases.len() >= 5);
         assert!(cases.iter().any(|c| c.params == KdfParams::DEFAULT) && cases.iter().any(|c| c.params == KdfParams::FLOOR), "the real parameters are covered");
         assert!(cases.iter().any(|c| !c.secret.is_ascii()), "a secret outside ASCII is covered");
-        for c in &cases {
+        for (i, c) in cases.iter().enumerate() {
             let key = derive_key(&c.secret, &hex::decode(&c.salt).unwrap(), &c.params).unwrap();
-            assert_eq!(hex::encode(key.as_ref()), c.key, "{:?} {:?}", c.secret, c.params);
+            // A failure names the case by its position, never by its secret (the PIN rule holds in tests too).
+            assert_eq!(hex::encode(key.as_ref()), c.key, "case {i} {:?}", c.params);
         }
     }
 
