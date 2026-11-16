@@ -6,7 +6,9 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 import { ATTRIBUTION_PATTERN, PREFIXES, checkMessage, checkPrBody, checkPrTitle } from '../scripts/check-commit-messages.mjs';
-import { refusal } from '../.claude/hooks/guard-git.mjs';
+import { isPlain, refusal } from '../.claude/hooks/guard-git.mjs';
+// origin/main's guard before PR #56, untouched: the guard must refuse at least what this refuses on a non-plain line.
+import { refusal as mainRefusal } from './helpers/guard-git-origin-main.mjs';
 import { summary } from '../.claude/hooks/session-issues.mjs';
 import { changedPaths, reason } from '../.claude/hooks/stop-ledger.mjs';
 
@@ -194,6 +196,247 @@ test('Contributor process: the git guard reads git\'s arguments, not any text in
     'git config --get commit.gpgsign',
     'git config commit.gpgsign true',
     'git config core.hooksPath ./.githooks',
+  ]) {
+    assert.equal(refusal(fine), null, fine);
+  }
+});
+
+test('Contributor process: the git guard reads a here-string, config forms, backticks, shell here-documents and aliases (issues #32, #33)', () => {
+  for (const bad of [
+    'grep foo <<< bar\ngit commit --no-verify -m x',
+    'git --config-env=core.hooksPath=X commit -m x',
+    'git --config-env core.hooksPath=X commit -m x',
+    'git --config-env=commit.gpgsign=NOSIGN commit -m x',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=false git commit -m x',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x',
+    'echo `git commit --no-verify -m x`',
+    "bash <<'EOF'\ngit commit --no-verify -m x\nEOF",
+    'git -c alias.ci="commit --no-verify" ci -m x',
+    'git -c alias.ci="!git commit -n" ci',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'cat <<< "git commit -n"',
+    "cat <<'EOF'\ngit commit -n\nEOF",
+    "bash <<'EOF'\ngit status\nEOF",
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=commit.gpgsign GIT_CONFIG_VALUE_0=true git commit -m x',
+    'git --config-env=user.name=NAME commit -m x',
+    'git -c alias.co=checkout co main',
+    'echo `date`',
+  ]) {
+    assert.equal(refusal(fine), null, fine);
+  }
+});
+
+test('Contributor process: the git guard allows an option value or a comment that only mentions a flag (issue #34)', () => {
+  for (const bad of [
+    // A `#` is a comment only after whitespace, `;`, `&`, `|` or at the line start, and never on a cmd line.
+    'echo ${#a}; git commit -n',
+    'echo ${#}; git commit -n',
+    'x=(1 2); echo ${#x[@]}; git commit -n',
+    'echo $(date)#x; git commit -n',
+    'echo ${a}#x; git commit -n',
+    'echo `date`#x; git commit -n',
+    'cmd /c "echo # & git commit -n"',
+    'cmd /c "echo # && git commit -n"',
+    // A backtick is a separator in bash and an escape in PowerShell: both readings are checked.
+    'git status;# git commit -n',
+    'git `commit --no-verify -m x',
+    'git commit `-m x -n',
+    'git commit --no-verify `-m x',
+    // -S is --gpg-sign (attached value) outside log, diff, show, grep and reflog.
+    'git merge -S --no-verify x',
+    'git rebase -S --no-verify main',
+    'git pull -S --no-verify',
+    'git am -S --no-gpg-sign x',
+    'git merge -S --no-gpg-sign x',
+    'git revert -S --no-verify x',
+    'git cherry-pick -S --no-verify x',
+    'git rebase -G --no-verify',
+    'git push --author --no-verify',
+    'git commit -m x -n',
+    'git commit -m a -m b -n',
+    'git commit -m a --no-verify',
+    'git log --grep x --no-verify',
+    'echo hi # note\ngit commit -n -m x',
+    'bash -c "git commit -n"',
+    'bash -lc "git commit -n"',
+    'git -c core.hooksPath=/x commit -m x',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'git commit -m "fix x" -m "-n is now refused"',
+    'git commit -m "fix x" -m "--no-verify is refused"',
+    'git commit --message "--no-verify"',
+    'git log --grep "--no-verify"',
+    'git log -S --no-verify',
+    'git diff -G --no-verify',
+    'git show -S --no-verify',
+    'git rev-list --author --no-verify HEAD',
+    'git status # never use --no-verify',
+    'git status && # git commit -n',
+    'git -c core.hooksPath=.githooks commit -m x',
+    'git commit -m x#y',
+  ]) {
+    assert.ok(isPlain(fine), fine);
+    assert.equal(refusal(fine), null, fine);
+  }
+  // Only a plain line gets the lenient reading: one character outside the allow-list (here a parenthesis, `;#`) keeps it refused.
+  for (const stillRefused of ['git commit -m "(fix) x" -m "-n is now refused"', 'git status;# git commit -n']) {
+    assert.ok(!isPlain(stillRefused) || stillRefused.includes(';#'), stillRefused);
+    assert.match(refusal(stillRefused) ?? '', /^Refused: /, stillRefused);
+  }
+});
+
+test('Contributor process: a line with a character outside the plain set is refused whenever origin/main refused it (review 6 of PR 56)', () => {
+  for (const bad of [
+    'git commit -m x `true` -n',
+    'git push `x` --no-verify',
+    'git commit -m x `a b` -n',
+    'git commit -m x ` -n',
+    'git commit -m a\\ #b -n',
+    'git commit -m a\\\t#b -n',
+    'git commit -m a # -n',
+    'git commit -m a # -n',
+    'git commit -m a\f# -n',
+  ]) {
+    assert.ok(!isPlain(bad), bad);
+    assert.ok(mainRefusal(bad), `origin/main refuses: ${bad}`);
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  // Review 7: a quote glued into a word (a shell spelled `"b"ash`, a flag spelled `--no-"verify"`) makes the line non-plain.
+  for (const bad of [
+    '"b"ash -c "git commit -n"',
+    "s'h' -c \"git commit -n\"",
+    "busybox s'h' -c \"git commit -n\"",
+    'git commit -m x --no-"verify"',
+    "git commit -m x --no-'verify'",
+    'git commit -"n" -m x',
+    'git commit -m a"b"c -n',
+    "git \"commit\" -n",
+  ]) {
+    assert.ok(mainRefusal(bad), `origin/main refuses: ${bad}`);
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+    // A quote only opens at a word start and closes at a word end; `"commit"` alone is fine.
+    assert.equal(isPlain(bad), bad === 'git "commit" -n', bad);
+  }
+  for (const plainLine of ['git status', 'git commit -m "a b" -m c', "git log --grep 'x y'", 'git status # c\ngit log']) assert.ok(isPlain(plainLine), plainLine);
+  for (const notPlain of ['git status `x`', 'git status $x', 'git status (x)', 'git status\r', 'git status é', 'bash x.sh', 'git commit -m "a', "git commit -m ''", 'git commit -m "" -n', 'git status | sh', 'git status\\']) {
+    assert.ok(!isPlain(notPlain), notPlain);
+  }
+  // Property: insert one character outside the plain set anywhere in a set of commands; the guard refuses whatever origin/main refuses.
+  const bases = [
+    'git commit -n -m x', 'git commit --no-verify -m x', 'git commit -m x --no-gpg-sign', 'git -c commit.gpgsign=false commit -m x', 'git -c core.hooksPath=/dev/null commit -m x',
+    'git config core.hooksPath /dev/null', 'git commit -m a -n', 'git push --no-verify', 'git merge -S --no-verify x', 'git commit -m a -m "-n x"', 'git log --grep "--no-verify"',
+    'git status # git commit -n', 'echo a; git commit -n', 'git commit -m "x y" -n', "git commit -m 'x y' --no-verify", 'git commit -anm x', 'git commit -m x\ngit commit -n',
+  ];
+  const odd = ['`', '\\', '$', '(', ')', '{', '}', '<', '>', '%', '^', '!', '*', '?', '~', '@', ' ', ' ', '\f', '\r', 'é', '\u0000', '[', ']'];
+  let checked = 0;
+  for (const base of bases) {
+    for (let i = 0; i <= base.length; i += 1) {
+      for (const c of odd) {
+        for (const line of [base.slice(0, i) + c + base.slice(i), base.slice(0, i) + ' ' + c + ' ' + base.slice(i)]) {
+          assert.ok(!isPlain(line), JSON.stringify(line));
+          if (mainRefusal(line)) {
+            checked += 1;
+            assert.match(refusal(line) ?? '', /^Refused: /, JSON.stringify(line));
+          }
+        }
+      }
+    }
+  }
+  assert.ok(checked > 1000, `the property test exercised ${checked} lines`);
+  // Property: quote characters inserted at every position, and single characters of each word wrapped in quotes,
+  // in commands with and without a shell: the guard still refuses whatever origin/main refuses.
+  const quoteBases = [...bases, 'bash -c "git commit -n"', 'sh -c "git commit --no-verify -m x"', 'busybox sh -c "git commit -n"', 'env bash -c "git commit -n"', 'sudo git commit -n', 'cmd /c "git commit -n"', 'pwsh -c "git commit --no-verify"', 'git commit -m x -n'];
+  let quoted = 0;
+  const variants = (base) => {
+    const out = [];
+    for (let i = 0; i <= base.length; i += 1) for (const q of ["'", '"']) out.push(base.slice(0, i) + q + base.slice(i), base.slice(0, i) + q + q + base.slice(i));
+    for (let i = 0; i < base.length; i += 1) for (const q of ["'", '"']) if (/\S/.test(base[i])) out.push(base.slice(0, i) + q + base[i] + q + base.slice(i + 1));
+    for (let i = 0; i + 1 < base.length; i += 1) for (const q of ["'", '"']) if (/\S\S/.test(base.slice(i, i + 2))) out.push(base.slice(0, i) + q + base.slice(i, i + 2) + q + base.slice(i + 2));
+    return out;
+  };
+  for (const base of quoteBases) {
+    for (const line of variants(base)) {
+      // A plain line may be allowed where main refused it: that is the #34 allowance (e.g. `-m "-n' x"`).
+      if (!isPlain(line) && mainRefusal(line)) {
+        quoted += 1;
+        assert.match(refusal(line) ?? '', /^Refused: /, JSON.stringify(line));
+      }
+    }
+  }
+  assert.ok(quoted > 1000, `the quote property test exercised ${quoted} lines`);
+});
+
+test('Contributor process: the git guard reads a command given to any shell invocation form (issue #65)', () => {
+  for (const bad of [
+    'powershell "git commit -n"',
+    'pwsh -NoProfile "git commit -n"',
+    'pwsh -NoProfile -Command "git commit -n"',
+    'powershell.exe -ExecutionPolicy Bypass "git commit --no-verify -m x"',
+    'bash -ce "git commit -n"',
+    'sh -ec "git commit --no-verify -m x"',
+    'bash -o pipefail -c "git commit -n"',
+    'cmd /c "git commit -n"',
+    'cmd /k "git commit -n"',
+    'cmd /r "git commit -n"',
+    'cmd "git commit -n"',
+    // -File only counts before the command: after it, everything is command text.
+    'pwsh -Command "git commit -n" -File',
+    'pwsh -c "git commit --no-verify" -f x.ps1',
+    'powershell -Command "git commit -n" -fi',
+    'pwsh "git commit -n" -File',
+    'pwsh /command "git commit -n" /file',
+    'pwsh -Command "git -c commit.gpgsign=false commit -m x" -File',
+    'pwsh "git commit --no-gpg-sign -m x" -File',
+    'pwsh -ExecutionPolicy Bypass "git commit -n" -File',
+    // Third review: a shell is denied by default; only a plain script path after no flags is allowed.
+    'bash +c "git commit -n"',
+    'bash +ec "git commit -n"',
+    'bash +xc "git commit -n"',
+    "bash $'-c' \"git commit -n\"",
+    'bash -$\'c\' "git commit -n"',
+    'f=-c; bash $f "git commit -n"',
+    'bash <<< "git commit -n"',
+    'bash -s <<< "git commit -n"',
+    'bash -i <<< "git commit -n"',
+    'sh -s <<< "git commit -n"',
+    'pwsh -File - <<< "git commit -n"',
+    'powershell -ExecutionPolicy -File "git commit -n"',
+    'env X=/bin/sh pwsh "git commit -n"',
+    'bash -x script.sh "git commit -n"',
+    'bash -- script.sh "git commit -n"',
+    'bash script.sh <<< "git commit -n"',
+    'pwsh -f x.ps1 "git commit -n"',
+    'pwsh -NoProfile -ExecutionPolicy Bypass -File x.ps1 "git commit -n"',
+    'powershell /file x.ps1 "git commit -n"',
+    'pwsh -File x.ps1 -File "git commit -n" <<< y',
+    'bash script.sh bash "git commit -n"',
+    'sudo bash script.sh "git commit -n"',
+    // Fourth review: a shell's later arguments are expanded by the outer shell, and a script path can read stdin.
+    'bash x.sh "$(git commit -n)"',
+    'bash x.sh "`git commit -n`"',
+    'bash x.sh "a${b:-$(git commit -n)}"',
+    'pwsh -File x.ps1 "$(git commit -n)"',
+    "bash x.sh $'a\\'b'; git commit -n",
+    'echo "git commit -n" | bash /dev/stdin "git commit -n"',
+    // No script-run exception: text mentioning a flag is refused too (a false refusal, accepted; part of #34 not delivered).
+    'bash scripts/x.sh "explain git commit -n"',
+    'sh ./x.sh "git commit -n"',
+    'zsh x.sh -c "explain git commit -n"',
+    'pwsh -File x.ps1 "explain git commit -n"',
+    'pwsh -NoProfile -NonInteractive -File x.ps1 "explain git commit -n"',
+    'powershell -NoLogo -file scripts\\x.ps1 "explain git commit -n"',
+  ]) {
+    assert.match(refusal(bad) ?? '', /^Refused: /, bad);
+  }
+  for (const fine of [
+    'bash scripts/x.sh',
+    'bash -c "git status"',
+    'pwsh -NoProfile "git status"',
   ]) {
     assert.equal(refusal(fine), null, fine);
   }
