@@ -269,3 +269,48 @@ test('Contributor process: Dependabot covers every manifest and its commits and 
   }
   assert.equal(checkMessage('(chore): Bump serde from 1.0.0 to 1.0.1').length, 1, 'the colon form is refused');
 });
+
+test('Contributor process: every Dependabot entry groups its minor and patch updates, as the config comment and the ledger say (issue #44)', () => {
+  const entries = fs.readFileSync('.github/dependabot.yml', 'utf8').split(/^  - package-ecosystem: /m).slice(1);
+  assert.equal(entries.length, 4);
+  for (const entry of entries) {
+    assert.match(entry, /^    groups:\r?\n      [a-z-]+-minor-and-patch:\r?\n        update-types: \[minor, patch\]\r?$/m, `${entry.split(/\r?\n/)[0]} ${entry.match(/^    directory: (\S+)/m)[1]} has a minor-and-patch group`);
+  }
+});
+
+test('Contributor process: Tauri minor and major bumps are left to a paired manual bump, and the lockfiles must agree (issue #42)', () => {
+  const config = fs.readFileSync('.github/dependabot.yml', 'utf8');
+  const entries = config.split(/^  - package-ecosystem: /m).slice(1);
+  const ignored = (eco, dir) => entries.find((e) => e.startsWith(eco) && new RegExp('^    directory: ' + dir + '\\r?$', 'm').test(e)).match(/^    ignore:[\s\S]*?(?=^    (?!  )\S|(?![\s\S]))/m)?.[0] ?? '';
+  const cargo = ignored('cargo', '/');
+  const npm = ignored('npm', '/');
+  for (const name of ['tauri', 'tauri-build']) assert.ok(cargo.includes(`dependency-name: "${name}"`), `cargo ignores ${name}`);
+  assert.ok(npm.includes('dependency-name: "@tauri-apps/*"'), 'npm ignores @tauri-apps/*');
+  for (const block of [cargo, npm]) {
+    assert.ok(block.includes('version-update:semver-minor') && block.includes('version-update:semver-major'));
+    assert.ok(!block.includes('semver-patch'), 'patch updates still arrive');
+  }
+  assert.match(config, /pair|together/i, 'the config explains the manual paired bump');
+  // The CLI refuses to build when the crate and the JavaScript packages differ in major.minor.
+  const crate = fs.readFileSync('Cargo.lock', 'utf8').match(/name = "tauri"\r?\nversion = "(\d+\.\d+)\./)[1];
+  const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).packages;
+  for (const pkg of ['@tauri-apps/api', '@tauri-apps/cli']) {
+    assert.equal(lock[`node_modules/${pkg}`].version.split('.').slice(0, 2).join('.'), crate, `${pkg} and the tauri crate share major.minor`);
+  }
+  assert.match(fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8') + fs.readFileSync('AGENTS.md', 'utf8'), /@tauri-apps/);
+});
+
+test('Contributor process: the rules say how Dependabot commits meet the test and ledger rules (issue #41)', () => {
+  const agents = fs.readFileSync('AGENTS.md', 'utf8');
+  assert.match(agents, /Dependabot/);
+  assert.match(agents, /dependency update by Dependabot[^\n]*(needs neither|no new test|no ledger row)/i);
+  assert.match(agents, /maintainer[^\n]*ledger row[^\n]*(merg|group)/i);
+});
+
+test('Contributor process: AGENTS.md and the review skill agree on where a must-fix review finding is recorded (issue #43)', () => {
+  const agents = fs.readFileSync('AGENTS.md', 'utf8');
+  const skill = fs.readFileSync('.claude/skills/review-pr/SKILL.md', 'utf8');
+  assert.match(agents, /must-fix review finding may stay in the PR comment until merge/);
+  assert.match(agents, /the author files it as an issue before merge/);
+  assert.match(skill, /the author files it as an issue before merge/);
+});
