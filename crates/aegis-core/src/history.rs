@@ -86,7 +86,7 @@ pub struct PublicStreamKey {
 
 impl StreamKey {
     pub fn generate() -> Self {
-        let (sk, pk) = Kem::gen_keypair(&mut OsRng);
+        let (sk, pk) = Kem::gen_keypair_with_rng(&mut OsRng);
         let public = pk.to_bytes();
         let private = Zeroizing::new(sk.to_bytes().to_vec());
         Self { key_id: key_id(&public), public_key: hex::encode(public), private_key: Secret::new(hex::encode(private.as_slice())) }
@@ -140,26 +140,25 @@ fn frame_aad(header_hash: &[u8; 32], index: u64) -> [u8; 40] {
     aad
 }
 
-/// `rand_core` 0.6 interface over the OS generator (`getrandom`).
+/// `rand_core` interface (the version `hpke` uses) over the OS generator (`getrandom`). It cannot fail: no generator is fatal.
 struct OsRng;
 
-impl rand_core::RngCore for OsRng {
-    fn next_u32(&mut self) -> u32 {
-        rand_core::impls::next_u32_via_fill(self)
+impl hpke::rand_core::TryRng for OsRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        hpke::rand_core::utils::next_word_via_fill(self)
     }
-    fn next_u64(&mut self) -> u64 {
-        rand_core::impls::next_u64_via_fill(self)
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        hpke::rand_core::utils::next_word_via_fill(self)
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         getrandom::fill(dest).expect("the OS random number generator is unavailable");
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl rand_core::CryptoRng for OsRng {}
+impl hpke::rand_core::TryCryptoRng for OsRng {}
 
 /// How long a stream keeps its files. Oldest files go first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,7 +352,7 @@ impl SegmentWriter {
         let name = SegmentName { day, n: next };
         let path = self.dir.join(name.file_name());
         let pk = self.key.key()?;
-        let (enc, ctx) = hpke::setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &pk, &info(&self.stream, &self.key.key_id), &mut OsRng)
+        let (enc, ctx) = hpke::setup_sender_with_rng::<Aead, Kdf, Kem>(&OpModeS::Base, &pk, &info(&self.stream, &self.key.key_id), &mut OsRng)
             .map_err(|e| invalid(&format!("HPKE setup failed: {e}")))?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);
@@ -876,15 +875,28 @@ mod tests {
     fn the_suite_matches_the_cfrg_known_answer_vector() {
         let h = |s: &str| hex::decode(s).unwrap();
         let (sk, pk) = Kem::derive_keypair(&h("dac33b0e9db1b59dbbea58d59a14e7b5896e9bdf98fad6891e99d1686492b9ee"));
-        assert_eq!(sk.to_bytes().to_vec(), h("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d"));
+        // The RFC prints the private key before X25519 clamping, and that is the form an existing
+        // vault stores. A library may hand back the clamped form of the same key, so compare clamped.
+        let rfc_sk = h("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d");
+        let clamped = |mut b: Vec<u8>| {
+            b[0] &= 248;
+            b[31] = (b[31] & 127) | 64;
+            b
+        };
+        assert_eq!(clamped(sk.to_bytes().to_vec()), clamped(rfc_sk.clone()));
         assert_eq!(pk.to_bytes().to_vec(), h("430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c"));
         let enc = EncappedKey::from_bytes(&h("6c93e09869df3402d7bf231bf540fadd35cd56be14f97178f0954db94b7fc256")).unwrap();
-        let mut ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &sk, &enc, &h("4f6465206f6e2061204772656369616e2055726e")).unwrap();
         let pt = h("4265617574792069732074727574682c20747275746820626561757479");
         let ct0 = h("e5d84cd531cfb583096e7cfa9641bd3079cf3a91cda813c52deb5f512be9931980a41de125a925cdad859d5b7a");
         let ct1 = h("2c43aff25343fdbff864506f0818b9d87df84ea01b1a2144d23b4d40c26bf655fdf197fe40297a8aebeed5cc2d");
-        assert_eq!(ctx.open(&ct0, &h("436f756e742d30")).unwrap(), pt);
-        assert_eq!(ctx.open(&ct1, &h("436f756e742d31")).unwrap(), pt);
+        // The derived key, and the same key read back from its stored bytes in either form, open the messages.
+        let stored = PrivateKey::from_bytes(&rfc_sk).unwrap();
+        let stored_clamped = PrivateKey::from_bytes(&clamped(rfc_sk)).unwrap();
+        for key in [&sk, &stored, &stored_clamped] {
+            let mut ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, key, &enc, &h("4f6465206f6e2061204772656369616e2055726e")).unwrap();
+            assert_eq!(ctx.open(&ct0, &h("436f756e742d30")).unwrap(), pt);
+            assert_eq!(ctx.open(&ct1, &h("436f756e742d31")).unwrap(), pt);
+        }
     }
 
     /// Checks this module drives the crate correctly: a frame on disk opens

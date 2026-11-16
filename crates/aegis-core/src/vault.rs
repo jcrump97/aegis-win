@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -198,7 +198,7 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 fn cipher(key: &[u8; 32]) -> Aes256Gcm {
-    Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key))
+    Aes256Gcm::new(key.into())
 }
 
 pub fn vault_exists(path: &Path) -> bool {
@@ -239,7 +239,7 @@ impl Wrapped {
     fn seal(kek: &[u8; 32], data_key: &[u8; 32], kind: Kind, params: KdfParams, salt: [u8; SALT_LEN]) -> Result<Self, VaultError> {
         let nonce = random_bytes::<NONCE_LEN>();
         let ciphertext = cipher(kek)
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: data_key, aad: &kind.aad(&params, &salt) })
+            .encrypt((&nonce).into(), Payload { msg: data_key, aad: &kind.aad(&params, &salt) })
             .map_err(|_| VaultError::Corrupt("encryption failed".into()))?;
         Ok(Self { kind, params, salt, nonce, ciphertext })
     }
@@ -248,7 +248,7 @@ impl Wrapped {
     fn open(&self, secret: &str) -> Option<Zeroizing<[u8; 32]>> {
         let kek = derive_key(secret, &self.salt, &self.params).ok()?;
         let plain = Zeroizing::new(
-            cipher(&kek).decrypt(Nonce::from_slice(&self.nonce), Payload { msg: &self.ciphertext, aad: &self.kind.aad(&self.params, &self.salt) }).ok()?,
+            cipher(&kek).decrypt((&self.nonce).into(), Payload { msg: &self.ciphertext, aad: &self.kind.aad(&self.params, &self.salt) }).ok()?,
         );
         let key: [u8; 32] = plain.as_slice().try_into().ok()?;
         Some(Zeroizing::new(key))
@@ -357,7 +357,7 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
                 let key = open_any(&pass, this_pc.as_ref(), secret).ok_or(VaultError::WrongPin)?;
                 // A short PIN made for an older copy of the vault opens a stale key.
                 let plain = Zeroizing::new(
-                    cipher(&key).decrypt(Nonce::from_slice(&nonce), Payload { msg: &ciphertext, aad: STATE_AAD }).map_err(|_| VaultError::WrongPin)?,
+                    cipher(&key).decrypt((&nonce).into(), Payload { msg: &ciphertext, aad: STATE_AAD }).map_err(|_| VaultError::WrongPin)?,
                 );
                 let state = serde_json::from_slice(&plain).map_err(|e| VaultError::Corrupt(e.to_string()))?;
                 Ok(Self { path: path.to_path_buf(), pass, this_pc, key, state })
@@ -373,7 +373,7 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
         let kek = derive_key(secret, &salt, &params)?;
         let plain = Zeroizing::new(
             cipher(&kek)
-                .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: &aad_v1(&params, &salt) })
+                .decrypt(nonce.into(), Payload { msg: ciphertext, aad: &aad_v1(&params, &salt) })
                 .map_err(|_| VaultError::WrongPin)?,
         );
         let state = serde_json::from_slice(&plain).map_err(|e| VaultError::Corrupt(e.to_string()))?;
@@ -391,7 +391,7 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
         let plaintext = Zeroizing::new(serde_json::to_vec(&self.state).map_err(|e| VaultError::Corrupt(e.to_string()))?);
         let nonce = random_bytes::<NONCE_LEN>();
         let ciphertext = cipher(&self.key)
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &plaintext, aad: STATE_AAD })
+            .encrypt((&nonce).into(), Payload { msg: &plaintext, aad: STATE_AAD })
             .map_err(|_| VaultError::Corrupt("encryption failed".into()))?;
         let Kind::Passphrase { meets_rule } = self.pass.kind else { unreachable!("the header wrap is the passphrase wrap") };
         let file = VaultFile {
@@ -609,7 +609,7 @@ mod tests {
         let nonce = random_bytes::<NONCE_LEN>();
         let key = derive_key(pin, &salt, &params).unwrap();
         let plain = serde_json::to_vec(state).unwrap();
-        let ct = cipher(&key).encrypt(Nonce::from_slice(&nonce), Payload { msg: &plain, aad: &aad_v1(&params, &salt) }).unwrap();
+        let ct = cipher(&key).encrypt((&nonce).into(), Payload { msg: &plain, aad: &aad_v1(&params, &salt) }).unwrap();
         let file = serde_json::json!({"version": 1, "kdf": "argon2id", "params": params, "salt": hex::encode(salt), "nonce": hex::encode(nonce), "ciphertext": hex::encode(ct)});
         fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
     }
@@ -693,6 +693,64 @@ mod tests {
         assert_eq!(file["passphrase"], false);
         // The same PIN still opens it until the owner chooses (D2).
         assert!(!UnlockedVault::<Demo>::unlock(&path, "135790").unwrap().meets_passphrase_rule());
+    }
+
+    /// A fixture written by the library versions in use before any crypto dependency bump (issue #94).
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    #[test]
+    fn argon2id_output_matches_the_stored_known_answers() {
+        // Keys derived with argon2 0.5.3. If a dependency bump changes one of them, every existing
+        // vault stops opening: do not update the file, find out why the output changed.
+        #[derive(Deserialize)]
+        struct Case {
+            secret: String,
+            salt: String,
+            params: KdfParams,
+            key: String,
+        }
+        let cases: Vec<Case> = serde_json::from_slice(&fs::read(fixture("kdf-known-answer.json")).unwrap()).unwrap();
+        assert!(cases.len() >= 5);
+        assert!(cases.iter().any(|c| c.params == KdfParams::DEFAULT) && cases.iter().any(|c| c.params == KdfParams::FLOOR), "the real parameters are covered");
+        assert!(cases.iter().any(|c| !c.secret.is_ascii()), "a secret outside ASCII is covered");
+        for (i, c) in cases.iter().enumerate() {
+            let key = derive_key(&c.secret, &hex::decode(&c.salt).unwrap(), &c.params).unwrap();
+            // A failure names the case by its position, never by its secret (the PIN rule holds in tests too).
+            assert_eq!(hex::encode(key.as_ref()), c.key, "case {i} {:?}", c.params);
+        }
+    }
+
+    #[test]
+    fn a_stored_format_2_vault_still_opens() {
+        // Written by UnlockedVault::create with the real parameters (argon2 0.5.3, aes-gcm 0.10.3).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        fs::copy(fixture("vault-format-2.json"), &path).unwrap();
+        let stored = fs::read(&path).unwrap();
+        assert!(matches!(UnlockedVault::<Demo>::unlock(&path, "correct-horse-batterx"), Err(VaultError::WrongPin)));
+        let mut v = UnlockedVault::<Demo>::unlock(&path, PASS).unwrap();
+        assert_eq!(v.state, demo());
+        assert!(v.meets_passphrase_rule());
+        assert_eq!(fs::read(&path).unwrap(), stored, "unlocking does not rewrite a format 2 vault");
+        // Saved again by this build, the same passphrase still opens it.
+        v.state.n = 8;
+        v.save().unwrap();
+        assert_eq!(UnlockedVault::<Demo>::unlock(&path, PASS).unwrap().state.n, 8);
+    }
+
+    #[test]
+    fn a_stored_format_1_vault_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        fs::copy(fixture("vault-format-1.json"), &path).unwrap();
+        assert!(matches!(UnlockedVault::<Demo>::unlock(&path, "135791"), Err(VaultError::WrongPin)));
+        assert_eq!(UnlockedVault::<Demo>::unlock(&path, "135790").unwrap().state, demo());
+        // It was rewritten as format 2, and the same PIN opens the rewritten file.
+        let file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file["version"], 2);
+        assert_eq!(UnlockedVault::<Demo>::unlock(&path, "135790").unwrap().state, demo());
     }
 
     #[test]
@@ -815,3 +873,4 @@ mod tests {
         assert_eq!(g.consecutive_failures(), 0);
     }
 }
+

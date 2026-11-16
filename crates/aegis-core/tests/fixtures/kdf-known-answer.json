@@ -1,0 +1,52 @@
+[
+  {
+    "secret": "correct-horse-battery",
+    "salt": "000102030405060708090a0b0c0d0e0f",
+    "params": {
+      "m_kib": 64,
+      "t": 1,
+      "p": 1
+    },
+    "key": "34dbea9ca72a01c5213def7871feb652daa5784949e5ad284a2abd732a9e95ae"
+  },
+  {
+    "secret": "135790",
+    "salt": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "params": {
+      "m_kib": 64,
+      "t": 1,
+      "p": 1
+    },
+    "key": "c679fa5cc389821f039cc0ea99167f7ecc95eaa68a50fa20da45c41215d4d1f0"
+  },
+  {
+    "secret": "pässwörd-with-ünïcode ✓",
+    "salt": "ffeeddccbbaa99887766554433221100",
+    "params": {
+      "m_kib": 8192,
+      "t": 2,
+      "p": 1
+    },
+    "key": "825df735dc24766868246c2d32442385cca926fe6ea7fec6f62f71d19352394f"
+  },
+  {
+    "secret": "correct-horse-battery",
+    "salt": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "params": {
+      "m_kib": 131072,
+      "t": 3,
+      "p": 1
+    },
+    "key": "b12ec554d7d501ae6de3f67c1a85c7899c3a06e38dcb8e8e1f82206ac592ec30"
+  },
+  {
+    "secret": "correct-horse-battery",
+    "salt": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "params": {
+      "m_kib": 262144,
+      "t": 3,
+      "p": 1
+    },
+    "key": "ce19a94cca31e46c87d1c3f419ef7ce13d4accaa938df05f22de04327d9c06eb"
+  }
+]

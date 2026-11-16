@@ -183,3 +183,18 @@ test('Documentation Audit: the guiding principles in AGENTS.md are numbered in o
   assert.ok(numbers.length >= 7, 'the principles are found');
   assert.deepEqual(numbers, numbers.map((_, i) => i + 1));
 });
+
+test('Documentation Audit: the HPKE crate is pinned exactly and SECURITY_MODEL names the same version', () => {
+  // The vault and history crypto crates move together, by hand (issue #94). A pin that drifts from the
+  // documented version, or a default feature switched on (post-quantum KEM, ChaCha20-Poly1305), is a reviewed change.
+  const manifest = fs.readFileSync('crates/aegis-core/Cargo.toml', 'utf8');
+  const pin = manifest.match(/^hpke = \{ version = "=(\d+\.\d+\.\d+)", default-features = false, features = \["alloc", "x25519", "aes"\] \}\r?$/m);
+  assert.ok(pin, 'hpke is pinned with "=", default features off, and only the alloc, x25519 and aes features');
+  const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
+  assert.ok(sec.includes('**pinned to exactly ' + pin[1] + '**, default features off, features `alloc`, `x25519` and `aes` only'), 'SECURITY_MODEL §10 names the pinned version and features');
+  // aegis-core takes rand_core and x25519-dalek from hpke, so their versions cannot drift from it.
+  assert.doesNotMatch(manifest, /^(rand_core|x25519-dalek) =/m);
+  const lock = fs.readFileSync('Cargo.lock', 'utf8');
+  const versions = [...lock.matchAll(/^name = "hpke"\r?\nversion = "([^"]+)"/gm)].map((m) => m[1]);
+  assert.deepEqual(versions, [pin[1]], 'Cargo.lock has the pinned version, and only that one');
+});
