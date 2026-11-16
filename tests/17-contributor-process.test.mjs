@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
-import { ATTRIBUTION_PATTERN, PREFIXES, checkMessage, checkPrBody } from '../scripts/check-commit-messages.mjs';
+import { ATTRIBUTION_PATTERN, PREFIXES, checkMessage, checkPrBody, checkPrTitle } from '../scripts/check-commit-messages.mjs';
 import { refusal } from '../.claude/hooks/guard-git.mjs';
 import { summary } from '../.claude/hooks/session-issues.mjs';
 import { changedPaths, reason } from '../.claude/hooks/stop-ledger.mjs';
@@ -21,12 +23,87 @@ test('Contributor process: CI checks commit messages with the same rules as the 
   assert.deepEqual(checkPrBody(undefined), []);
 
   // A pull request from a clone without the hooks is still checked.
-  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
-  assert.match(ci, /if: github\.event_name == 'pull_request'/);
+  const ci = fs.readFileSync('.github/workflows/check-messages.yml', 'utf8');
   assert.match(ci, /node scripts\/check-commit-messages\.mjs/);
   assert.match(ci, /BASE_SHA: \$\{\{ github\.event\.pull_request\.base\.sha \}\}/);
   // Untrusted text reaches the script through the environment, never the command line.
   assert.doesNotMatch(ci, /run:.*\$\{\{/);
+});
+
+// The forbidden words are built here so that this file, and the commit and pull request text that
+// quote it, never carry a real footer themselves.
+const GEN = ['Gener', 'ated with'].join('');
+const COA = ['Co-Auth', 'ored-By:'].join('');
+const footers = (name) => [`${GEN} ${name}`, `${GEN} [${name} Code](https://example.com)`, `${GEN} ${name.toLowerCase()}`, `${GEN.toUpperCase()} ${name.toUpperCase()}`];
+
+/** The shell hook's verdict (exit status) for a message, in the UTF-8 locale git runs hooks in. */
+function hookStatus(message) {
+  const file = path.join(os.tmpdir(), `aegis-msg-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  fs.writeFileSync(file, message);
+  const run = spawnSync('sh', ['.githooks/commit-msg', file], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'en_US.UTF-8' } });
+  fs.rmSync(file);
+  return run.status;
+}
+
+test('Contributor process: a message may quote the attribution rule, a real trailer or footer is still refused (issue #37)', () => {
+  // Quoted mentions (double quotes or backticks) pass, in the script, the description check and the hook.
+  const quoted = [
+    `(fix) Refuse a "${GEN} Claude Code" footer`,
+    `(fix) Refuse a \`${GEN} Claude Code\` footer`,
+    `(doc) Note\n\nThe check refuses "${GEN} Claude Code" and a \`${GEN} Copilot\` line.`,
+  ];
+  for (const m of quoted) {
+    assert.deepEqual(checkMessage(m), [], m);
+    assert.equal(hookStatus(m + '\n'), 0, `hook: ${m}`);
+  }
+  assert.deepEqual(checkPrBody(`The hook refuses footers such as "${GEN} [Claude Code](x)" in a description.`), []);
+
+  // Every wrapper a footer can sit behind is still refused: main refused all of these.
+  const wrappers = ['', ' ', '\t', '   ', '> ', '>> ', '- ', '* ', '1. ', '**', '__', '~~', '# ', '[', '(', '<p>', '<b>', '<!-- x -->', '![x](y)', '[x](y) ', 'Powered by AI. ', 'x'.repeat(5000), '\u{1F916} ', '\u{1F916}', '\u200b', '\u00a0', '<a href="u">', '&nbsp;', ': '];
+  for (const wrapper of wrappers) {
+    for (const footer of footers('Claude').concat(footers('Copilot'), footers('Gemini'), footers('ChatGPT'))) {
+      const line = wrapper + footer;
+      const label = JSON.stringify(line.length > 80 ? line.slice(-60) : line);
+      for (const message of [`(feat) Add\n\n${line}`, `(feat) Add\n\n${line}\n`, `(feat) Add\r\n\r\n${line}\r\n`]) {
+        assert.equal(checkMessage(message).length, 1, `script: ${label}`);
+        assert.equal(checkPrBody(message).length, 1, `body: ${label}`);
+      }
+      // A line starting with # is a comment to the hook (and to git's default cleanup), on main as well.
+      if (wrapper.length < 100 && wrapper !== '# ') assert.equal(hookStatus(`(feat) Add\n\n${line}`), 1, `hook: ${label}`);
+    }
+  }
+  assert.equal(hookStatus(`(feat) Add\n\n${'x'.repeat(5000)}${GEN} Claude`), 1, 'hook: footer after a long line');
+  // Trailers: at the start of a line, any case, the five names; a human co-author stays allowed.
+  for (const name of ['Claude <a@b.c>', 'Anthropic', 'GitHub Copilot <a@b.c>', 'Gemini', 'OpenAI', 'ChatGPT']) {
+    for (const line of [`${COA} ${name}`, `${COA.toLowerCase()} ${name}`]) {
+      assert.equal(checkMessage(`(feat) Add\n\n${line}`).length, 1, line);
+      assert.equal(hookStatus(`(feat) Add\n\n${line}`), 1, `hook: ${line}`);
+    }
+  }
+  assert.deepEqual(checkMessage(`(feat) Add\n\n${COA} Jane Doe <jane@example.com>`), []);
+  assert.equal(hookStatus(`(feat) Add\n\n${COA} Jane Doe <jane@example.com>\n`), 0);
+});
+
+test('Contributor process: the pull request title is checked, and the message check is its own workflow that re-runs on an edit (issues #30, #82, #83)', () => {
+  assert.deepEqual(checkPrTitle('(fix) Resolve DNS timeout'), []);
+  assert.equal(checkPrTitle('Resolve DNS timeout').length, 1);
+  assert.equal(checkPrTitle(undefined).length, 1);
+  const wf = fs.readFileSync('.github/workflows/check-messages.yml', 'utf8');
+  assert.match(wf, /types: \[opened, synchronize, reopened, edited\]/);
+  assert.match(wf, /^  check-messages:/m, 'the job keeps the name check-messages');
+  assert.match(wf, /PR_TITLE: \$\{\{ github\.event\.pull_request\.title \}\}/);
+  assert.match(wf, /PR_BODY: \$\{\{ github\.event\.pull_request\.body \}\}/);
+  assert.match(wf, /cancel-in-progress: true/);
+  assert.match(wf, /group: check-messages-\$\{\{ github\.event\.pull_request\.number \}\}/);
+  assert.doesNotMatch(wf, /run:.*\$\{\{/, 'untrusted text only through env');
+  assert.doesNotMatch(wf, /pull_request_target/);
+  assert.match(wf, /permissions:\r?\n {2}contents: read\r?\n {2}pull-requests: read/);
+  assert.doesNotMatch(wf, /: write/, 'no write permission');
+  // The build workflow keeps main's triggers, so its required job is never skipped by an edit.
+  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+  assert.doesNotMatch(ci, /edited/);
+  assert.doesNotMatch(ci, /github\.event\.action/);
+  assert.doesNotMatch(ci, /check-commit-messages/);
 });
 
 test('Contributor process: the commit message check passes on this repository\'s own history', () => {
@@ -138,6 +215,11 @@ test('Contributor process: the session-start issue list shows only maintainers\'
   assert.ok(line.length < 140, 'titles are cut');
   assert.match(line, /\[no label\]/, 'a label that is not a plain name is dropped');
   assert.equal(summary([issues[1]]), null);
+  assert.match(text, /maintainers \(2\)\./, 'an uncut list gives its length');
+  const many = Array.from({ length: 45 }, (_, n) => ({ number: n + 1, title: 't', author_association: 'OWNER', labels: [] }));
+  const cut = summary(many);
+  assert.match(cut, /\(40 of 45, run `gh issue list` for the rest\)/, 'a cut list says so');
+  assert.equal(cut.split('\n').filter((l) => l.startsWith('#')).length, 40);
 });
 
 test('Contributor process: the stop check asks for a ledger row only when code changed without one', () => {
@@ -146,6 +228,10 @@ test('Contributor process: the stop check asks for a ledger row only when code c
   assert.match(reason(paths), /AUDIT_LEDGER\.md did not/);
   assert.equal(reason([...paths, 'documentation/AUDIT_LEDGER.md']), null);
   assert.equal(reason(['README.md', 'documentation/ARCHITECTURE.md', 'tests/x.test.mjs']), null, 'documents and tests alone need no reminder');
+  for (const p of ['.claude/hooks/x.mjs', '.claude/settings.json', 'package.json', 'Cargo.toml', 'Cargo.lock', 'vite.config.ts', 'tsconfig.json', 'index.html', 'Start AegisWin.exe']) {
+    assert.match(reason([p]) ?? '', /AUDIT_LEDGER\.md did not/, `${p} is code`);
+  }
+  assert.equal(reason(['README.md', 'AGENTS.md', 'CLAUDE.md', 'docs/package.json.md']), null);
   // It never blocks twice in a row.
   const again = spawnSync(process.execPath, ['.claude/hooks/stop-ledger.mjs'], { input: JSON.stringify({ stop_hook_active: true }), encoding: 'utf8' });
   assert.equal(again.stdout, '');
@@ -182,4 +268,49 @@ test('Contributor process: Dependabot covers every manifest and its commits and 
     assert.match(entry, /^      interval: weekly\r?$/m);
   }
   assert.equal(checkMessage('(chore): Bump serde from 1.0.0 to 1.0.1').length, 1, 'the colon form is refused');
+});
+
+test('Contributor process: every Dependabot entry groups its minor and patch updates, as the config comment and the ledger say (issue #44)', () => {
+  const entries = fs.readFileSync('.github/dependabot.yml', 'utf8').split(/^  - package-ecosystem: /m).slice(1);
+  assert.equal(entries.length, 4);
+  for (const entry of entries) {
+    assert.match(entry, /^    groups:\r?\n      [a-z-]+-minor-and-patch:\r?\n        update-types: \[minor, patch\]\r?$/m, `${entry.split(/\r?\n/)[0]} ${entry.match(/^    directory: (\S+)/m)[1]} has a minor-and-patch group`);
+  }
+});
+
+test('Contributor process: Tauri minor and major bumps are left to a paired manual bump, and the lockfiles must agree (issue #42)', () => {
+  const config = fs.readFileSync('.github/dependabot.yml', 'utf8');
+  const entries = config.split(/^  - package-ecosystem: /m).slice(1);
+  const ignored = (eco, dir) => entries.find((e) => e.startsWith(eco) && new RegExp('^    directory: ' + dir + '\\r?$', 'm').test(e)).match(/^    ignore:[\s\S]*?(?=^    (?!  )\S|(?![\s\S]))/m)?.[0] ?? '';
+  const cargo = ignored('cargo', '/');
+  const npm = ignored('npm', '/');
+  for (const name of ['tauri', 'tauri-build']) assert.ok(cargo.includes(`dependency-name: "${name}"`), `cargo ignores ${name}`);
+  assert.ok(npm.includes('dependency-name: "@tauri-apps/*"'), 'npm ignores @tauri-apps/*');
+  for (const block of [cargo, npm]) {
+    assert.ok(block.includes('version-update:semver-minor') && block.includes('version-update:semver-major'));
+    assert.ok(!block.includes('semver-patch'), 'patch updates still arrive');
+  }
+  assert.match(config, /pair|together/i, 'the config explains the manual paired bump');
+  // The CLI refuses to build when the crate and the JavaScript packages differ in major.minor.
+  const crate = fs.readFileSync('Cargo.lock', 'utf8').match(/name = "tauri"\r?\nversion = "(\d+\.\d+)\./)[1];
+  const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')).packages;
+  for (const pkg of ['@tauri-apps/api', '@tauri-apps/cli']) {
+    assert.equal(lock[`node_modules/${pkg}`].version.split('.').slice(0, 2).join('.'), crate, `${pkg} and the tauri crate share major.minor`);
+  }
+  assert.match(fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8') + fs.readFileSync('AGENTS.md', 'utf8'), /@tauri-apps/);
+});
+
+test('Contributor process: the rules say how Dependabot commits meet the test and ledger rules (issue #41)', () => {
+  const agents = fs.readFileSync('AGENTS.md', 'utf8');
+  assert.match(agents, /Dependabot/);
+  assert.match(agents, /dependency update by Dependabot[^\n]*(needs neither|no new test|no ledger row)/i);
+  assert.match(agents, /maintainer[^\n]*ledger row[^\n]*(merg|group)/i);
+});
+
+test('Contributor process: AGENTS.md and the review skill agree on where a must-fix review finding is recorded (issue #43)', () => {
+  const agents = fs.readFileSync('AGENTS.md', 'utf8');
+  const skill = fs.readFileSync('.claude/skills/review-pr/SKILL.md', 'utf8');
+  assert.match(agents, /must-fix review finding may stay in the PR comment until merge/);
+  assert.match(agents, /the author files it as an issue before merge/);
+  assert.match(skill, /the author files it as an issue before merge/);
 });
