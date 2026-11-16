@@ -6,7 +6,9 @@
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-const CODE = /^(crates|plugins|src|src-tauri|launcher|scripts|\.githooks|\.github)\//;
+// Code, plus what changes how it builds or runs: the Claude Code hooks and
+// settings (`.claude/`) and the root manifests and configs.
+const CODE = /^((crates|plugins|src|src-tauri|launcher|scripts|\.githooks|\.github|\.claude)\/|(package(-lock)?\.json|Cargo\.(toml|lock)|index\.html|vite\.config\.[\w.]+|tsconfig[\w.]*\.json|\.mcp\.json|Start AegisWin\.exe)$)/;
 const LEDGER = 'documentation/AUDIT_LEDGER.md';
 
 /** The paths in `git status --porcelain` output. */

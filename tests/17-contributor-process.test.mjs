@@ -215,6 +215,11 @@ test('Contributor process: the session-start issue list shows only maintainers\'
   assert.ok(line.length < 140, 'titles are cut');
   assert.match(line, /\[no label\]/, 'a label that is not a plain name is dropped');
   assert.equal(summary([issues[1]]), null);
+  assert.match(text, /maintainers \(2\)\./, 'an uncut list gives its length');
+  const many = Array.from({ length: 45 }, (_, n) => ({ number: n + 1, title: 't', author_association: 'OWNER', labels: [] }));
+  const cut = summary(many);
+  assert.match(cut, /\(40 of 45, run `gh issue list` for the rest\)/, 'a cut list says so');
+  assert.equal(cut.split('\n').filter((l) => l.startsWith('#')).length, 40);
 });
 
 test('Contributor process: the stop check asks for a ledger row only when code changed without one', () => {
@@ -223,6 +228,10 @@ test('Contributor process: the stop check asks for a ledger row only when code c
   assert.match(reason(paths), /AUDIT_LEDGER\.md did not/);
   assert.equal(reason([...paths, 'documentation/AUDIT_LEDGER.md']), null);
   assert.equal(reason(['README.md', 'documentation/ARCHITECTURE.md', 'tests/x.test.mjs']), null, 'documents and tests alone need no reminder');
+  for (const p of ['.claude/hooks/x.mjs', '.claude/settings.json', 'package.json', 'Cargo.toml', 'Cargo.lock', 'vite.config.ts', 'tsconfig.json', 'index.html', 'Start AegisWin.exe']) {
+    assert.match(reason([p]) ?? '', /AUDIT_LEDGER\.md did not/, `${p} is code`);
+  }
+  assert.equal(reason(['README.md', 'AGENTS.md', 'CLAUDE.md', 'docs/package.json.md']), null);
   // It never blocks twice in a row.
   const again = spawnSync(process.execPath, ['.claude/hooks/stop-ledger.mjs'], { input: JSON.stringify({ stop_hook_active: true }), encoding: 'utf8' });
   assert.equal(again.stdout, '');
