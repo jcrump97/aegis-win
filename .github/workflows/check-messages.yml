@@ -1,0 +1,39 @@
+name: AegisWin Commit Message Check
+
+# Its own workflow, so an edited title or description re-runs only this check and never
+# touches the build workflow whose job is a required check. Read-only token.
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  check-messages:
+    runs-on: ubuntu-latest
+    # One run per pull request: a newer edit cancels an older run, so results cannot arrive out of order.
+    concurrency:
+      group: check-messages-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Git does not clone core.hooksPath, so a contributor's commits may never have met .githooks/commit-msg.
+      - name: Check Commit Messages (type tag, no AI attribution)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: node scripts/check-commit-messages.mjs
