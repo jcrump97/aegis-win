@@ -86,7 +86,7 @@ pub struct PublicStreamKey {
 
 impl StreamKey {
     pub fn generate() -> Self {
-        let (sk, pk) = Kem::gen_keypair(&mut OsRng);
+        let (sk, pk) = Kem::gen_keypair_with_rng(&mut OsRng);
         let public = pk.to_bytes();
         let private = Zeroizing::new(sk.to_bytes().to_vec());
         Self { key_id: key_id(&public), public_key: hex::encode(public), private_key: Secret::new(hex::encode(private.as_slice())) }
@@ -140,26 +140,25 @@ fn frame_aad(header_hash: &[u8; 32], index: u64) -> [u8; 40] {
     aad
 }
 
-/// `rand_core` 0.6 interface over the OS generator (`getrandom`).
+/// `rand_core` interface (the version `hpke` uses) over the OS generator (`getrandom`). It cannot fail: no generator is fatal.
 struct OsRng;
 
-impl rand_core::RngCore for OsRng {
-    fn next_u32(&mut self) -> u32 {
-        rand_core::impls::next_u32_via_fill(self)
+impl hpke::rand_core::TryRng for OsRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        hpke::rand_core::utils::next_word_via_fill(self)
     }
-    fn next_u64(&mut self) -> u64 {
-        rand_core::impls::next_u64_via_fill(self)
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        hpke::rand_core::utils::next_word_via_fill(self)
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         getrandom::fill(dest).expect("the OS random number generator is unavailable");
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl rand_core::CryptoRng for OsRng {}
+impl hpke::rand_core::TryCryptoRng for OsRng {}
 
 /// How long a stream keeps its files. Oldest files go first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,7 +352,7 @@ impl SegmentWriter {
         let name = SegmentName { day, n: next };
         let path = self.dir.join(name.file_name());
         let pk = self.key.key()?;
-        let (enc, ctx) = hpke::setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &pk, &info(&self.stream, &self.key.key_id), &mut OsRng)
+        let (enc, ctx) = hpke::setup_sender_with_rng::<Aead, Kdf, Kem>(&OpModeS::Base, &pk, &info(&self.stream, &self.key.key_id), &mut OsRng)
             .map_err(|e| invalid(&format!("HPKE setup failed: {e}")))?;
         let mut header = Vec::with_capacity(HEADER_LEN);
         header.extend_from_slice(MAGIC);

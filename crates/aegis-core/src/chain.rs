@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -142,7 +142,7 @@ fn ratchet(key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 }
 
 fn mac(key: &[u8; 32], body: &[u8]) -> [u8; 32] {
-    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC takes any key length");
+    let mut m = <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC takes any key length");
     m.update(body);
     m.finalize().into_bytes().into()
 }
@@ -249,7 +249,7 @@ impl MacCheck {
             key = ratchet(&key);
             n += 1;
         }
-        let mut m = <HmacSha256 as Mac>::new_from_slice(key.as_ref()).expect("HMAC takes any key length");
+        let mut m = <HmacSha256 as KeyInit>::new_from_slice(key.as_ref()).expect("HMAC takes any key length");
         m.update(body);
         let ok = m.verify_slice(tag).is_ok();
         self.at.insert(id.to_owned(), (n, key));
