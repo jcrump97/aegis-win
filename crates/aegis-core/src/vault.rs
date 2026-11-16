@@ -695,6 +695,64 @@ mod tests {
         assert!(!UnlockedVault::<Demo>::unlock(&path, "135790").unwrap().meets_passphrase_rule());
     }
 
+    /// A fixture written by the library versions in use before any crypto dependency bump (issue #94).
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    #[test]
+    fn argon2id_output_matches_the_stored_known_answers() {
+        // Keys derived with argon2 0.5.3. If a dependency bump changes one of them, every existing
+        // vault stops opening: do not update the file, find out why the output changed.
+        #[derive(Deserialize)]
+        struct Case {
+            secret: String,
+            salt: String,
+            params: KdfParams,
+            key: String,
+        }
+        let cases: Vec<Case> = serde_json::from_slice(&fs::read(fixture("kdf-known-answer.json")).unwrap()).unwrap();
+        assert!(cases.len() >= 5);
+        assert!(cases.iter().any(|c| c.params == KdfParams::DEFAULT) && cases.iter().any(|c| c.params == KdfParams::FLOOR), "the real parameters are covered");
+        assert!(cases.iter().any(|c| !c.secret.is_ascii()), "a secret outside ASCII is covered");
+        for (i, c) in cases.iter().enumerate() {
+            let key = derive_key(&c.secret, &hex::decode(&c.salt).unwrap(), &c.params).unwrap();
+            // A failure names the case by its position, never by its secret (the PIN rule holds in tests too).
+            assert_eq!(hex::encode(key.as_ref()), c.key, "case {i} {:?}", c.params);
+        }
+    }
+
+    #[test]
+    fn a_stored_format_2_vault_still_opens() {
+        // Written by UnlockedVault::create with the real parameters (argon2 0.5.3, aes-gcm 0.10.3).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        fs::copy(fixture("vault-format-2.json"), &path).unwrap();
+        let stored = fs::read(&path).unwrap();
+        assert!(matches!(UnlockedVault::<Demo>::unlock(&path, "correct-horse-batterx"), Err(VaultError::WrongPin)));
+        let mut v = UnlockedVault::<Demo>::unlock(&path, PASS).unwrap();
+        assert_eq!(v.state, demo());
+        assert!(v.meets_passphrase_rule());
+        assert_eq!(fs::read(&path).unwrap(), stored, "unlocking does not rewrite a format 2 vault");
+        // Saved again by this build, the same passphrase still opens it.
+        v.state.n = 8;
+        v.save().unwrap();
+        assert_eq!(UnlockedVault::<Demo>::unlock(&path, PASS).unwrap().state.n, 8);
+    }
+
+    #[test]
+    fn a_stored_format_1_vault_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.enc");
+        fs::copy(fixture("vault-format-1.json"), &path).unwrap();
+        assert!(matches!(UnlockedVault::<Demo>::unlock(&path, "135791"), Err(VaultError::WrongPin)));
+        assert_eq!(UnlockedVault::<Demo>::unlock(&path, "135790").unwrap().state, demo());
+        // It was rewritten as format 2, and the same PIN opens the rewritten file.
+        let file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file["version"], 2);
+        assert_eq!(UnlockedVault::<Demo>::unlock(&path, "135790").unwrap().state, demo());
+    }
+
     #[test]
     fn a_new_passphrase_uses_a_new_data_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -815,3 +873,4 @@ mod tests {
         assert_eq!(g.consecutive_failures(), 0);
     }
 }
+
