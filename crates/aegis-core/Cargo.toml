@@ -23,7 +23,7 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 # rand_core and x25519-dalek are not listed: the history code uses hpke's own
 # rand_core (`hpke::rand_core`), and hpke turns on x25519-dalek's zeroize itself.
 hpke = { version = "=0.15.1", default-features = false, features = ["alloc", "x25519", "aes"] }
-getrandom = "0.3"
+getrandom = "0.4"
 hex = "0.4"
 sha2 = "0.11"
 hmac = "0.13"
