@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -198,7 +198,7 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 fn cipher(key: &[u8; 32]) -> Aes256Gcm {
-    Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key))
+    Aes256Gcm::new(key.into())
 }
 
 pub fn vault_exists(path: &Path) -> bool {
@@ -239,7 +239,7 @@ impl Wrapped {
     fn seal(kek: &[u8; 32], data_key: &[u8; 32], kind: Kind, params: KdfParams, salt: [u8; SALT_LEN]) -> Result<Self, VaultError> {
         let nonce = random_bytes::<NONCE_LEN>();
         let ciphertext = cipher(kek)
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: data_key, aad: &kind.aad(&params, &salt) })
+            .encrypt((&nonce).into(), Payload { msg: data_key, aad: &kind.aad(&params, &salt) })
             .map_err(|_| VaultError::Corrupt("encryption failed".into()))?;
         Ok(Self { kind, params, salt, nonce, ciphertext })
     }
@@ -248,7 +248,7 @@ impl Wrapped {
     fn open(&self, secret: &str) -> Option<Zeroizing<[u8; 32]>> {
         let kek = derive_key(secret, &self.salt, &self.params).ok()?;
         let plain = Zeroizing::new(
-            cipher(&kek).decrypt(Nonce::from_slice(&self.nonce), Payload { msg: &self.ciphertext, aad: &self.kind.aad(&self.params, &self.salt) }).ok()?,
+            cipher(&kek).decrypt((&self.nonce).into(), Payload { msg: &self.ciphertext, aad: &self.kind.aad(&self.params, &self.salt) }).ok()?,
         );
         let key: [u8; 32] = plain.as_slice().try_into().ok()?;
         Some(Zeroizing::new(key))
@@ -357,7 +357,7 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
                 let key = open_any(&pass, this_pc.as_ref(), secret).ok_or(VaultError::WrongPin)?;
                 // A short PIN made for an older copy of the vault opens a stale key.
                 let plain = Zeroizing::new(
-                    cipher(&key).decrypt(Nonce::from_slice(&nonce), Payload { msg: &ciphertext, aad: STATE_AAD }).map_err(|_| VaultError::WrongPin)?,
+                    cipher(&key).decrypt((&nonce).into(), Payload { msg: &ciphertext, aad: STATE_AAD }).map_err(|_| VaultError::WrongPin)?,
                 );
                 let state = serde_json::from_slice(&plain).map_err(|e| VaultError::Corrupt(e.to_string()))?;
                 Ok(Self { path: path.to_path_buf(), pass, this_pc, key, state })
@@ -373,7 +373,7 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
         let kek = derive_key(secret, &salt, &params)?;
         let plain = Zeroizing::new(
             cipher(&kek)
-                .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: &aad_v1(&params, &salt) })
+                .decrypt(nonce.into(), Payload { msg: ciphertext, aad: &aad_v1(&params, &salt) })
                 .map_err(|_| VaultError::WrongPin)?,
         );
         let state = serde_json::from_slice(&plain).map_err(|e| VaultError::Corrupt(e.to_string()))?;
@@ -391,7 +391,7 @@ impl<T: Serialize + DeserializeOwned> UnlockedVault<T> {
         let plaintext = Zeroizing::new(serde_json::to_vec(&self.state).map_err(|e| VaultError::Corrupt(e.to_string()))?);
         let nonce = random_bytes::<NONCE_LEN>();
         let ciphertext = cipher(&self.key)
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &plaintext, aad: STATE_AAD })
+            .encrypt((&nonce).into(), Payload { msg: &plaintext, aad: STATE_AAD })
             .map_err(|_| VaultError::Corrupt("encryption failed".into()))?;
         let Kind::Passphrase { meets_rule } = self.pass.kind else { unreachable!("the header wrap is the passphrase wrap") };
         let file = VaultFile {
@@ -609,7 +609,7 @@ mod tests {
         let nonce = random_bytes::<NONCE_LEN>();
         let key = derive_key(pin, &salt, &params).unwrap();
         let plain = serde_json::to_vec(state).unwrap();
-        let ct = cipher(&key).encrypt(Nonce::from_slice(&nonce), Payload { msg: &plain, aad: &aad_v1(&params, &salt) }).unwrap();
+        let ct = cipher(&key).encrypt((&nonce).into(), Payload { msg: &plain, aad: &aad_v1(&params, &salt) }).unwrap();
         let file = serde_json::json!({"version": 1, "kdf": "argon2id", "params": params, "salt": hex::encode(salt), "nonce": hex::encode(nonce), "ciphertext": hex::encode(ct)});
         fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
     }

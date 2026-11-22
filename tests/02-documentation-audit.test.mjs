@@ -183,3 +183,33 @@ test('Documentation Audit: the guiding principles in AGENTS.md are numbered in o
   assert.ok(numbers.length >= 7, 'the principles are found');
   assert.deepEqual(numbers, numbers.map((_, i) => i + 1));
 });
+
+test('Documentation Audit: the HPKE crate is pinned exactly and SECURITY_MODEL names the same version', () => {
+  // The vault and history crypto crates move together, by hand (issue #94). A pin that drifts from the
+  // documented version, or a default feature switched on (post-quantum KEM, ChaCha20-Poly1305), is a reviewed change.
+  const manifest = fs.readFileSync('crates/aegis-core/Cargo.toml', 'utf8');
+  const pin = manifest.match(/^hpke = \{ version = "=(\d+\.\d+\.\d+)", default-features = false, features = \["alloc", "x25519", "aes"\] \}\r?$/m);
+  assert.ok(pin, 'hpke is pinned with "=", default features off, and only the alloc, x25519 and aes features');
+  const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
+  assert.ok(sec.includes('**pinned to exactly ' + pin[1] + '**, default features off, features `alloc`, `x25519` and `aes` only'), 'SECURITY_MODEL §10 names the pinned version and features');
+  // aegis-core takes rand_core and x25519-dalek from hpke, so their versions cannot drift from it.
+  assert.doesNotMatch(manifest, /^(rand_core|x25519-dalek) =/m);
+  const lock = fs.readFileSync('Cargo.lock', 'utf8');
+  const versions = [...lock.matchAll(/^name = "hpke"\r?\nversion = "([^"]+)"/gm)].map((m) => m[1]);
+  assert.deepEqual(versions, [pin[1]], 'Cargo.lock has the pinned version, and only that one');
+});
+
+test('Documentation Audit: SECURITY_MODEL §10 names the file that holds each stored-format test', () => {
+  // A reviewer checking a crypto bump follows these pointers, so each must lead to the test it names.
+  const sec = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
+  const where = {
+    vault: { doc: '(`vault.rs`, reading `crates/aegis-core/tests/fixtures/`)', tests: ['argon2id_output_matches_the_stored_known_answers', 'a_stored_format_2_vault_still_opens', 'a_stored_format_1_vault_still_opens'] },
+    chain: { doc: 'HMAC known answers (`chain.rs`)', tests: ['the_ratchet_and_the_mac_match_known_answers'] },
+    history: { doc: 'read back from its stored bytes (`history.rs`', tests: ['the_suite_matches_the_cfrg_known_answer_vector'] },
+  };
+  for (const [file, { doc, tests }] of Object.entries(where)) {
+    assert.ok(sec.includes(doc), `SECURITY_MODEL §10 points to ${file}.rs`);
+    const src = fs.readFileSync(`crates/aegis-core/src/${file}.rs`, 'utf8');
+    for (const name of tests) assert.match(src, new RegExp(`fn ${name}\\(`), `${file}.rs holds ${name}`);
+  }
+});
