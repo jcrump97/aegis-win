@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "kdf": "argon2id",
+  "params": {
+    "m_kib": 262144,
+    "t": 3,
+    "p": 1
+  },
+  "salt": "0ba45c00574cdc41d105211dcdc4c0dc",
+  "wrap": {
+    "nonce": "a66d3170288ff803b187700d",
+    "ciphertext": "2b6f4ab8a71126d9a298d182077b4d4f966aea0c998ab19e1fb0347d3fa7cb0bf627023a98119d0e7d4cbddcc0706c91"
+  },
+  "passphrase": true,
+  "nonce": "6be8bd5eb3d6c1d23a542fb4",
+  "ciphertext": "6493a897736458289378805dc83b97792cd73782f5c22ebbf395167390a0ffbf50783750c4d8c87c7a84b7c4bc3414"
+}

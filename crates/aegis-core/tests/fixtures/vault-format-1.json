@@ -1,0 +1,1 @@
+{"version":1,"kdf":"argon2id","params":{"m_kib":64,"t":1,"p":1},"salt":"a10e5660281a621fae2f3819d8c28924","nonce":"549669c590d4bbfb47eb76e8","ciphertext":"7443d52b89cf0d1480f2b582ad43531513834a565719cf1ff5044cad67d2734b942b2bd56a5bfd20240792db0ec98f"}

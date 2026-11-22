@@ -876,15 +876,28 @@ mod tests {
     fn the_suite_matches_the_cfrg_known_answer_vector() {
         let h = |s: &str| hex::decode(s).unwrap();
         let (sk, pk) = Kem::derive_keypair(&h("dac33b0e9db1b59dbbea58d59a14e7b5896e9bdf98fad6891e99d1686492b9ee"));
-        assert_eq!(sk.to_bytes().to_vec(), h("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d"));
+        // The RFC prints the private key before X25519 clamping, and that is the form an existing
+        // vault stores. A library may hand back the clamped form of the same key, so compare clamped.
+        let rfc_sk = h("497b4502664cfea5d5af0b39934dac72242a74f8480451e1aee7d6a53320333d");
+        let clamped = |mut b: Vec<u8>| {
+            b[0] &= 248;
+            b[31] = (b[31] & 127) | 64;
+            b
+        };
+        assert_eq!(clamped(sk.to_bytes().to_vec()), clamped(rfc_sk.clone()));
         assert_eq!(pk.to_bytes().to_vec(), h("430f4b9859665145a6b1ba274024487bd66f03a2dd577d7753c68d7d7d00c00c"));
         let enc = EncappedKey::from_bytes(&h("6c93e09869df3402d7bf231bf540fadd35cd56be14f97178f0954db94b7fc256")).unwrap();
-        let mut ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &sk, &enc, &h("4f6465206f6e2061204772656369616e2055726e")).unwrap();
         let pt = h("4265617574792069732074727574682c20747275746820626561757479");
         let ct0 = h("e5d84cd531cfb583096e7cfa9641bd3079cf3a91cda813c52deb5f512be9931980a41de125a925cdad859d5b7a");
         let ct1 = h("2c43aff25343fdbff864506f0818b9d87df84ea01b1a2144d23b4d40c26bf655fdf197fe40297a8aebeed5cc2d");
-        assert_eq!(ctx.open(&ct0, &h("436f756e742d30")).unwrap(), pt);
-        assert_eq!(ctx.open(&ct1, &h("436f756e742d31")).unwrap(), pt);
+        // The derived key, and the same key read back from its stored bytes in either form, open the messages.
+        let stored = PrivateKey::from_bytes(&rfc_sk).unwrap();
+        let stored_clamped = PrivateKey::from_bytes(&clamped(rfc_sk)).unwrap();
+        for key in [&sk, &stored, &stored_clamped] {
+            let mut ctx = hpke::setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, key, &enc, &h("4f6465206f6e2061204772656369616e2055726e")).unwrap();
+            assert_eq!(ctx.open(&ct0, &h("436f756e742d30")).unwrap(), pt);
+            assert_eq!(ctx.open(&ct1, &h("436f756e742d31")).unwrap(), pt);
+        }
     }
 
     /// Checks this module drives the crate correctly: a frame on disk opens
