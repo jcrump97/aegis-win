@@ -29,6 +29,7 @@ async fn snapshot_reports_real_processes_and_crash_events() {
     let snap = call(&plugin, "capture_diagnostic_snapshot", json!({}), ctx).await.unwrap();
     assert!(snap["system"]["memoryTotalMb"].as_u64().unwrap() > 0);
     assert!(snap["system"]["logicalCpus"].as_u64().unwrap() > 0);
+    assert!(snap["system"]["uptimeHours"].as_f64().unwrap() >= 0.0, "{}", snap["system"]);
     assert!(!snap["topByMemory"].as_array().unwrap().is_empty());
     assert!(snap["crashes"].is_array(), "{}", snap["crashes"]);
     assert_eq!(snap["label"], "Current diagnostic window");
