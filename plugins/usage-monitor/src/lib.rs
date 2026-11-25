@@ -294,10 +294,17 @@ fn supervise(stop: &AtomicBool, first: Duration, mut body: impl FnMut(), mut res
     }
 }
 
+/// Opens sysinfo's view of the machine. Since sysinfo 0.40 this can fail
+/// (an unsupported OS or an I/O error); each caller decides what that means.
+fn open_system() -> Result<System, String> {
+    System::new().map_err(|e| format!("Could not read system usage: {e}"))
+}
+
 /// The sampler's loop: every `SAMPLE_EVERY`, records usage, checks the
-/// monitors and writes what they queued, until `stop` is set.
+/// monitors and writes what they queued, until `stop` is set. If the system
+/// can't be read it panics, so `supervise` reports it and retries later.
 fn sample(stop: &AtomicBool, telemetry: &Mutex<Telemetry>) {
-    let mut sys = System::new();
+    let mut sys = open_system().unwrap_or_else(|e| panic!("{e}"));
     refresh(&mut sys);
     let mut events: Vec<rules::ObservedEvent> = Vec::new();
     let mut last_poll: Option<Instant> = None;
@@ -365,7 +372,9 @@ fn write_history(history: &HistoryHandle, records: Vec<Value>) {
 const RESUME_NOTICE_DAYS: i64 = 14;
 
 fn session_start(launch: Launch) -> Value {
-    let boot = DateTime::<Utc>::from_timestamp(i64::try_from(System::boot_time()).unwrap_or(0), 0)
+    let boot = System::boot_time()
+        .ok()
+        .and_then(|s| DateTime::<Utc>::from_timestamp(i64::try_from(s).unwrap_or(0), 0))
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     json!({ "kind": "session_start", "launch": launch.as_str(), "bootTime": boot, "version": env!("CARGO_PKG_VERSION") })
 }
@@ -446,7 +455,7 @@ fn poll_events(needs: &[(rules::Channel, Vec<u32>)]) -> Vec<rules::ObservedEvent
 /// chat: the apps the owner named plus the busiest, without Windows' own.
 fn running_app_names(mention_text: &str) -> Vec<String> {
     let windows_dir = os::system32().parent().map(|d| d.to_string_lossy().to_lowercase() + "\\").unwrap_or_default();
-    let mut sys = System::new();
+    let Ok(mut sys) = open_system() else { return Vec::new() };
     let kind = ProcessRefreshKind::nothing().with_cpu().with_memory().with_exe(UpdateKind::OnlyIfNotSet);
     sys.refresh_cpu_usage();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
@@ -914,7 +923,7 @@ impl UsageMonitorPlugin {
         let enabled = |c: &str| components.iter().any(|x| x == c);
 
         let (system, mut current) = tokio::task::spawn_blocking(|| {
-            let mut sys = System::new();
+            let mut sys = open_system()?;
             refresh(&mut sys);
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(Duration::from_millis(500)));
             refresh(&mut sys);
@@ -923,12 +932,13 @@ impl UsageMonitorPlugin {
                 "logicalCpus": sys.cpus().len(),
                 "memoryUsedMb": sys.used_memory() / (1024 * 1024),
                 "memoryTotalMb": sys.total_memory() / (1024 * 1024),
-                "uptimeHours": round1(System::uptime() as f64 / 3600.0),
+                "uptimeHours": System::uptime().ok().map(|s| round1(s as f64 / 3600.0)),
             });
-            (system, samples(&sys))
+            Ok::<_, String>((system, samples(&sys)))
         })
         .await
-        .map_err(|e| AegisError::failed(e.to_string()))?;
+        .map_err(|e| AegisError::failed(e.to_string()))?
+        .map_err(AegisError::failed)?;
 
         current.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
         let top_cpu: Vec<Value> = current.iter().take(10).map(|s| json!({ "process": s.name, "pid": s.pid, "cpuPercent": round1(s.cpu_percent), "ramMb": s.ram_mb })).collect();
@@ -1097,17 +1107,18 @@ impl Plugin for UsageMonitorPlugin {
         // Ticks name busy processes only with Resource spikes on (RecordedTick::keep).
         let recording = self.is_sampling() && ctx.component_enabled(COMPONENT_SPIKES);
         let now = tokio::task::spawn_blocking(|| {
-            let mut sys = System::new();
+            let mut sys = open_system()?;
             sys.refresh_memory();
             sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_memory());
             let mut top = samples(&sys);
             top.sort_by(|a, b| b.ram_mb.cmp(&a.ram_mb));
             top.truncate(3);
-            checks::MemoryNow { used_mb: sys.used_memory() / (1024 * 1024), total_mb: sys.total_memory() / (1024 * 1024), top }
+            Ok::<_, String>(checks::MemoryNow { used_mb: sys.used_memory() / (1024 * 1024), total_mb: sys.total_memory() / (1024 * 1024), top })
         })
         .await;
         let memory = match now {
-            Ok(now) => checks::memory_pressure(&now, &recent, ctx.now),
+            Ok(Ok(now)) => checks::memory_pressure(&now, &recent, ctx.now),
+            Ok(Err(e)) => aegis_core::diagnose::CheckResult::failed("memory_pressure", e),
             Err(e) => aegis_core::diagnose::CheckResult::failed("memory_pressure", format!("Could not read memory use: {e}")),
         };
         vec![memory, checks::sustained_cpu(&recent, recording)]
@@ -1256,6 +1267,16 @@ impl Plugin for UsageMonitorPlugin {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// sysinfo 0.40 returns errors where 0.39 did not; on Windows the reads
+    /// still succeed, so the session record keeps its boot time.
+    #[test]
+    fn system_reads_succeed_and_session_start_has_boot_time() {
+        assert!(open_system().is_ok());
+        let record = session_start(Launch::Manual);
+        let boot = record["bootTime"].as_str().expect("bootTime is a timestamp");
+        assert!(DateTime::parse_from_rfc3339(boot).unwrap() < Utc::now());
+    }
 
     fn monitor_runtime(trigger: Value) -> MonitorRuntime {
         let rule = json!({
