@@ -2040,7 +2040,7 @@ impl Engine {
                 // while its decision is applied: not a wrong code (issue #73).
                 return Err(AegisError::new(ErrorCode::Conflict, "A decision on this request is being applied. Reload the page in a moment."));
             }
-            if !approve && ticket.plan.as_ref().is_some_and(|p| p.origin != PlanOrigin::Agent) {
+            if !approve && ticket.app_ends_it() {
                 // Declining needs no code, and the page gives its form to anyone
                 // who knows the id, so it ends only what an agent could end
                 // itself (issue #71).
@@ -2052,6 +2052,24 @@ impl Engine {
                 // together cannot both use it; given back below if applying fails.
                 held = Some(HeldCode { tickets: &self.tickets, id, code: ticket.device_code.take(), give_back: false, device_on: &self.device_approval });
                 ticket.deciding = true;
+            } else if approve && ticket.app_ends_it() {
+                // Wrong codes cancel the code, never a plan only the app may
+                // end: anyone who knows the id can post them.
+                ticket.device_misses += 1;
+                let left = STRIKES_PER_TICKET.saturating_sub(ticket.device_misses);
+                if left == 0 {
+                    ticket.device_code = None;
+                    ticket.device_misses = 0;
+                }
+                drop(store);
+                self.device_miss(now);
+                return Err(match left {
+                    0 => AegisError::new(ErrorCode::CodeInvalid, "Too many wrong codes, so this code was cancelled. The request is still waiting: in the AegisWin app, click Approve on another device for a new code."),
+                    left => AegisError::new(
+                        ErrorCode::CodeInvalid,
+                        format!("Wrong or expired code. {left} attempt(s) left for this code. In the AegisWin app, click Approve on another device on this request for a new code."),
+                    ),
+                });
             } else if approve {
                 drop(store);
                 self.device_miss(now);
@@ -2637,6 +2655,7 @@ impl Engine {
         let expires = (now + crate::tickets::DEVICE_CODE_TTL).min(ticket.created + ticket.ttl);
         let (code, device_code) = crate::tickets::DeviceCode::generate(expires);
         ticket.device_code = Some(device_code);
+        ticket.device_misses = 0;
         drop(store);
         let expires_at = chrono::Utc::now() + chrono::Duration::from_std(expires.saturating_duration_since(now)).unwrap_or_default();
         let qr = crate::qr::encode(&url).ok_or_else(|| AegisError::failed("The QR code could not be drawn."))?;

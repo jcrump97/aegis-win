@@ -843,6 +843,42 @@ async fn the_device_page_declines_only_what_an_agent_could_decline_with_the_app_
 }
 
 #[tokio::test]
+async fn wrong_codes_on_the_device_page_cancel_the_code_but_never_end_a_plan_only_the_app_may_end() {
+    use aegis_core::plan::PlanOrigin;
+    use aegis_core::tickets::TicketStatus;
+    // Anyone who knows the id can post codes, so for a plan the owner or the assistant
+    // wrote, three wrong ones cancel the code and leave the plan waiting for the app.
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "keep" } }] })).await.unwrap();
+    let id = owner.ticket_id.clone();
+    let hash = owner.plan.as_ref().unwrap().hash.clone();
+    let (_, code) = s.device_code(&id).await;
+    let wrong = if code == "ZZZZ-ZZZZ" { "YYYY-YYYY" } else { "ZZZZ-ZZZZ" };
+    for _ in 0..3 {
+        let err = s.f.engine.decide_on_device(&id, true, wrong, None, Some(&hash)).unwrap_err();
+        assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid);
+    }
+    let ticket = s.f.engine.ticket(&id).unwrap();
+    assert_eq!(ticket.status, TicketStatus::PendingApproval, "the owner's plan is still waiting");
+    assert_eq!(ticket.attempts_remaining, aegis_core::tickets::STRIKES_PER_TICKET, "the app's PIN attempts are untouched");
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, Some(&hash)).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "the cancelled code no longer approves");
+
+    // A new code from the app works, and the owner can still approve in the app instead.
+    let (_, fresh) = s.device_code(&id).await;
+    assert_ne!(s.f.engine.decide_on_device(&id, true, &fresh, None, Some(&hash)).unwrap().status, TicketStatus::PendingApproval);
+
+    // An agent's request is still locked by three wrong codes, as before.
+    let agent = s.call("demo__fix", json!({ "note": "theirs" })).await["structuredContent"].clone();
+    let agent_id = agent["ticketId"].as_str().unwrap().to_owned();
+    s.device_code(&agent_id).await;
+    for _ in 0..3 {
+        let _ = s.f.engine.decide_on_device(&agent_id, true, wrong, None, None).unwrap_err();
+    }
+    assert_eq!(s.f.engine.ticket(&agent_id).unwrap().status, TicketStatus::LockedOut);
+}
+
+#[tokio::test]
 async fn a_submission_while_a_decision_is_applied_is_a_conflict_not_a_wrong_code() {
     use aegis_core::tickets::TicketStatus;
     // Issue #73: a double-click while the first decision is being written gets "being

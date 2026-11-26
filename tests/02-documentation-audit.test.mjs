@@ -122,6 +122,11 @@ test('Documentation Audit: ADR 0004 is accepted and records every owner decision
   const model = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
   assert.match(model, /it cancels and declines as an agent would, and may stop or decline only requests and plans an agent made/);
   assert.match(model, /never given back, even if the owner turns it on again before that decision finishes/);
+  // Wrong codes on the device page never end a plan only the app may end.
+  assert.match(model, /on a plan the owner or the assistant wrote they only cancel the code, so the plan keeps waiting for the app/);
+  assert.doesNotMatch(model, /3 wrong codes lock the ticket;/);
+  assert.match(adr, /On a plan the owner or the assistant wrote, 3 wrong codes only cancel the code: the plan stays `pending_approval`/);
+  assert.match(adr, /the page declines only requests and plans an agent made; a plan the owner or the assistant wrote is declined in the app/);
   assert.doesNotMatch(model, /The page's cancel does not check origin/);
   // §8: hardening is complete for 0.x; new security work needs a finding, new attack surface, or an outside review.
   assert.match(adr, /## 8\. Security scope after this ADR/);
