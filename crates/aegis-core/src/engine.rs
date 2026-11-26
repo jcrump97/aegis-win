@@ -513,6 +513,9 @@ impl Engine {
     }
 
     pub async fn unlock(&self, pin: String) -> AegisResult<Status> {
+        if self.exiting_for_restart() {
+            return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator. Unlock the new copy."));
+        }
         let pin = Zeroizing::new(pin);
         if lock(&self.vault).is_some() {
             return Ok(self.status());
@@ -718,8 +721,10 @@ impl Engine {
     /// the owner's review; everything else stops.
     pub async fn lock(&self) -> Status {
         // An accepted restart's exit is already stopping everything; a lock now
-        // (tray, idle auto-lock) would start locked work in this copy.
+        // (tray, idle auto-lock) would start locked work in this copy. It only
+        // drops the vault key at once; the exit does the rest.
         if self.exiting_for_restart.load(Ordering::SeqCst) {
+            lock(&self.vault).take();
             return self.status();
         }
         self.lock_inner(true).await
@@ -750,10 +755,15 @@ impl Engine {
         Some(tokio::spawn(async move { me.exit_now(ExitReason::Quit).await }))
     }
 
-    /// The restart's exit ran past its budget: it starts no further step. A
-    /// step already under way finishes; nothing after it starts.
+    /// Called on every accepted restart, just before the claim is let go:
+    /// the exit starts no further step, history and runtime files refuse
+    /// every later write, and the vault is dropped, so nothing this copy does
+    /// afterwards writes to `./data` (issue #91). A step already under way
+    /// is not interrupted, but its writes are refused.
     pub(crate) fn cut_exit_for_restart(&self) {
         self.exit_cut.store(true, Ordering::SeqCst);
+        self.history.seal();
+        lock(&self.vault).take();
     }
 
     /// True while an accepted restart is ending this copy.
@@ -772,6 +782,8 @@ impl Engine {
     }
 
     async fn exit_now(&self, reason: ExitReason) {
+        // First, so no agent request lands while a plugin's stop step runs.
+        self.stop_mcp().await;
         let hook = lock(&self.exit_hook).clone();
         if let Some(hook) = hook {
             hook();
@@ -823,7 +835,7 @@ impl Engine {
                 let mut running = BTreeSet::new();
                 for id in installed {
                     let Some(plugin) = self.registry.plugin(&id) else { continue };
-                    match runtime.get(&id).filter(|_| keep_locked_work && !reviews.contains(&id)) {
+                    match runtime.get(&id).filter(|_| keep_locked_work && !reviews.contains(&id) && !self.exiting_for_restart()) {
                         Some(section) => {
                             if plugin.run_locked(&LockedContext { runtime: section.clone(), history: self.history_for(&id), paused, launch: None }) {
                                 running.insert(id);

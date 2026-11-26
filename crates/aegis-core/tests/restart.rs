@@ -5,6 +5,7 @@
 mod common;
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -111,43 +112,85 @@ async fn a_second_prompt_is_refused_while_the_first_is_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_an_accepted_restart_the_app_s_exit_handler_stops_nothing_more() {
     // Issue #91: the claim may already be the elevated copy's, so the app's own exit,
-    // which runs after `quit`, must not stop or write anything a second time.
+    // which runs after `quit`, must not stop or write anything a second time, and this
+    // copy cannot be unlocked again.
     let f = ready().await;
+    let exits = Arc::new(AtomicUsize::new(0));
+    let counted = exits.clone();
+    f.engine.set_exit_hook(Some(Arc::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    })));
     let (released, quit) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
     restart_elevated(&f.engine, || Ok(()), || released.set(true), || quit.set(true)).await.unwrap();
     assert!(released.get() && quit.get());
     assert!(!f.engine.status().unlocked, "the restart's exit ran and locked the vault");
-    f.engine.unlock(PIN.into()).await.unwrap();
+    assert_eq!(exits.load(Ordering::SeqCst), 1);
     f.engine.exit(aegis_core::registry::ExitReason::Quit).await;
-    assert!(f.engine.status().unlocked, "a later exit does nothing");
+    assert_eq!(exits.load(Ordering::SeqCst), 1, "a later exit does nothing");
+    assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "this copy is ending; the new one is unlocked instead");
+    f.engine.set_exit_hook(None);
+}
+
+fn stream_bytes(f: &Fixture) -> u64 {
+    let dir = f.engine.data_dir().join("history").join("demo");
+    std::fs::read_dir(dir).map(|d| d.map(|e| e.unwrap().metadata().unwrap().len()).sum()).unwrap_or(0)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_exit_cut_at_its_budget_runs_no_stop_step_after_the_claim_is_let_go() {
-    // Issue #91: a stop step that blocks its thread (usage-monitor joins its sampler)
-    // outlives the budget. Once the claim is let go the elevated copy may own the
-    // files, so when the step returns, the exit starts nothing more: here the vault
-    // stays open, where the rest of the exit would have locked it.
+async fn an_exit_cut_at_its_budget_writes_nothing_after_the_claim_is_let_go() {
+    // Issue #91: a stop step that blocks its thread (usage-monitor joins its sampler,
+    // then writes its stop record) outlives the budget. Once the claim is let go the
+    // elevated copy may own the files, so when the step returns, its write is refused
+    // and nothing in ./data changes.
     let f = ready().await;
-    f.engine.set_exit_hook(Some(Arc::new(|| std::thread::sleep(Duration::from_millis(800)))));
+    let history = f.plugin.unlock_history.lock().unwrap().clone().expect("on_unlock gets a history handle");
+    history.append(json!({ "kind": "before" })).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = std::sync::Mutex::new(tx);
+    f.engine.set_exit_hook(Some(Arc::new(move || {
+        std::thread::sleep(Duration::from_millis(800));
+        let _ = tx.lock().unwrap().send(history.append(json!({ "kind": "after the claim" })));
+    })));
+    let released = std::sync::Mutex::new(None);
     let started = Instant::now();
-    aegis_core::restart::restart_elevated_within(&f.engine, Duration::from_millis(100), || Ok(()), || {}, || {}).await.unwrap();
+    aegis_core::restart::restart_elevated_within(&f.engine, Duration::from_millis(100), || Ok(()), || *released.lock().unwrap() = Some(stream_bytes(&f)), || {}).await.unwrap();
     assert!(started.elapsed() < Duration::from_millis(600), "the restart is cut at its budget");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(f.engine.status().unlocked, "nothing after the blocked step ran");
+    let at_release = released.lock().unwrap().expect("the claim was let go");
+    let late = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the blocked step returns");
+    assert_eq!(late.unwrap_err().code, ErrorCode::Conflict, "its write is refused");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(stream_bytes(&f), at_release, "nothing was written after the claim was let go");
+    f.engine.history_tick();
+    assert_eq!(stream_bytes(&f), at_release, "the app's history tick writes nothing either");
     f.engine.set_exit_hook(None);
 
-    // A later Restart click while this copy is ending is refused, not prompted.
+    // A later Restart click while this copy is ending is refused with its own message.
     let out = restart_elevated(&f.engine, || panic!("no second prompt"), || {}, || {}).await;
     assert_eq!(out.unwrap_err().message, "AegisWin is already restarting as administrator.");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lock_while_a_restart_ends_this_copy_starts_nothing() {
-    // The tray's Lock or idle auto-lock during the restart's exit would start locked
-    // monitoring in this copy; it does nothing instead (the exit locks).
+async fn a_lock_while_a_restart_ends_this_copy_drops_the_key_and_starts_nothing() {
+    // The tray's Lock or idle auto-lock while the restart's exit runs must not start
+    // locked work in this copy. It drops the vault key at once; the exit does the rest.
     let f = ready().await;
-    restart_elevated(&f.engine, || Ok(()), || {}, || {}).await.unwrap();
-    f.engine.unlock(PIN.into()).await.unwrap();
-    assert!(f.engine.lock().await.unlocked, "a lock after the restart began its exit does nothing");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, go_rx) = (std::sync::Mutex::new(entered_tx), std::sync::Mutex::new(go_rx));
+    f.engine.set_exit_hook(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+    })));
+    let engine = f.engine.clone();
+    let restart = tokio::spawn(async move { restart_elevated(&engine, || Ok(()), || {}, || {}).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the exit begins");
+    let locks_before = f.plugin.locks.load(Ordering::SeqCst);
+    let status = f.engine.lock().await;
+    assert!(!status.unlocked, "the vault key is dropped at once");
+    assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before, "the lock itself stopped and started nothing");
+    assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "and this copy cannot be unlocked again");
+    go_tx.send(()).unwrap();
+    restart.await.unwrap().unwrap();
+    assert!(!f.engine.locked_monitoring(), "no locked work runs in the ending copy");
+    f.engine.set_exit_hook(None);
 }

@@ -127,7 +127,9 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.match(model, /the app's own exit handler runs no second stop after that/);
   assert.match(model, /Only one administrator prompt is open at a time/);
   assert.doesNotMatch(model, /the rest of it is dropped/);
-  assert.match(model, /the exit is cut just before the claim is let go: it starts no further stop step/);
+  assert.match(model, /the exit is cut: it starts no further stop step, the history and runtime files refuse every later write/);
+  assert.match(model, /whatever it then tries to write is refused, so nothing writes to `\.\/data` after the claim is the elevated copy's/);
+  assert.match(model, /a Lock \(tray or idle auto-lock\) only drops the vault key and starts no locked work, Unlock is refused/);
   assert.doesNotMatch(model, /the stop task is ended at its next await/);
   assert.match(mainRs, /args\(\)\.skip\(1\)\.any\(\|a\| a == os::AFTER_RESTART_ARG\)/);
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
