@@ -121,7 +121,7 @@ The owner asked for a way to run several tools under one PIN. The PIN is the onl
 | Waiting too long | An item still queued 30 minutes after approval is cancelled (`expired`), because the owner approved it for the system as it was. The 10-minute pending expiry stops once a plan is approved. |
 | Lock | Every queued item is cancelled with reason "locked" and **never resumes after unlock**; the approval belonged to that session. A running step finishes, since killing tools such as `sfc` mid-run is unsafe. Its outcome goes to the audit trail, and the rest of its plan is `cancelled`. Lock signals the executor and returns; it never waits on it. |
 | Auto-lock | When auto-lock is due, **no new item or step starts**. The running step finishes, then the lock happens and the queue is cancelled as above. A long queue cannot hold the vault open. |
-| Restart as administrator, Quit | Restart as administrator is refused while a change is running ("Wait for sfc_scan to finish"). Quit while running asks for confirmation and warns that the change may be left half done. Queued items are cancelled in both cases. |
+| Restart as administrator, Quit | Restart as administrator is refused while a change is running ("Wait for sfc_scan to finish"). While its UAC prompt is open no change starts; one approved meanwhile waits its turn. Quit while running asks for confirmation and warns that the change may be left half done. Queued items are cancelled in both cases. |
 | MCP and in-app approving the same ticket | Already safe: decisions are serialized, and the move from `pending_approval` happens once under the ticket lock. The second decision gets `CONFLICT` ("already decided"). |
 
 **Deadlock avoidance**

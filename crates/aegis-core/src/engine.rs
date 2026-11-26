@@ -690,6 +690,12 @@ impl Engine {
         self.executor.running()
     }
 
+    /// Restart as administrator: if no change is running, no change starts
+    /// until the hold is dropped. Fails with the running tool's name.
+    pub fn hold_changes_for_restart(&self) -> Result<crate::executor::RestartHold<'_>, String> {
+        self.executor.hold_for_restart()
+    }
+
     /// Stops the MCP server and background work, drops the key, and forgets tickets.
     /// Locks the vault. A plugin that declared locked work keeps running it
     /// (*locked, monitoring*, ADR 0002 §4) unless its runtime file waits for

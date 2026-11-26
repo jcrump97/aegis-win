@@ -19,7 +19,7 @@ use aegis_core::registry::{ExitReason, GatePolicy, Launch, Plugin, Registry};
 use aegis_core::plan::PlanOrigin;
 use aegis_core::notify::{self, Notifier};
 use aegis_core::tickets::{TicketStatus, TicketView};
-use aegis_core::{AegisError, ErrorCode};
+use aegis_core::AegisError;
 use serde::Serialize;
 use serde_json::Value;
 use tauri::menu::{Menu, MenuItem};
@@ -45,8 +45,17 @@ fn request_quit(app: &AppHandle) {
 /// Released only for the elevated restart, so the elevated copy can start.
 struct InstanceClaim(Mutex<Option<SingleInstance>>);
 
+impl InstanceClaim {
+    /// Lets go of the install, so the elevated copy can claim it. A poisoned
+    /// lock still lets go: a panic elsewhere must not keep the claim.
+    fn release(&self) {
+        drop(self.0.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+}
+
 /// Claims this install; a later launch shows this copy's window instead.
-/// The elevated copy of a restart (`after_restart`) first waits, up to 30 s, for
+/// The elevated copy of a restart (`after_restart`) first waits, up to 30 s
+/// (`restart::AFTER_RESTART_WAIT`), for
 /// the old copy to write its quit record and let go; after that it is an
 /// ordinary second launch (see `os::single_instance_after_restart`).
 fn claim_instance(after_restart: bool) -> std::io::Result<Instance> {
@@ -57,7 +66,7 @@ fn claim_instance(after_restart: bool) -> std::io::Result<Instance> {
         }
     };
     if after_restart {
-        os::single_instance_after_restart(&key, show, std::time::Duration::from_secs(30))
+        os::single_instance_after_restart(&key, show, aegis_core::restart::AFTER_RESTART_WAIT)
     } else {
         os::single_instance(&key, show)
     }
@@ -515,7 +524,7 @@ async fn restart_as_admin(app: tauri::AppHandle, engine: EngineState<'_>, claim:
     aegis_core::restart::restart_elevated(
         &engine,
         aegis_core::os::relaunch_elevated,
-        || drop(claim.0.lock().unwrap().take()),
+        || claim.release(),
         || request_quit(&app),
     )
     .await
@@ -630,4 +639,21 @@ fn main() {
             tauri::async_runtime::block_on(engine.exit(reason));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releasing_the_claim_lets_the_next_copy_take_the_install() {
+        let key = format!("test-claim-release-{}", std::process::id());
+        let Instance::First(guard) = os::single_instance(&key, || {}).unwrap() else { panic!("first copy") };
+        let claim = InstanceClaim(Mutex::new(Some(guard)));
+        assert!(matches!(os::single_instance(&key, || {}).unwrap(), Instance::AlreadyRunning), "held until released");
+        claim.release();
+        assert!(claim.0.lock().unwrap().is_none());
+        assert!(matches!(os::single_instance(&key, || {}).unwrap(), Instance::First(_)), "the elevated copy can claim it now");
+        claim.release();
+    }
 }

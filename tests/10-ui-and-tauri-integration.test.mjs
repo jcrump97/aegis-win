@@ -108,9 +108,21 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   // The elevated restart goes through the tested seam (aegis_core::restart, plugins/usage-monitor/tests/restart.rs):
   // the claim is kept until the quit record is written, and the elevated copy waits for it.
   const restart = mainRs.slice(mainRs.indexOf('async fn restart_as_admin'), mainRs.indexOf('fn main()'));
-  assert.match(restart, /aegis_core::restart::restart_elevated\(\s*&engine,\s*aegis_core::os::relaunch_elevated,/);
+  // The whole call: the third argument lets go of the claim and the fourth quits (issue #92).
+  assert.match(restart, /aegis_core::restart::restart_elevated\(\s*&engine,\s*aegis_core::os::relaunch_elevated,\s*\|\| claim\.release\(\),\s*\|\| request_quit\(&app\),\s*\)\s*\.await\s*\}/);
   assert.equal(restart.includes('engine.exit('), false, 'the shell does not stop anything itself');
-  assert.match(mainRs, /os::single_instance_after_restart\(&key, show, std::time::Duration::from_secs\(30\)\)/);
+  // release() really drops the claim (a Rust test in main.rs claims the install again afterwards).
+  assert.match(mainRs, /fn release\(&self\) \{\s*drop\(self\.0\.lock\(\)\.unwrap_or_else\(\|e\| e\.into_inner\(\)\)\.take\(\)\);\s*\}/);
+  assert.match(mainRs, /fn releasing_the_claim_lets_the_next_copy_take_the_install\(\)/);
+  assert.match(mainRs, /fn request_quit\(app: &AppHandle\) \{\s*QUIT_REQUESTED\.store\(true, Ordering::SeqCst\);\s*app\.exit\(0\);\s*\}/);
+  // The elevated copy waits as long as the restart allows for, and the old copy's exit is bounded within it.
+  assert.match(mainRs, /os::single_instance_after_restart\(&key, show, aegis_core::restart::AFTER_RESTART_WAIT\)/);
+  assert.match(fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8'), /pub const AFTER_RESTART_WAIT: Duration = Duration::from_secs\(30\);/);
+  assert.match(fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8'), /pub const EXIT_BUDGET: Duration = Duration::from_secs\(20\);/);
+  const model = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
+  assert.match(model, /While the prompt is open no change starts/);
+  assert.match(model, /within 20 s, then lets go of the install claim/);
+  assert.match(model, /It lets go and exits even if stopping panics or takes longer/);
   assert.match(mainRs, /args\(\)\.skip\(1\)\.any\(\|a\| a == os::AFTER_RESTART_ARG\)/);
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   // Only input in the app window counts as activity.
@@ -227,7 +239,8 @@ test('Serial executor: the app shows the change in progress, and the shell never
   assert.match(main, /const \{ running, queued \} = status\.change;/);
   assert.match(main, /queued: \['approved, waiting its turn'/);
   // Restarting as administrator is refused while a change runs; Quit asks first.
-  assert.match(fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8'), /if let Some\(tool\) = engine\.change_running\(\) \{\s*return Err[\s\S]*?match launch\(\)/);
+  // Restart refuses while a change runs, and holds every new change from the same check until the prompt is answered (issue #87).
+  assert.match(fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8'), /let _hold = engine\s*\.hold_changes_for_restart\(\)\s*\.map_err\([\s\S]*?\)\?;\s*match launch\(\)/);
   assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
   assert.match(mainRs, /"quit" => quit_app\(app\),/);
 });
