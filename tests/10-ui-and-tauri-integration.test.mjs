@@ -129,7 +129,7 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.doesNotMatch(model, /the rest of it is dropped/);
   assert.match(model, /the exit is cut: it starts no further stop step, the history and runtime files refuse every later write/);
   assert.match(model, /whatever it then tries to write is refused, so nothing writes to `\.\/data` after the claim is the elevated copy's/);
-  assert.match(model, /a Lock \(tray or idle auto-lock\) does nothing, because the exit stops the plugins and locks the vault itself, once; Unlock, Forget this PC and another Restart are refused, and nothing starts the MCP server again/);
+  assert.match(model, /a Lock \(tray or idle auto-lock\) does nothing, because the exit stops the plugins and locks the vault itself, once; first-run setup, Unlock, Forget this PC, settings changes and another Restart are refused, and nothing starts the MCP server again/);
   assert.match(model, /An unlock or PIN check already under way when the restart is accepted finishes before the exit stops anything; an unlock that was still deriving its key then keeps no vault and tells no plugin it unlocked/);
   assert.doesNotMatch(model, /the stop task is ended at its next await/);
   assert.match(mainRs, /args\(\)\.skip\(1\)\.any\(\|a\| a == os::AFTER_RESTART_ARG\)/);

@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aegis_core::engine::{Engine, Origin, RunOutcome};
+use aegis_core::engine::{Engine, Origin, RunOutcome, SettingsUpdate};
 use aegis_core::restart::restart_elevated;
 use aegis_core::{AegisResult, ErrorCode};
-use common::{ready, Fixture, PIN};
+use common::{fixture, ready, Fixture, PIN};
 use serde_json::json;
 use tokio::task::JoinHandle;
 
@@ -192,6 +192,10 @@ async fn a_lock_while_a_restart_ends_this_copy_leaves_the_stopping_to_the_exit()
     assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "this copy cannot be unlocked again");
     assert_eq!(f.engine.start_mcp().await.unwrap_err().code, ErrorCode::Conflict, "nor serve agents again");
     assert!(!f.engine.mcp_status().await.running);
+    assert!(!f.engine.settings().await.unwrap().mcp.enabled, "the refused start saved no setting");
+    let turn_on = SettingsUpdate { mcp_enabled: Some(true), ..Default::default() };
+    assert_eq!(f.engine.update_settings(turn_on).await.unwrap_err().code, ErrorCode::Conflict, "nor change a setting");
+    assert!(!f.engine.settings().await.unwrap().mcp.enabled);
     go_tx.send(()).unwrap();
     restart.await.unwrap().unwrap();
     assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before + 1, "the exit stopped the plugin, once");
@@ -285,7 +289,31 @@ async fn an_unlock_that_kept_the_vault_just_before_a_restart_finishes_before_the
     restart.await.unwrap().unwrap();
     assert_eq!(heard.load(Ordering::SeqCst), unlocks_before + 1, "the plugin heard of the unlock before the exit stopped it");
     assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before + 1, "the exit stopped the plugin, once");
-    assert!(!f.engine.status().unlocked && !f.engine.mcp_status().await.running, "the ending copy holds no vault and serves nothing");
+    assert!(!f.engine.status().unlocked, "the ending copy holds no vault");
     f.engine.set_unlock_kept_hook(None);
+    f.engine.set_exit_hook(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_run_setup_is_refused_while_a_restart_ends_this_copy() {
+    // Setup writes a new vault. In a copy that is quitting it is refused and
+    // writes nothing, so the elevated copy starts from the same ./data.
+    let f = fixture();
+    assert!(!f.engine.status().vault_exists);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, go_rx) = (std::sync::Mutex::new(entered_tx), std::sync::Mutex::new(go_rx));
+    f.engine.set_exit_hook(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+    })));
+    let engine = f.engine.clone();
+    let restart = tokio::spawn(async move { restart_elevated(&engine, || Ok(()), || {}, || {}).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the exit begins");
+    assert_eq!(f.engine.setup(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "setup is refused");
+    assert!(!f.engine.status().vault_exists, "and wrote no vault");
+    go_tx.send(()).unwrap();
+    restart.await.unwrap().unwrap();
+    assert!(!f.engine.status().vault_exists);
     f.engine.set_exit_hook(None);
 }

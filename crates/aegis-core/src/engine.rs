@@ -1065,6 +1065,10 @@ impl Engine {
     }
 
     pub async fn update_settings(&self, update: SettingsUpdate) -> AegisResult<SettingsView> {
+        // A copy that is quitting changes no setting (issue #91).
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         let (mcp_changed, enabled) = self.mutate(|s| {
             if let Some(scale) = update.ui_scale {
                 if !(80..=150).contains(&scale) {
