@@ -170,9 +170,11 @@ async fn an_exit_cut_at_its_budget_writes_nothing_after_the_claim_is_let_go() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lock_while_a_restart_ends_this_copy_drops_the_key_and_starts_nothing() {
+async fn a_lock_while_a_restart_ends_this_copy_leaves_the_stopping_to_the_exit() {
     // The tray's Lock or idle auto-lock while the restart's exit runs must not start
-    // locked work in this copy. It drops the vault key at once; the exit does the rest.
+    // locked work in this copy, nor take the vault before the exit has stopped the
+    // plugins (then they would get neither their exit nor their lock). It does
+    // nothing; the exit locks, once. An unlock meanwhile is refused.
     let f = ready().await;
     let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -185,12 +187,13 @@ async fn a_lock_while_a_restart_ends_this_copy_drops_the_key_and_starts_nothing(
     let restart = tokio::spawn(async move { restart_elevated(&engine, || Ok(()), || {}, || {}).await });
     tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the exit begins");
     let locks_before = f.plugin.locks.load(Ordering::SeqCst);
-    let status = f.engine.lock().await;
-    assert!(!status.unlocked, "the vault key is dropped at once");
-    assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before, "the lock itself stopped and started nothing");
-    assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "and this copy cannot be unlocked again");
+    assert!(f.engine.lock().await.unlocked, "the lock leaves the vault to the exit");
+    assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before, "and stops nothing itself");
+    assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "this copy cannot be unlocked again");
     go_tx.send(()).unwrap();
     restart.await.unwrap().unwrap();
-    assert!(!f.engine.locked_monitoring(), "no locked work runs in the ending copy");
+    assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before + 1, "the exit stopped the plugin, once");
+    assert!(!f.engine.status().unlocked && !f.engine.locked_monitoring(), "no locked work runs in the ending copy");
+    assert_eq!(f.engine.forget_this_pc().unwrap_err().code, ErrorCode::Conflict, "nothing in ./data changes after the claim is let go");
     f.engine.set_exit_hook(None);
 }

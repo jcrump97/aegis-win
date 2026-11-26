@@ -38,9 +38,11 @@ pub const EXIT_BUDGET: Duration = Duration::from_secs(20);
 /// 3. `quit` ends this process. Its exit handler runs no second exit.
 ///
 /// After an accepted launch, `release_claim` and `quit` run even if the exit
-/// panics, or blocks or runs past its budget. The exit then starts no further
-/// step (a step already under way finishes) and the quit record may be
-/// missing. This copy never
+/// panics, or blocks or runs past its budget. Just before `release_claim`,
+/// the exit is cut: it starts no further step, history and runtime files
+/// refuse every later write, and the vault is dropped, so a step already
+/// under way cannot write once the claim is let go. The quit record may then
+/// be missing. This copy never
 /// stays half-stopped with the claim held while the elevated copy waits for
 /// it. If the elevated copy dies before it takes the claim, no copy is left
 /// running; the owner starts AegisWin again.

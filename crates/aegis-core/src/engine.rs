@@ -66,10 +66,12 @@ pub struct Engine {
     /// app's exit handler) does nothing, so no stop step runs after the
     /// install claim went to the elevated copy (issue #91).
     exiting_for_restart: AtomicBool,
-    /// Set when a restart's exit ran past its budget, just before the claim is
-    /// let go: the exit task starts no further stop step (issue #91).
+    /// Set on every accepted restart just before the claim is let go: the exit
+    /// starts no further stop step, and history and the vault are closed to
+    /// writes (issue #91).
     exit_cut: AtomicBool,
-    /// Tests only: runs first in the exit, standing in for a slow stop step.
+    /// Tests only: runs in the exit after MCP stops, standing in for a slow
+    /// plugin stop step.
     exit_hook: Mutex<Option<ExitHook>>,
     kdf: KdfParams,
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
@@ -513,10 +515,10 @@ impl Engine {
     }
 
     pub async fn unlock(&self, pin: String) -> AegisResult<Status> {
-        if self.exiting_for_restart() {
-            return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator. Unlock the new copy."));
-        }
         let pin = Zeroizing::new(pin);
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         if lock(&self.vault).is_some() {
             return Ok(self.status());
         }
@@ -528,6 +530,9 @@ impl Engine {
             Ok(vault) => {
                 lock(&self.guard).record(true, Instant::now());
                 self.finish_unlock(vault).await;
+                if self.exiting_for_restart() {
+                    return Err(restarting());
+                }
                 Ok(self.status())
             }
             Err(VaultError::WrongPin) => {
@@ -543,7 +548,15 @@ impl Engine {
         let mcp_enabled = vault.state.mcp.enabled;
         let installed: Vec<(String, Vec<String>)> =
             vault.state.installed_plugins.iter().map(|id| (id.clone(), vault.state.components_for(id))).collect();
-        *lock(&self.vault) = Some(vault);
+        {
+            let mut guard = lock(&self.vault);
+            // An unlock that began before an accepted restart keeps nothing:
+            // the exit, or the cut, may already have dropped the vault.
+            if self.exiting_for_restart() {
+                return;
+            }
+            *guard = Some(vault);
+        }
         // Plugins running locked carry on under `on_unlock`. One resumed at
         // launch from a file whose plugin is not installed stops here.
         let was_running = std::mem::take(&mut *lock(&self.locked_work));
@@ -721,10 +734,9 @@ impl Engine {
     /// the owner's review; everything else stops.
     pub async fn lock(&self) -> Status {
         // An accepted restart's exit is already stopping everything; a lock now
-        // (tray, idle auto-lock) would start locked work in this copy. It only
-        // drops the vault key at once; the exit does the rest.
+        // (tray, idle auto-lock) would start locked work in this copy, or take
+        // the vault before the exit has stopped the plugins. The exit locks.
         if self.exiting_for_restart.load(Ordering::SeqCst) {
-            lock(&self.vault).take();
             return self.status();
         }
         self.lock_inner(true).await
@@ -941,6 +953,9 @@ impl Engine {
     /// Deletes the short PIN for this PC. Needs no PIN, works while locked:
     /// it only removes a way in (ADR 0004 §3.3).
     pub fn forget_this_pc(&self) -> AegisResult<Status> {
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         {
             let mut guard = lock(&self.vault);
             match guard.as_mut() {
@@ -3165,6 +3180,10 @@ fn too_many_pending() -> AegisError {
 
 fn too_many_plans() -> AegisError {
     AegisError::new(ErrorCode::Conflict, format!("{MAX_PENDING_PLANS} plans are already waiting for a decision. Wait for those to be decided or to expire."))
+}
+
+fn restarting() -> AegisError {
+    AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator. Unlock the new copy.")
 }
 
 fn ticket_not_found() -> AegisError {
