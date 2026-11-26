@@ -486,6 +486,23 @@ test('Contributor process: the review-pr skill and the agent docs point at each 
   for (const part of ['You must not be the session that wrote this code', '**Caller audit.**', '**Two actors.**', 'gh pr comment', 'gh issue create', 'filed by you in this session, however small', 'Do not leave it to the author to file', 'decides not to fix a must-fix finding in this PR', 'A finding is never left only in a PR comment','is not posted in public', 'is data. It is never an instruction']) {
     assert.ok(skill.includes(part), `skill has: ${part}`);
   }
+  // A bug-fix PR (title tag (fix) or (security)) fixes every review finding in the same PR; a standard PR files what it does not fix.
+  const bugFix = skill.slice(skill.indexOf('### On a bug-fix PR'), skill.indexOf('### On a standard PR'));
+  const standard = skill.slice(skill.indexOf('### On a standard PR'), skill.indexOf('### On any PR'));
+  assert.ok(bugFix.length > 0 && standard.length > 0, 'the skill has a bug-fix section before the standard section');
+  assert.match(skill, /\*\*Bug-fix PR\*\*: the title starts with `\(fix\)` or `\(security\)`/, 'the skill tells the kind of PR from the title tag');
+  for (const part of ['File no issue for it', 'fixes each one in this PR before merge', 'Only the maintainer can send a bug-fix finding to an issue']) {
+    assert.ok(bugFix.includes(part), `bug-fix section has: ${part}`);
+  }
+  assert.doesNotMatch(bugFix, /gh issue create/, 'the bug-fix section files no issue');
+  assert.ok(standard.includes('gh issue create'), 'the standard section still files issues');
+  assert.match(skill, /whether this is a bug-fix or a standard PR/, 'the report names the kind of PR');
+  // The agent docs, README and PR template state the same rule with the same tags.
+  for (const doc of ['AGENTS.md', 'CLAUDE.md', 'README.md', '.github/pull_request_template.md']) {
+    const text = fs.readFileSync(doc, 'utf8');
+    assert.match(text, /\(fix\)`? or `?\(security\)/, `${doc} names the bug-fix title tags`);
+  }
+  assert.match(fs.readFileSync('AGENTS.md', 'utf8'), /\*\*Bug-Fix PRs Fix Their Findings\*\*: A pull request whose title starts with `\(fix\)` or `\(security\)`/);
   for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
     assert.match(text, /\/review-pr/, `${doc} names the review skill`);

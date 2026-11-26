@@ -95,7 +95,7 @@ Set them in your user environment, not in a file in the repo, so the token is ne
 - Commit messages start with a type tag: `(feat)`, `(fix)`, `(doc)`, `(chore)`, `(test)`, `(refactor)`, `(security)`, or `(perf)`.
 - Every commit updates tests and [`documentation/AUDIT_LEDGER.md`](documentation/AUDIT_LEDGER.md).
 - Commits are signed. Changes land through pull requests into `main`.
-- A pull request is reviewed before merge by someone, or a fresh AI session, that did not write it (in Claude Code: `/review-pr <number>`). CI checks every commit message in a pull request, so the rules hold even if you did not turn on the hooks. Anything found and not fixed is filed as a [GitHub issue](https://github.com/jcrump97/aegis-win/issues) in the format of [`AGENTS.md`](AGENTS.md) §3.
+- A pull request is reviewed before merge by someone, or a fresh AI session, that did not write it (in Claude Code: `/review-pr <number>`). CI checks every commit message in a pull request, so the rules hold even if you did not turn on the hooks. Anything found and not fixed is filed as a [GitHub issue](https://github.com/jcrump97/aegis-win/issues) in the format of [`AGENTS.md`](AGENTS.md) §3. On a bug-fix pull request (its title starts with `(fix)` or `(security)`), review findings are fixed in that pull request instead of filed.
 - No AI-attribution trailers in commits or PRs; credit lives in this README.
 
 ## Acknowledgements

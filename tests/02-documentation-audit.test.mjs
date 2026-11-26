@@ -154,7 +154,7 @@ test('Documentation Audit: agent docs keep the review and findings rules, and no
   // Findings are filed as issues, reviews come from a fresh session, and shared functions get a caller audit.
   for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
-    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Caller Audit', 'Two-Actor Test', 'Fixes Start with a Failing Test']) {
+    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Bug-Fix PRs Fix Their Findings', 'Caller Audit', 'Two-Actor Test', 'Fixes Start with a Failing Test']) {
       assert.ok(text.includes(`**${rule}**`), `${doc} must name the ${rule} rule`);
     }
   }
