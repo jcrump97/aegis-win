@@ -633,7 +633,8 @@ fn main() {
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
             // Writes the clean-stop record (quit, or Windows ending the session),
-            // removes the firewall rule, and stops all background work.
+            // removes the firewall rule, and stops all background work. After an
+            // accepted Restart as administrator it does nothing: that exit already ran.
             let reason = if QUIT_REQUESTED.load(Ordering::SeqCst) { ExitReason::Quit } else { ExitReason::Shutdown };
             let engine = handle.state::<Arc<Engine>>().inner().clone();
             tauri::async_runtime::block_on(engine.exit(reason));

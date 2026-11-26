@@ -127,6 +127,8 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.match(model, /the app's own exit handler runs no second stop after that/);
   assert.match(model, /Only one administrator prompt is open at a time/);
   assert.doesNotMatch(model, /the rest of it is dropped/);
+  assert.match(model, /the exit is cut just before the claim is let go: it starts no further stop step/);
+  assert.doesNotMatch(model, /the stop task is ended at its next await/);
   assert.match(mainRs, /args\(\)\.skip\(1\)\.any\(\|a\| a == os::AFTER_RESTART_ARG\)/);
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   // Only input in the app window counts as activity.
@@ -247,7 +249,10 @@ test('Serial executor: the app shows the change in progress, and the shell never
   const restartRs = fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8');
   assert.match(restartRs, /let hold = engine\s*\.hold_changes_for_restart\(\)\s*\.map_err\([\s\S]*?\)\?;\s*match launch\(\)/);
   // An accepted launch keeps the hold for good, runs the exit on its own task within the budget, then lets go and quits.
-  assert.match(restartRs, /Ok\(\(\)\) => \{\s*hold\.keep\(\);\s*finish\(on_own_task\(engine\.begin_exit_for_restart\(\)\), EXIT_BUDGET, release_claim, quit\)\.await;\s*Ok\(\(\)\)\s*\}/);
+  assert.match(restartRs, /Ok\(\(\)\) => \{\s*hold\.keep\(\);(?:\s*\/\/[^\n]*)*\s*let release = \|\| \{[^}]*\};\s*finish\(on_own_task\(engine\.begin_exit_for_restart\(\)\), budget, release, quit\)\.await;\s*Ok\(\(\)\)\s*\}/);
+  // The claim is let go only after the exit is cut, and the public entry point uses the 20 s budget.
+  assert.match(restartRs, /let release = \|\| \{\s*engine\.cut_exit_for_restart\(\);\s*release_claim\(\);\s*\};/);
+  assert.match(restartRs, /restart_elevated_within\(engine, EXIT_BUDGET, launch, release_claim, quit\)\.await/);
   assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
   assert.match(mainRs, /"quit" => quit_app\(app\),/);
 });

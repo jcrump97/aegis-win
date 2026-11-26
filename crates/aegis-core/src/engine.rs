@@ -47,6 +47,9 @@ impl Default for EngineOptions {
     }
 }
 
+/// See `Engine::set_exit_hook`.
+pub type ExitHook = Arc<dyn Fn() + Send + Sync>;
+
 pub struct Engine {
     /// Lets `&self` methods hand an owning reference to background tasks.
     me: std::sync::Weak<Engine>,
@@ -63,6 +66,11 @@ pub struct Engine {
     /// app's exit handler) does nothing, so no stop step runs after the
     /// install claim went to the elevated copy (issue #91).
     exiting_for_restart: AtomicBool,
+    /// Set when a restart's exit ran past its budget, just before the claim is
+    /// let go: the exit task starts no further stop step (issue #91).
+    exit_cut: AtomicBool,
+    /// Tests only: runs first in the exit, standing in for a slow stop step.
+    exit_hook: Mutex<Option<ExitHook>>,
     kdf: KdfParams,
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
     /// Last owner activity, for idle auto-lock.
@@ -397,6 +405,8 @@ impl Engine {
             http: crate::llm::http_client(),
             elevated: options.elevated,
             exiting_for_restart: AtomicBool::new(false),
+            exit_cut: AtomicBool::new(false),
+            exit_hook: Mutex::new(None),
             kdf: options.kdf,
             mcp: tokio::sync::Mutex::new(None),
             activity: Mutex::new(Instant::now()),
@@ -707,6 +717,11 @@ impl Engine {
     /// (*locked, monitoring*, ADR 0002 §4) unless its runtime file waits for
     /// the owner's review; everything else stops.
     pub async fn lock(&self) -> Status {
+        // An accepted restart's exit is already stopping everything; a lock now
+        // (tray, idle auto-lock) would start locked work in this copy.
+        if self.exiting_for_restart.load(Ordering::SeqCst) {
+            return self.status();
+        }
         self.lock_inner(true).await
     }
 
@@ -724,14 +739,47 @@ impl Engine {
     /// [`Self::exit`] does nothing, and runs the exit on its own task, so a
     /// stop step that blocks its thread cannot keep the caller past its budget
     /// (issue #91). `None` if the engine is already being dropped.
+    ///
+    /// An await that is already ready never yields, so aborting the task alone
+    /// does not stop it after a step that blocked its thread. The caller calls
+    /// [`Self::cut_exit_for_restart`] before it lets go of the claim, and the
+    /// exit checks that between its steps.
     pub(crate) fn begin_exit_for_restart(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.exiting_for_restart.store(true, Ordering::SeqCst);
         let me = self.self_arc().ok()?;
         Some(tokio::spawn(async move { me.exit_now(ExitReason::Quit).await }))
     }
 
+    /// The restart's exit ran past its budget: it starts no further step. A
+    /// step already under way finishes; nothing after it starts.
+    pub(crate) fn cut_exit_for_restart(&self) {
+        self.exit_cut.store(true, Ordering::SeqCst);
+    }
+
+    /// True while an accepted restart is ending this copy.
+    pub(crate) fn exiting_for_restart(&self) -> bool {
+        self.exiting_for_restart.load(Ordering::SeqCst)
+    }
+
+    fn exit_cut(&self) -> bool {
+        self.exit_cut.load(Ordering::SeqCst)
+    }
+
+    /// Runs `hook` at the start of every exit. Tests only.
+    #[doc(hidden)]
+    pub fn set_exit_hook(&self, hook: Option<ExitHook>) {
+        *lock(&self.exit_hook) = hook;
+    }
+
     async fn exit_now(&self, reason: ExitReason) {
+        let hook = lock(&self.exit_hook).clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         for id in self.background_plugins() {
+            if self.exit_cut() {
+                return;
+            }
             if let Some(plugin) = self.registry.plugin(&id) {
                 plugin.on_exit(reason);
             }
@@ -741,9 +789,17 @@ impl Engine {
 
     async fn lock_inner(&self, keep_locked_work: bool) -> Status {
         self.stop_mcp().await;
+        // A restart's exit that ran past its budget writes nothing more: the
+        // claim, and the files, may already be the elevated copy's (issue #91).
+        if self.exit_cut() {
+            return self.status();
+        }
         // Recorded while the vault is still open; the requests are forgotten below.
         let open: Vec<String> = lock(&self.tickets).list(Instant::now()).into_iter().filter(|v| !v.status.is_final()).map(|v| v.ticket_id).collect();
         for id in open {
+            if self.exit_cut() {
+                return self.status();
+            }
             self.record_approval(json!({
                 "event": "cancelled",
                 "ticketId": id,
@@ -753,6 +809,9 @@ impl Engine {
         }
         // While the vault key is still here: close the file, checkpoint, and
         // store the key of the session that covers the locked period (ADR 0004 §4.2).
+        if self.exit_cut() {
+            return self.status();
+        }
         let _ = self.turn_approval_session(false);
         let reviews: BTreeSet<String> = lock(&self.runtime_reviews).keys().cloned().collect();
         let taken = lock(&self.vault).take().map(|v| (v.state.installed_plugins.clone(), v.state.runtime.clone()));
@@ -787,6 +846,9 @@ impl Engine {
             None => {}
         }
         // A fresh file (and HPKE context) for anything written while locked.
+        if self.exit_cut() {
+            return self.status();
+        }
         self.history.close_all();
         lock(&self.tickets).clear();
         lock(&self.resume_notices).clear();

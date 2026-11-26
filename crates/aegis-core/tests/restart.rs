@@ -121,3 +121,33 @@ async fn after_an_accepted_restart_the_app_s_exit_handler_stops_nothing_more() {
     f.engine.exit(aegis_core::registry::ExitReason::Quit).await;
     assert!(f.engine.status().unlocked, "a later exit does nothing");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exit_cut_at_its_budget_runs_no_stop_step_after_the_claim_is_let_go() {
+    // Issue #91: a stop step that blocks its thread (usage-monitor joins its sampler)
+    // outlives the budget. Once the claim is let go the elevated copy may own the
+    // files, so when the step returns, the exit starts nothing more: here the vault
+    // stays open, where the rest of the exit would have locked it.
+    let f = ready().await;
+    f.engine.set_exit_hook(Some(Arc::new(|| std::thread::sleep(Duration::from_millis(800)))));
+    let started = Instant::now();
+    aegis_core::restart::restart_elevated_within(&f.engine, Duration::from_millis(100), || Ok(()), || {}, || {}).await.unwrap();
+    assert!(started.elapsed() < Duration::from_millis(600), "the restart is cut at its budget");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(f.engine.status().unlocked, "nothing after the blocked step ran");
+    f.engine.set_exit_hook(None);
+
+    // A later Restart click while this copy is ending is refused, not prompted.
+    let out = restart_elevated(&f.engine, || panic!("no second prompt"), || {}, || {}).await;
+    assert_eq!(out.unwrap_err().message, "AegisWin is already restarting as administrator.");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lock_while_a_restart_ends_this_copy_starts_nothing() {
+    // The tray's Lock or idle auto-lock during the restart's exit would start locked
+    // monitoring in this copy; it does nothing instead (the exit locks).
+    let f = ready().await;
+    restart_elevated(&f.engine, || Ok(()), || {}, || {}).await.unwrap();
+    f.engine.unlock(PIN.into()).await.unwrap();
+    assert!(f.engine.lock().await.unlocked, "a lock after the restart began its exit does nothing");
+}
