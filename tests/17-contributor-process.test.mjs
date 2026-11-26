@@ -491,7 +491,7 @@ test('Contributor process: the review-pr skill and the agent docs point at each 
   assert.ok(at[0] >= 0 && at[0] < at[1] && at[1] < at[2], 'the skill has bug-fix, standard and any-PR sections, in that order');
   const bugFix = skill.slice(at[0], at[1]);
   const standard = skill.slice(at[1], at[2]);
-  assert.match(skill, /\n\n### On any PR/, 'a blank line comes before the any-PR heading');
+  assert.match(skill, /\r?\n\r?\n### On any PR/, 'a blank line comes before the any-PR heading');
   assert.match(skill, /\*\*Bug-fix PR\*\*: the title starts with `\(fix\)` or `\(security\)`/, 'the skill tells the kind of PR from the title tag');
   for (const part of ['File no issue for it', 'fixes each one in this PR before merge', 'Only the maintainer can send a bug-fix finding to an issue', 'the author files it as an issue before merge']) {
     assert.ok(bugFix.includes(part), `bug-fix section has: ${part}`);
