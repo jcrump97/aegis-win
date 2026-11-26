@@ -73,6 +73,9 @@ pub struct Engine {
     /// Tests only: runs in the exit after MCP stops, standing in for a slow
     /// plugin stop step.
     exit_hook: Mutex<Option<ExitHook>>,
+    /// Tests only: runs in an unlock just before the key is derived,
+    /// standing in for a slow key derivation.
+    unlock_hook: Mutex<Option<ExitHook>>,
     kdf: KdfParams,
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
     /// Last owner activity, for idle auto-lock.
@@ -409,6 +412,7 @@ impl Engine {
             exiting_for_restart: AtomicBool::new(false),
             exit_cut: AtomicBool::new(false),
             exit_hook: Mutex::new(None),
+            unlock_hook: Mutex::new(None),
             kdf: options.kdf,
             mcp: tokio::sync::Mutex::new(None),
             activity: Mutex::new(Instant::now()),
@@ -523,9 +527,21 @@ impl Engine {
             return Ok(self.status());
         }
         let _serial = self.pin_check.lock().await;
+        // A restart may have begun while this unlock waited its turn.
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         self.guard_check()?;
         let path = self.vault_path();
-        let result = tokio::task::spawn_blocking(move || UnlockedVault::<VaultState>::unlock(&path, &pin)).await.map_err(internal)?;
+        let hook = lock(&self.unlock_hook).clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(hook) = hook {
+                hook();
+            }
+            UnlockedVault::<VaultState>::unlock(&path, &pin)
+        })
+        .await
+        .map_err(internal)?;
         match result {
             Ok(vault) => {
                 lock(&self.guard).record(true, Instant::now());
@@ -779,7 +795,7 @@ impl Engine {
     }
 
     /// True while an accepted restart is ending this copy.
-    pub(crate) fn exiting_for_restart(&self) -> bool {
+    pub fn exiting_for_restart(&self) -> bool {
         self.exiting_for_restart.load(Ordering::SeqCst)
     }
 
@@ -787,13 +803,26 @@ impl Engine {
         self.exit_cut.load(Ordering::SeqCst)
     }
 
-    /// Runs `hook` at the start of every exit. Tests only.
+    /// Runs `hook` in every exit, after the MCP server stops and before the
+    /// plugins stop. Tests only.
     #[doc(hidden)]
     pub fn set_exit_hook(&self, hook: Option<ExitHook>) {
         *lock(&self.exit_hook) = hook;
     }
 
+    /// Runs `hook` in every unlock, on the blocking thread just before the key
+    /// is derived. Tests only.
+    #[doc(hidden)]
+    pub fn set_unlock_hook(&self, hook: Option<ExitHook>) {
+        *lock(&self.unlock_hook) = hook;
+    }
+
     async fn exit_now(&self, reason: ExitReason) {
+        // An unlock or PIN check already under way finishes first, so it
+        // cannot start the MCP server, call a plugin's on_unlock or rewrite
+        // the vault after the stop steps below. An unlock that waits on this
+        // lock is refused once it gets it (issue #91).
+        drop(self.pin_check.lock().await);
         // First, so no agent request lands while a plugin's stop step runs.
         self.stop_mcp().await;
         let hook = lock(&self.exit_hook).clone();
@@ -2751,6 +2780,10 @@ impl Engine {
     }
 
     async fn start_mcp_inner(&self) -> AegisResult<McpStatus> {
+        // The restart's exit has stopped the server, or is about to.
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         let config = self.with_state(|s| s.mcp.clone())?;
         let host = validate_mcp_host(&config.host)?;
         let mut slot = self.mcp.lock().await;
@@ -3183,7 +3216,7 @@ fn too_many_plans() -> AegisError {
 }
 
 fn restarting() -> AegisError {
-    AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator. Unlock the new copy.")
+    AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator, so this copy does nothing more. Use the new copy once it opens.")
 }
 
 fn ticket_not_found() -> AegisError {

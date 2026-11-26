@@ -197,3 +197,37 @@ async fn a_lock_while_a_restart_ends_this_copy_leaves_the_stopping_to_the_exit()
     assert_eq!(f.engine.forget_this_pc().unwrap_err().code, ErrorCode::Conflict, "nothing in ./data changes after the claim is let go");
     f.engine.set_exit_hook(None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlock_already_deriving_its_key_when_a_restart_begins_keeps_nothing() {
+    // The owner unlocks, and while the key is being derived the restart is
+    // accepted. The exit waits for that unlock, which then keeps no vault and
+    // tells no plugin it unlocked, so the exit's stop steps are the last word.
+    let f = ready().await;
+    f.engine.lock().await;
+    assert!(!f.engine.status().unlocked);
+    let unlocks_before = f.plugin.unlocks.load(Ordering::SeqCst);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, go_rx) = (std::sync::Mutex::new(entered_tx), std::sync::Mutex::new(go_rx));
+    f.engine.set_unlock_hook(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+    })));
+    let engine = f.engine.clone();
+    let unlock = tokio::spawn(async move { engine.unlock(PIN.into()).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the unlock derives its key");
+    let engine = f.engine.clone();
+    let restart = tokio::spawn(async move { restart_elevated(&engine, || Ok(()), || {}, || {}).await });
+    let started = Instant::now();
+    while !f.engine.exiting_for_restart() {
+        assert!(started.elapsed() < Duration::from_secs(30), "the restart was accepted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    go_tx.send(()).unwrap();
+    assert_eq!(unlock.await.unwrap().unwrap_err().code, ErrorCode::Conflict, "the unlock is refused");
+    restart.await.unwrap().unwrap();
+    assert_eq!(f.plugin.unlocks.load(Ordering::SeqCst), unlocks_before, "no plugin was told this copy unlocked");
+    assert!(!f.engine.status().unlocked && !f.engine.locked_monitoring(), "the ending copy holds no vault and runs nothing");
+    f.engine.set_unlock_hook(None);
+}
