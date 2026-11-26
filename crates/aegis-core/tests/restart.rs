@@ -190,6 +190,8 @@ async fn a_lock_while_a_restart_ends_this_copy_leaves_the_stopping_to_the_exit()
     assert!(f.engine.lock().await.unlocked, "the lock leaves the vault to the exit");
     assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before, "and stops nothing itself");
     assert_eq!(f.engine.unlock(PIN.into()).await.unwrap_err().code, ErrorCode::Conflict, "this copy cannot be unlocked again");
+    assert_eq!(f.engine.start_mcp().await.unwrap_err().code, ErrorCode::Conflict, "nor serve agents again");
+    assert!(!f.engine.mcp_status().await.running);
     go_tx.send(()).unwrap();
     restart.await.unwrap().unwrap();
     assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before + 1, "the exit stopped the plugin, once");
@@ -199,10 +201,11 @@ async fn a_lock_while_a_restart_ends_this_copy_leaves_the_stopping_to_the_exit()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unlock_already_deriving_its_key_when_a_restart_begins_keeps_nothing() {
-    // The owner unlocks, and while the key is being derived the restart is
-    // accepted. The exit waits for that unlock, which then keeps no vault and
-    // tells no plugin it unlocked, so the exit's stop steps are the last word.
+async fn unlocks_under_way_when_a_restart_begins_keep_nothing() {
+    // The owner unlocks, and while the key is being derived a second unlock
+    // waits its turn and the restart is accepted. The first keeps no vault
+    // and tells no plugin it unlocked; the second is refused once its turn
+    // comes and derives no key at all.
     let f = ready().await;
     f.engine.lock().await;
     assert!(!f.engine.status().unlocked);
@@ -210,13 +213,20 @@ async fn an_unlock_already_deriving_its_key_when_a_restart_begins_keeps_nothing(
     let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let (entered_tx, go_rx) = (std::sync::Mutex::new(entered_tx), std::sync::Mutex::new(go_rx));
+    let derived = Arc::new(AtomicUsize::new(0));
+    let counted = derived.clone();
     f.engine.set_unlock_hook(Some(Arc::new(move || {
-        let _ = entered_tx.lock().unwrap().send(());
-        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = entered_tx.lock().unwrap().send(());
+            let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+        }
     })));
     let engine = f.engine.clone();
-    let unlock = tokio::spawn(async move { engine.unlock(PIN.into()).await });
+    let first = tokio::spawn(async move { engine.unlock(PIN.into()).await });
     tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the unlock derives its key");
+    let engine = f.engine.clone();
+    let second = tokio::spawn(async move { engine.unlock(PIN.into()).await });
+    tokio::time::sleep(Duration::from_millis(100)).await; // the second now waits its turn
     let engine = f.engine.clone();
     let restart = tokio::spawn(async move { restart_elevated(&engine, || Ok(()), || {}, || {}).await });
     let started = Instant::now();
@@ -225,9 +235,57 @@ async fn an_unlock_already_deriving_its_key_when_a_restart_begins_keeps_nothing(
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     go_tx.send(()).unwrap();
-    assert_eq!(unlock.await.unwrap().unwrap_err().code, ErrorCode::Conflict, "the unlock is refused");
+    assert_eq!(first.await.unwrap().unwrap_err().code, ErrorCode::Conflict, "the first unlock is refused");
+    assert_eq!(second.await.unwrap().unwrap_err().code, ErrorCode::Conflict, "the second unlock is refused");
     restart.await.unwrap().unwrap();
+    assert_eq!(derived.load(Ordering::SeqCst), 1, "the waiting unlock derived no key");
     assert_eq!(f.plugin.unlocks.load(Ordering::SeqCst), unlocks_before, "no plugin was told this copy unlocked");
     assert!(!f.engine.status().unlocked && !f.engine.locked_monitoring(), "the ending copy holds no vault and runs nothing");
     f.engine.set_unlock_hook(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlock_that_kept_the_vault_just_before_a_restart_finishes_before_the_exit_stops_anything() {
+    // The vault is kept, then the restart is accepted before the plugins are
+    // told. The exit waits for that unlock, so no plugin hears of the unlock
+    // after its stop, and the exit's lock is the last word.
+    let f = ready().await;
+    f.engine.lock().await;
+    let unlocks_before = f.plugin.unlocks.load(Ordering::SeqCst);
+    let locks_before = f.plugin.locks.load(Ordering::SeqCst);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, go_rx) = (std::sync::Mutex::new(entered_tx), std::sync::Mutex::new(go_rx));
+    f.engine.set_unlock_kept_hook(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(30));
+    })));
+    // What the plugin had heard when the exit's stop steps began.
+    let heard = Arc::new(AtomicUsize::new(usize::MAX));
+    let (heard_at_exit, plugin) = (heard.clone(), f.plugin.clone());
+    f.engine.set_exit_hook(Some(Arc::new(move || heard_at_exit.store(plugin.unlocks.load(Ordering::SeqCst), Ordering::SeqCst))));
+    let engine = f.engine.clone();
+    let unlock = tokio::spawn(async move { engine.unlock(PIN.into()).await });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(30))).await.unwrap().expect("the unlock keeps the vault");
+    let engine = f.engine.clone();
+    let restart = tokio::spawn(async move { restart_elevated(&engine, || Ok(()), || {}, || {}).await });
+    let started = Instant::now();
+    while !f.engine.exiting_for_restart() {
+        assert!(started.elapsed() < Duration::from_secs(30), "the restart was accepted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Give an exit that does not wait the time to reach its stop steps.
+    let waited = Instant::now();
+    while heard.load(Ordering::SeqCst) == usize::MAX && waited.elapsed() < Duration::from_millis(500) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(heard.load(Ordering::SeqCst), usize::MAX, "no stop step starts while the unlock is under way");
+    go_tx.send(()).unwrap();
+    assert_eq!(unlock.await.unwrap().unwrap_err().code, ErrorCode::Conflict, "the unlock reports the restart");
+    restart.await.unwrap().unwrap();
+    assert_eq!(heard.load(Ordering::SeqCst), unlocks_before + 1, "the plugin heard of the unlock before the exit stopped it");
+    assert_eq!(f.plugin.locks.load(Ordering::SeqCst), locks_before + 1, "the exit stopped the plugin, once");
+    assert!(!f.engine.status().unlocked && !f.engine.mcp_status().await.running, "the ending copy holds no vault and serves nothing");
+    f.engine.set_unlock_kept_hook(None);
+    f.engine.set_exit_hook(None);
 }
