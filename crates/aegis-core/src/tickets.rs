@@ -111,6 +111,14 @@ pub struct PlanMeta {
     pub stop_reason: Option<String>,
 }
 
+impl Ticket {
+    /// A plan the owner or the assistant wrote: only the AegisWin app may end
+    /// it, because the device page gives its form to anyone who knows the id.
+    pub fn app_ends_it(&self) -> bool {
+        self.plan.as_ref().is_some_and(|p| p.origin != PlanOrigin::Agent)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Ticket {
     pub id: String,
@@ -139,6 +147,16 @@ pub struct Ticket {
     pub cancel_requested: bool,
     /// The one-time code for approving on another device, while one is shown.
     pub device_code: Option<DeviceCode>,
+    /// A device-page decision holds the code while it is applied, so another
+    /// submission meanwhile is a conflict, not a wrong code (issue #73).
+    pub deciding: bool,
+    /// The code a decision in progress holds was revoked meanwhile (the
+    /// feature turned off or tripped), so it is never given back, even if the
+    /// feature is turned on again before the decision finishes.
+    pub code_revoked: bool,
+    /// Wrong codes typed on the device page for a plan only the app may end.
+    /// They cancel the code, never the plan (see `Ticket::app_ends_it`).
+    pub device_misses: u8,
 }
 
 /// Only the code's hash is kept; the code itself is shown once, in the app.
@@ -308,6 +326,9 @@ impl TicketStore {
             steps: t.steps,
             cancel_requested: false,
             device_code: None,
+            deciding: false,
+            code_revoked: false,
+            device_misses: 0,
         };
         let view = ticket.view();
         self.tickets.insert(ticket.id.clone(), ticket);
@@ -331,6 +352,7 @@ impl TicketStore {
     pub fn clear_device_codes(&mut self) {
         for t in self.tickets.values_mut() {
             t.device_code = None;
+            t.code_revoked |= t.deciding;
         }
     }
 

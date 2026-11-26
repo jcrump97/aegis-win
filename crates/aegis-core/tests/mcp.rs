@@ -674,3 +674,276 @@ async fn cancelling_a_ticket_checks_who_made_it_with_the_app_and_an_agent_acting
     let r = s.call("aegis__cancel_ticket", json!({ "ticketId": plan.ticket_id })).await;
     assert_ne!(r["isError"], true, "{r}");
 }
+
+#[tokio::test]
+async fn the_device_page_cancels_only_what_an_agent_could_cancel_with_the_app_acting_after() {
+    use aegis_core::plan::PlanOrigin;
+    use aegis_core::tickets::TicketStatus;
+    // Issue #71: the page hands its form token to anyone who knows the ticket id, so its
+    // cancel is the weaker caller. An agent that learned the id of the owner's plan gets
+    // no further on the page than it does with aegis__cancel_ticket.
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "mine" } }] })).await.unwrap();
+    let (url, _) = s.device_code(&owner.ticket_id).await;
+    let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "cancel")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(r.text().await.unwrap().contains("Only the AegisWin app can decline or stop a plan you or the assistant wrote"));
+    assert_eq!(s.f.engine.ticket(&owner.ticket_id).unwrap().status, TicketStatus::PendingApproval, "the owner's plan is untouched");
+
+    // The owner, in the app, still cancels it.
+    assert_eq!(s.f.engine.cancel_ticket(&owner.ticket_id).unwrap().status, TicketStatus::Cancelled);
+
+    // An agent's own plan is still cancelled from the page.
+    let agent = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "theirs" } }] })).await["structuredContent"].clone();
+    let id = agent["ticketId"].as_str().unwrap().to_owned();
+    let (url, _) = s.device_code(&id).await;
+    let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "cancel")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, TicketStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn the_page_offers_no_stop_button_on_a_plan_the_owner_wrote() {
+    use aegis_core::plan::PlanOrigin;
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "wait-owner" } }] })).await.unwrap();
+    let (url, code) = s.device_code(&owner.ticket_id).await;
+    let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
+    let csrf = extract_csrf(&html);
+    let hash = owner.plan.as_ref().map(|p| p.hash.clone()).unwrap();
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("code", code.as_str()), ("decision", "approve"), ("plan_hash", hash.as_str())]).finish();
+    let approved = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap().text().await.unwrap();
+    assert!(!approved.contains("value=\"cancel\""), "no stop button the page could not honour");
+    assert!(approved.contains("Stop it in the AegisWin app"));
+    s.f.plugin.release.add_permits(1);
+}
+
+/// Runs `engine.set_device_approval(true, PIN)` from inside the apply hook,
+/// which is synchronous. Needs a multi-thread runtime.
+fn turn_on_again(engine: &aegis_core::engine::Engine) {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(engine.set_device_approval(true, Some(PIN.into())))).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_code_held_while_device_approval_is_turned_off_is_not_given_back() {
+    use aegis_core::tickets::TicketStatus;
+    // Issue #72: turning the feature off forgets every code, even one that a failing
+    // decision had taken out of the ticket at that moment, and even when the owner
+    // turns it on again before that decision finishes.
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "off" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    s.f.engine.set_approval_record_limits(0, 0);
+    let engine = s.f.engine.clone();
+    s.f.engine.set_device_apply_hook(Some(std::sync::Arc::new(move || {
+        engine.turn_off_device_approval();
+        turn_on_again(&engine);
+    })));
+    let _ = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    s.f.engine.set_device_apply_hook(None);
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, TicketStatus::PendingApproval);
+    assert!(s.f.engine.device_approval_on());
+
+    // The old code is dead, and no submission is stuck as "being applied".
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_code_held_while_wrong_codes_trip_device_approval_is_not_given_back() {
+    use aegis_core::engine::DEVICE_MISSES_PER_HOUR;
+    // Issue #72, the hourly trip: wrong codes on other requests turn the feature off
+    // while a decision holds its code, and the owner turns it on again at once.
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "trip" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    let mut others = Vec::new();
+    for n in 0..DEVICE_MISSES_PER_HOUR.div_ceil(3) {
+        let other = s.call("demo__fix", json!({ "note": format!("guess {n}") })).await["structuredContent"].clone();
+        let other = other["ticketId"].as_str().unwrap().to_owned();
+        s.device_code(&other).await;
+        others.push(other);
+    }
+    s.f.engine.set_approval_record_limits(0, 0);
+    let engine = s.f.engine.clone();
+    s.f.engine.set_device_apply_hook(Some(std::sync::Arc::new(move || {
+        for n in 0..DEVICE_MISSES_PER_HOUR {
+            let _ = engine.decide_on_device(&others[n / 3], true, "ZZZZ-ZZZZ", None, None);
+        }
+        assert!(!engine.device_approval_on(), "the wrong codes tripped it");
+        turn_on_again(&engine);
+    })));
+    let _ = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    s.f.engine.set_device_apply_hook(None);
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "{err:?}");
+}
+
+#[tokio::test]
+async fn a_panic_while_a_decision_is_applied_leaves_no_request_stuck() {
+    // Issue #73: the marker that turns a second submission into "being applied" is
+    // cleared however the first one ends, a panic included, and its code is used up.
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "panic" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    s.f.engine.set_device_apply_hook(Some(std::sync::Arc::new(|| panic!("applying failed"))));
+    let engine = s.f.engine.clone();
+    let (id_in, code_in) = (id.clone(), code.clone());
+    assert!(std::thread::spawn(move || engine.decide_on_device(&id_in, true, &code_in, None, None)).join().is_err());
+    s.f.engine.set_device_apply_hook(None);
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "not a conflict: nothing is being applied, and the code was used: {err:?}");
+    let (_, fresh) = s.device_code(&id).await;
+    assert!(s.f.engine.decide_on_device(&id, true, &fresh, None, None).is_ok(), "a new code from the app works");
+}
+
+#[tokio::test]
+async fn the_device_page_declines_only_what_an_agent_could_decline_with_the_app_acting_after() {
+    use aegis_core::plan::PlanOrigin;
+    use aegis_core::tickets::TicketStatus;
+    // Issue #71: declining needs no code, so the page ends no plan the owner or the
+    // assistant wrote. It shows no Decline button there and refuses one posted anyway.
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "keep" } }] })).await.unwrap();
+    let (url, _) = s.device_code(&owner.ticket_id).await;
+    let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(!html.contains("value=\"decline\""), "no Decline button on the owner's plan");
+    assert!(html.contains("To decline it, use the AegisWin app."));
+    assert!(html.contains("3 wrong codes cancel this code.") && !html.contains("attempt(s) left for this request"), "codes cannot lock the owner's plan, so the page counts none for it");
+    let csrf = extract_csrf(&html);
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "decline")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(r.text().await.unwrap().contains("Only the AegisWin app can decline or stop a plan you or the assistant wrote"));
+    assert_eq!(s.f.engine.ticket(&owner.ticket_id).unwrap().status, TicketStatus::PendingApproval, "the owner's plan is untouched");
+
+    // The owner, in the app, still declines it.
+    let declined = s.f.engine.decide(&owner.ticket_id, false, PIN.into(), None, "app", None).await.unwrap();
+    assert_eq!(declined.status, TicketStatus::Declined);
+
+    // An agent's own plan is still declined from the page.
+    let agent = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "theirs" } }] })).await["structuredContent"].clone();
+    let id = agent["ticketId"].as_str().unwrap().to_owned();
+    let (url, _) = s.device_code(&id).await;
+    let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains("value=\"decline\""));
+    assert!(html.contains("3 attempt(s) left for this request."));
+    let csrf = extract_csrf(&html);
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "decline")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, TicketStatus::Declined);
+}
+
+#[tokio::test]
+async fn wrong_codes_on_the_device_page_cancel_the_code_but_never_end_a_plan_only_the_app_may_end() {
+    use aegis_core::plan::PlanOrigin;
+    use aegis_core::tickets::TicketStatus;
+    // Anyone who knows the id can post codes, so for a plan the owner or the assistant
+    // wrote, three wrong ones cancel the code and leave the plan waiting for the app.
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "keep" } }] })).await.unwrap();
+    let id = owner.ticket_id.clone();
+    let hash = owner.plan.as_ref().unwrap().hash.clone();
+    let (_, code) = s.device_code(&id).await;
+    let wrong = if code == "ZZZZ-ZZZZ" { "YYYY-YYYY" } else { "ZZZZ-ZZZZ" };
+    for _ in 0..3 {
+        let err = s.f.engine.decide_on_device(&id, true, wrong, None, Some(&hash)).unwrap_err();
+        assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid);
+    }
+    let ticket = s.f.engine.ticket(&id).unwrap();
+    assert_eq!(ticket.status, TicketStatus::PendingApproval, "the owner's plan is still waiting");
+    assert_eq!(ticket.attempts_remaining, aegis_core::tickets::STRIKES_PER_TICKET, "the app's PIN attempts are untouched");
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, Some(&hash)).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "the cancelled code no longer approves");
+
+    // A new code from the app starts a fresh count: two misses, a new code, two more
+    // misses, and the newest code still approves. (Codes come straight from the engine
+    // here, so the hourly count is not reset by turning the feature on again.)
+    let next = s.f.engine.device_code(&id).await.unwrap().code;
+    for _ in 0..2 {
+        let _ = s.f.engine.decide_on_device(&id, true, wrong, None, Some(&hash)).unwrap_err();
+    }
+    let fresh = s.f.engine.device_code(&id).await.unwrap().code;
+    assert_ne!(next, fresh);
+    for _ in 0..2 {
+        let _ = s.f.engine.decide_on_device(&id, true, wrong, None, Some(&hash)).unwrap_err();
+    }
+    assert_ne!(s.f.engine.decide_on_device(&id, true, &fresh, None, Some(&hash)).unwrap().status, TicketStatus::PendingApproval);
+
+    // Wrong codes on such a plan still count toward the hourly limit: 8 so far, and two
+    // more on another owner plan turn the feature off, with that plan still waiting.
+    use aegis_core::engine::DEVICE_MISSES_PER_HOUR;
+    assert_eq!(DEVICE_MISSES_PER_HOUR, 10, "the counts below assume the limit");
+    let other = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "also mine" } }] })).await.unwrap();
+    let other_hash = other.plan.as_ref().unwrap().hash.clone();
+    s.f.engine.device_code(&other.ticket_id).await.unwrap();
+    let _ = s.f.engine.decide_on_device(&other.ticket_id, true, wrong, None, Some(&other_hash)).unwrap_err();
+    assert!(s.f.engine.device_approval_on(), "nine misses leave it on");
+    let _ = s.f.engine.decide_on_device(&other.ticket_id, true, wrong, None, Some(&other_hash)).unwrap_err();
+    assert!(!s.f.engine.device_approval_on(), "the tenth turns it off");
+    assert_eq!(s.f.engine.ticket(&other.ticket_id).unwrap().status, TicketStatus::PendingApproval);
+
+    // An agent's request is still locked by three wrong codes, as before.
+    let agent = s.call("demo__fix", json!({ "note": "theirs" })).await["structuredContent"].clone();
+    let agent_id = agent["ticketId"].as_str().unwrap().to_owned();
+    s.device_code(&agent_id).await;
+    for _ in 0..3 {
+        let _ = s.f.engine.decide_on_device(&agent_id, true, wrong, None, None).unwrap_err();
+    }
+    assert_eq!(s.f.engine.ticket(&agent_id).unwrap().status, TicketStatus::LockedOut);
+}
+
+#[tokio::test]
+async fn a_submission_while_a_decision_is_applied_is_a_conflict_not_a_wrong_code() {
+    use aegis_core::tickets::TicketStatus;
+    // Issue #73: a double-click while the first decision is being written gets "being
+    // applied", with no strike on the ticket and no miss toward the hourly limit.
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "double" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    // One short of the hourly limit, so a single miss counted below would turn it off.
+    use aegis_core::engine::DEVICE_MISSES_PER_HOUR;
+    let mut misses = 0;
+    while misses < DEVICE_MISSES_PER_HOUR - 1 {
+        let other = s.call("demo__fix", json!({ "note": format!("guess {misses}") })).await["structuredContent"].clone();
+        let other = other["ticketId"].as_str().unwrap().to_owned();
+        s.device_code(&other).await;
+        for _ in 0..3.min(DEVICE_MISSES_PER_HOUR - 1 - misses) {
+            let _ = s.f.engine.decide_on_device(&other, true, "ZZZZ-ZZZZ", None, None);
+            misses += 1;
+        }
+    }
+    assert!(s.f.engine.device_approval_on());
+    s.f.engine.set_approval_record_limits(0, 0);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (engine, seen_in, again, id_in) = (s.f.engine.clone(), seen.clone(), code.clone(), id.clone());
+    s.f.engine.set_device_apply_hook(Some(std::sync::Arc::new(move || {
+        for _ in 0..4 {
+            seen_in.lock().unwrap().push(engine.decide_on_device(&id_in, true, &again, None, None).unwrap_err().code);
+        }
+        seen_in.lock().unwrap().push(engine.decide_on_device(&id_in, false, "", None, None).unwrap_err().code);
+    })));
+    let _ = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    s.f.engine.set_device_apply_hook(None);
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    assert!(seen.lock().unwrap().iter().all(|c| *c == aegis_core::ErrorCode::Conflict), "{:?}", seen.lock().unwrap());
+
+    // Nothing was counted: the ticket keeps its three attempts and the code still works.
+    let ticket = s.f.engine.ticket(&id).unwrap();
+    assert_eq!(ticket.status, TicketStatus::PendingApproval);
+    assert_eq!(ticket.attempts_remaining, 3);
+    assert!(s.f.engine.device_approval_on(), "no hourly misses were counted");
+    let approved = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap();
+    assert_ne!(approved.status, TicketStatus::PendingApproval);
+}
