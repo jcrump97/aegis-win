@@ -644,7 +644,7 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
             "<form method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
 {CODE_FIELD}\
 <label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
-<p>{}</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run</button>\
+<p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run</button>\
 <button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button></div></form>",
             escape_html(csrf),
             ticket.attempts_remaining
@@ -750,7 +750,7 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
 <input type=\"hidden\" name=\"plan_hash\" value=\"{}\">\
 {CODE_FIELD}\
 <label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
-<p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run {} step{}</button>\
+<p>{}</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run {} step{}</button>\
 {}</div></form>{}",
             escape_html(csrf),
             escape_html(&plan.hash),
