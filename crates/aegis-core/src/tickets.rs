@@ -142,6 +142,10 @@ pub struct Ticket {
     /// A device-page decision holds the code while it is applied, so another
     /// submission meanwhile is a conflict, not a wrong code (issue #73).
     pub deciding: bool,
+    /// The code a decision in progress holds was revoked meanwhile (the
+    /// feature turned off or tripped), so it is never given back, even if the
+    /// feature is turned on again before the decision finishes.
+    pub code_revoked: bool,
 }
 
 /// Only the code's hash is kept; the code itself is shown once, in the app.
@@ -312,6 +316,7 @@ impl TicketStore {
             cancel_requested: false,
             device_code: None,
             deciding: false,
+            code_revoked: false,
         };
         let view = ticket.view();
         self.tickets.insert(ticket.id.clone(), ticket);
@@ -335,6 +340,7 @@ impl TicketStore {
     pub fn clear_device_codes(&mut self) {
         for t in self.tickets.values_mut() {
             t.device_code = None;
+            t.code_revoked |= t.deciding;
         }
     }
 

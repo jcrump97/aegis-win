@@ -95,6 +95,8 @@ test('Documentation Audit: ADRs 0002 and 0003 are accepted and keep their trust 
   assert.match(plans, /one global serial executor/);
   // The device page cancels as the weaker caller, so a stolen page link cannot stop the owner's plans (#71).
   assert.match(plans, /The device page's cancel checks origin the same way, as the weaker caller/);
+  assert.match(plans, /Its Decline, which needs no code, is limited the same way/);
+  assert.doesNotMatch(plans, /Decline needs the PIN, as before/);
   assert.doesNotMatch(plans, /The device page's cancel does not check origin/);
   // Plugin data in the vault: own records only, and the store never replaces the gate.
   const spec = fs.readFileSync('documentation/PLUGIN_SPEC.md', 'utf8');
@@ -115,9 +117,11 @@ test('Documentation Audit: ADR 0004 is accepted and records every owner decision
   assert.match(adr, /Wrong codes never count towards `PinGuard`\./);
   // A submission during apply is a conflict, and turning the feature off destroys a held code (#72, #73).
   assert.match(adr, /answered 409 "being applied": it costs no attempt and no hourly miss/);
-  assert.match(adr, /turning the feature off while a decision is being applied destroys that code for good/);
+  assert.match(adr, /destroys that code for good, even if the owner turns it on again before the decision finishes/);
+  assert.match(adr, /The mark is cleared however the decision ends, a panic included/);
   const model = fs.readFileSync('documentation/SECURITY_MODEL.md', 'utf8');
-  assert.match(model, /it cancels as an agent would and may stop only requests and plans an agent made/);
+  assert.match(model, /it cancels and declines as an agent would, and may stop or decline only requests and plans an agent made/);
+  assert.match(model, /never given back, even if the owner turns it on again before that decision finishes/);
   assert.doesNotMatch(model, /The page's cancel does not check origin/);
   // §8: hardening is complete for 0.x; new security work needs a finding, new attack surface, or an outside review.
   assert.match(adr, /## 8\. Security scope after this ADR/);

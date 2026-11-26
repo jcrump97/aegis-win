@@ -50,6 +50,37 @@ impl Default for EngineOptions {
 /// See `Engine::set_device_apply_hook`.
 pub type DeviceApplyHook = Arc<dyn Fn() + Send + Sync>;
 
+/// What the device page says when asked to decline a plan only the app may end.
+pub const DEVICE_PAGE_LEAVES_IT: &str = "Only the AegisWin app can decline or stop a plan you or the assistant wrote. Do it in the AegisWin app.";
+
+/// The code a device-page decision took out of its ticket while the decision
+/// is applied. Dropping it, after the decision or on a panic inside it, clears
+/// `deciding`, so the ticket never stays stuck as "being applied". The code
+/// goes back only when `give_back` was set (applying failed), the ticket is
+/// still pending with no newer code, the code was not revoked meanwhile, and
+/// device approval is still on (issues #72, #73).
+struct HeldCode<'a> {
+    tickets: &'a Mutex<TicketStore>,
+    id: &'a str,
+    code: Option<crate::tickets::DeviceCode>,
+    give_back: bool,
+    device_on: &'a AtomicBool,
+}
+
+impl Drop for HeldCode<'_> {
+    fn drop(&mut self) {
+        let mut store = lock(self.tickets);
+        if let Some(ticket) = store.get_mut(self.id, Instant::now()) {
+            ticket.deciding = false;
+            let revoked = std::mem::take(&mut ticket.code_revoked);
+            let code = self.code.take();
+            if self.give_back && !revoked && ticket.status == TicketStatus::PendingApproval && ticket.device_code.is_none() && self.device_on.load(Ordering::SeqCst) {
+                ticket.device_code = code;
+            }
+        }
+    }
+}
+
 pub struct Engine {
     /// Lets `&self` methods hand an owning reference to background tasks.
     me: std::sync::Weak<Engine>,
@@ -2009,11 +2040,17 @@ impl Engine {
                 // while its decision is applied: not a wrong code (issue #73).
                 return Err(AegisError::new(ErrorCode::Conflict, "A decision on this request is being applied. Reload the page in a moment."));
             }
+            if !approve && ticket.plan.as_ref().is_some_and(|p| p.origin != PlanOrigin::Agent) {
+                // Declining needs no code, and the page gives its form to anyone
+                // who knows the id, so it ends only what an agent could end
+                // itself (issue #71).
+                return Err(AegisError::new(ErrorCode::Conflict, DEVICE_PAGE_LEAVES_IT));
+            }
             let right_code = ticket.device_code.as_ref().is_some_and(|c| c.matches(code, now));
             if approve && right_code {
                 // Taken while the decision is applied, so two submissions
                 // together cannot both use it; given back below if applying fails.
-                held = ticket.device_code.take();
+                held = Some(HeldCode { tickets: &self.tickets, id, code: ticket.device_code.take(), give_back: false, device_on: &self.device_approval });
                 ticket.deciding = true;
             } else if approve {
                 drop(store);
@@ -2034,22 +2071,10 @@ impl Engine {
             }
         }
         let result = self.apply_decision(epoch, id, approve, comment, VIA);
-        if let Some(code) = held {
-            let mut store = lock(&self.tickets);
-            if let Some(ticket) = store.get_mut(id, Instant::now()) {
-                ticket.deciding = false;
-                // Applying failed (queue full, record not written) and the ticket
-                // is still pending: the owner's code stays good until it expires,
-                // so the page can be tried again. A wrong code still strikes, a
-                // decision that was applied keeps the code used up, and a code is
-                // never given back once the feature was turned off meanwhile
-                // (issue #72). Checked under the tickets lock, which turning it
-                // off takes after clearing the flag.
-                if result.is_err() && ticket.status == TicketStatus::PendingApproval && ticket.device_code.is_none() && self.device_approval_on() {
-                    ticket.device_code = Some(code);
-                }
-            }
+        if let Some(held) = held.as_mut() {
+            held.give_back = result.is_err();
         }
+        drop(held);
         result
     }
 
@@ -2576,9 +2601,9 @@ impl Engine {
     }
 
     /// Turns device approval off and forgets every code. Needs no PIN, since
-    /// it only makes less possible. The flag is cleared before the tickets
-    /// lock is taken, so a code held by a decision in progress is not given
-    /// back afterwards (`decide_on_device` checks the flag under that lock).
+    /// it only makes less possible. A code held by a decision in progress is
+    /// marked revoked under the tickets lock, so it is not given back even if
+    /// the feature is turned on again before that decision finishes.
     pub fn turn_off_device_approval(&self) {
         self.device_approval.store(false, Ordering::SeqCst);
         lock(&self.tickets).clear_device_codes();

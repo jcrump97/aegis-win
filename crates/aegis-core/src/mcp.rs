@@ -751,12 +751,17 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
 {CODE_FIELD}\
 <label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
 <p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run {} step{}</button>\
-<button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button></div></form>",
+{}</div></form>{}",
             escape_html(csrf),
             escape_html(&plan.hash),
             ticket.attempts_remaining,
             ticket.steps.len(),
             if ticket.steps.len() == 1 { "" } else { "s" },
+            // A plan the owner or the assistant wrote is declined only in the
+            // app: declining needs no code, so the page could not tell the owner
+            // from an agent that learned the id (issue #71).
+            if plan.origin == PlanOrigin::Agent { "<button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button>" } else { "" },
+            if plan.origin == PlanOrigin::Agent { String::new() } else { format!("<p>{}</p>", escape_html("To decline it, use the AegisWin app.")) },
         )),
         (TicketStatus::Queued, csrf) => {
             body.push_str("<p>Approved. Another change is running first; the plan starts when it finishes.</p>");
@@ -859,9 +864,6 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
     }
 }
 
-/// What the page tells someone who asks it to stop a plan only the app can stop.
-const APP_STOPS_IT: &str = "Only the AegisWin app can stop a plan you or the assistant wrote. Stop it in the AegisWin app.";
-
 /// The cancel button: the CSRF token has already been checked. The page gives
 /// that token to anyone who knows the ticket's id, so it cannot tell the owner
 /// from an agent that learned the id: it cancels as the weaker caller, only
@@ -870,7 +872,7 @@ fn portal_cancel(state: &AppState, id: &str) -> Response {
     let csrf = state.engine.ticket_csrf(id);
     let ticket = state.engine.ticket(id);
     if let Some(ticket) = ticket.as_ref().filter(|t| t.plan.as_ref().is_some_and(|p| p.origin != PlanOrigin::Agent)) {
-        return page(StatusCode::CONFLICT, &render_ticket(ticket, csrf.as_deref(), Some((APP_STOPS_IT, false))));
+        return page(StatusCode::CONFLICT, &render_ticket(ticket, csrf.as_deref(), Some((crate::engine::DEVICE_PAGE_LEAVES_IT, false))));
     }
     match state.engine.cancel_ticket_for(&Origin::Mcp, id) {
         Ok(view) => {
