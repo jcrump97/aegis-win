@@ -139,6 +139,9 @@ pub struct Ticket {
     pub cancel_requested: bool,
     /// The one-time code for approving on another device, while one is shown.
     pub device_code: Option<DeviceCode>,
+    /// A device-page decision holds the code while it is applied, so another
+    /// submission meanwhile is a conflict, not a wrong code (issue #73).
+    pub deciding: bool,
 }
 
 /// Only the code's hash is kept; the code itself is shown once, in the app.
@@ -308,6 +311,7 @@ impl TicketStore {
             steps: t.steps,
             cancel_requested: false,
             device_code: None,
+            deciding: false,
         };
         let view = ticket.view();
         self.tickets.insert(ticket.id.clone(), ticket);

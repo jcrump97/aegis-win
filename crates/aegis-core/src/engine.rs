@@ -47,6 +47,9 @@ impl Default for EngineOptions {
     }
 }
 
+/// See `Engine::set_device_apply_hook`.
+pub type DeviceApplyHook = Arc<dyn Fn() + Send + Sync>;
+
 pub struct Engine {
     /// Lets `&self` methods hand an owning reference to background tasks.
     me: std::sync::Weak<Engine>,
@@ -83,6 +86,8 @@ pub struct Engine {
     device_misses: Mutex<VecDeque<Instant>>,
     /// Device approval was turned off by too many wrong codes.
     device_tripped: AtomicBool,
+    /// Tests only: runs while a device-page decision holds its code.
+    device_apply_hook: Mutex<Option<DeviceApplyHook>>,
     /// When agents last asked for approval, newest last (ADR 0004 §1.3).
     agent_requests: Mutex<VecDeque<Instant>>,
     /// Approval record events that could not be written yet, oldest first.
@@ -377,6 +382,7 @@ impl Engine {
             device_approval: AtomicBool::new(false),
             device_misses: Mutex::new(VecDeque::new()),
             device_tripped: AtomicBool::new(false),
+            device_apply_hook: Mutex::new(None),
             agent_requests: Mutex::new(VecDeque::new()),
             unwritten: Mutex::new(Vec::new()),
             record_full_bytes: AtomicU64::new(APPROVAL_RECORD_FULL_BYTES),
@@ -1991,18 +1997,25 @@ impl Engine {
             return Err(AegisError::new(ErrorCode::CodeInvalid, "Type the 8-character code shown in the AegisWin app, like K7QM-4XRT."));
         }
         let mut held = None;
-        if approve {
+        {
             let now = Instant::now();
             let mut store = lock(&self.tickets);
             let ticket = store.get_mut(id, now).ok_or_else(ticket_not_found)?;
             if ticket.status != TicketStatus::PendingApproval {
                 return Err(ticket_conflict(ticket.status));
             }
-            if ticket.device_code.as_ref().is_some_and(|c| c.matches(code, now)) {
+            if ticket.deciding {
+                // Another submission (often a double-click) holds the code
+                // while its decision is applied: not a wrong code (issue #73).
+                return Err(AegisError::new(ErrorCode::Conflict, "A decision on this request is being applied. Reload the page in a moment."));
+            }
+            let right_code = ticket.device_code.as_ref().is_some_and(|c| c.matches(code, now));
+            if approve && right_code {
                 // Taken while the decision is applied, so two submissions
                 // together cannot both use it; given back below if applying fails.
                 held = ticket.device_code.take();
-            } else {
+                ticket.deciding = true;
+            } else if approve {
                 drop(store);
                 self.device_miss(now);
                 return Err(self.strike(id, VIA, |left| match left {
@@ -2014,15 +2027,27 @@ impl Engine {
                 }));
             }
         }
+        if held.is_some() {
+            let hook = lock(&self.device_apply_hook).clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let result = self.apply_decision(epoch, id, approve, comment, VIA);
-        if let (Err(_), Some(code)) = (&result, held) {
-            // Applying failed (queue full, record not written) and the ticket is
-            // still pending: the owner's code stays good until it expires, so
-            // the page can be tried again. A wrong code still strikes, and a
-            // decision that was applied keeps the code used up.
+        if let Some(code) = held {
             let mut store = lock(&self.tickets);
-            if let Some(ticket) = store.get_mut(id, Instant::now()).filter(|t| t.status == TicketStatus::PendingApproval && t.device_code.is_none()) {
-                ticket.device_code = Some(code);
+            if let Some(ticket) = store.get_mut(id, Instant::now()) {
+                ticket.deciding = false;
+                // Applying failed (queue full, record not written) and the ticket
+                // is still pending: the owner's code stays good until it expires,
+                // so the page can be tried again. A wrong code still strikes, a
+                // decision that was applied keeps the code used up, and a code is
+                // never given back once the feature was turned off meanwhile
+                // (issue #72). Checked under the tickets lock, which turning it
+                // off takes after clearing the flag.
+                if result.is_err() && ticket.status == TicketStatus::PendingApproval && ticket.device_code.is_none() && self.device_approval_on() {
+                    ticket.device_code = Some(code);
+                }
             }
         }
         result
@@ -2545,10 +2570,25 @@ impl Engine {
             self.device_tripped.store(false, Ordering::SeqCst);
             self.device_approval.store(true, Ordering::SeqCst);
         } else {
-            self.device_approval.store(false, Ordering::SeqCst);
-            lock(&self.tickets).clear_device_codes();
+            self.turn_off_device_approval();
         }
         Ok(())
+    }
+
+    /// Turns device approval off and forgets every code. Needs no PIN, since
+    /// it only makes less possible. The flag is cleared before the tickets
+    /// lock is taken, so a code held by a decision in progress is not given
+    /// back afterwards (`decide_on_device` checks the flag under that lock).
+    pub fn turn_off_device_approval(&self) {
+        self.device_approval.store(false, Ordering::SeqCst);
+        lock(&self.tickets).clear_device_codes();
+    }
+
+    /// Runs `hook` each time a device-page decision has taken its code and
+    /// before the decision is applied. Tests only.
+    #[doc(hidden)]
+    pub fn set_device_apply_hook(&self, hook: Option<DeviceApplyHook>) {
+        *lock(&self.device_apply_hook) = hook;
     }
 
     /// Makes a new one-time code for a pending ticket, replacing any earlier

@@ -659,6 +659,16 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
     body
 }
 
+/// A plan the owner or the assistant wrote is stopped only in the app, so the
+/// page shows no button it could not honour (issue #71).
+fn plan_stop(plan: &PlanMeta, csrf: Option<&str>, label: &str) -> String {
+    if plan.origin == PlanOrigin::Agent {
+        cancel_form(csrf, label)
+    } else {
+        format!("<p>{}</p>", escape_html("Stop it in the AegisWin app if you need to."))
+    }
+}
+
 /// A PIN-free form that only withdraws or stops (it can never make more happen).
 fn cancel_form(csrf: Option<&str>, label: &str) -> String {
     csrf.map(|csrf| {
@@ -750,11 +760,11 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
         )),
         (TicketStatus::Queued, csrf) => {
             body.push_str("<p>Approved. Another change is running first; the plan starts when it finishes.</p>");
-            body.push_str(&cancel_form(csrf, "Cancel before it starts"));
+            body.push_str(&plan_stop(plan, csrf, "Cancel before it starts"));
         }
         (TicketStatus::Running, csrf) => {
             body.push_str("<p>Approved and running. You can close this page; reload it to see each step.</p>");
-            body.push_str(&cancel_form(csrf, "Stop after this step"));
+            body.push_str(&plan_stop(plan, csrf, "Stop after this step"));
         }
         _ => body.push_str("<p>This plan is closed. You can close this page.</p>"),
     }
@@ -849,10 +859,20 @@ async fn portal_post(State(state): State<AppState>, Path(id): Path<String>, Form
     }
 }
 
-/// The cancel button: the CSRF token has already been checked.
+/// What the page tells someone who asks it to stop a plan only the app can stop.
+const APP_STOPS_IT: &str = "Only the AegisWin app can stop a plan you or the assistant wrote. Stop it in the AegisWin app.";
+
+/// The cancel button: the CSRF token has already been checked. The page gives
+/// that token to anyone who knows the ticket's id, so it cannot tell the owner
+/// from an agent that learned the id: it cancels as the weaker caller, only
+/// what an agent could cancel with `aegis__cancel_ticket` (issue #71).
 fn portal_cancel(state: &AppState, id: &str) -> Response {
     let csrf = state.engine.ticket_csrf(id);
-    match state.engine.cancel_ticket(id) {
+    let ticket = state.engine.ticket(id);
+    if let Some(ticket) = ticket.as_ref().filter(|t| t.plan.as_ref().is_some_and(|p| p.origin != PlanOrigin::Agent)) {
+        return page(StatusCode::CONFLICT, &render_ticket(ticket, csrf.as_deref(), Some((APP_STOPS_IT, false))));
+    }
+    match state.engine.cancel_ticket_for(&Origin::Mcp, id) {
         Ok(view) => {
             let text = if view.status == TicketStatus::Cancelled { "Cancelled. Nothing more will run." } else { "Stopping after the step that is running now." };
             page(StatusCode::OK, &render_ticket(&view, csrf.as_deref(), Some((text, true))))

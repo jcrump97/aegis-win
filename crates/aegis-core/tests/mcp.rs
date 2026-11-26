@@ -674,3 +674,105 @@ async fn cancelling_a_ticket_checks_who_made_it_with_the_app_and_an_agent_acting
     let r = s.call("aegis__cancel_ticket", json!({ "ticketId": plan.ticket_id })).await;
     assert_ne!(r["isError"], true, "{r}");
 }
+
+#[tokio::test]
+async fn the_device_page_cancels_only_what_an_agent_could_cancel_with_the_app_acting_after() {
+    use aegis_core::plan::PlanOrigin;
+    use aegis_core::tickets::TicketStatus;
+    // Issue #71: the page hands its form token to anyone who knows the ticket id, so its
+    // cancel is the weaker caller. An agent that learned the id of the owner's plan gets
+    // no further on the page than it does with aegis__cancel_ticket.
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "mine" } }] })).await.unwrap();
+    let (url, _) = s.device_code(&owner.ticket_id).await;
+    let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "cancel")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    assert!(r.text().await.unwrap().contains("Only the AegisWin app can stop a plan you or the assistant wrote"));
+    assert_eq!(s.f.engine.ticket(&owner.ticket_id).unwrap().status, TicketStatus::PendingApproval, "the owner's plan is untouched");
+
+    // The owner, in the app, still cancels it.
+    assert_eq!(s.f.engine.cancel_ticket(&owner.ticket_id).unwrap().status, TicketStatus::Cancelled);
+
+    // An agent's own plan is still cancelled from the page.
+    let agent = s.call("aegis__propose_plan", json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "theirs" } }] })).await["structuredContent"].clone();
+    let id = agent["ticketId"].as_str().unwrap().to_owned();
+    let (url, _) = s.device_code(&id).await;
+    let csrf = extract_csrf(&s.http.get(&url).send().await.unwrap().text().await.unwrap());
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "cancel")]).finish();
+    let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, TicketStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn the_page_offers_no_stop_button_on_a_plan_the_owner_wrote() {
+    use aegis_core::plan::PlanOrigin;
+    let s = server().await;
+    let owner = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "wait-owner" } }] })).await.unwrap();
+    let (url, code) = s.device_code(&owner.ticket_id).await;
+    let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
+    let csrf = extract_csrf(&html);
+    let hash = owner.plan.as_ref().map(|p| p.hash.clone()).unwrap();
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("code", code.as_str()), ("decision", "approve"), ("plan_hash", hash.as_str())]).finish();
+    let approved = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap().text().await.unwrap();
+    assert!(!approved.contains("value=\"cancel\""), "no stop button the page could not honour");
+    assert!(approved.contains("Stop it in the AegisWin app"));
+    s.f.plugin.release.add_permits(1);
+}
+
+#[tokio::test]
+async fn a_code_held_while_device_approval_is_turned_off_is_not_given_back() {
+    use aegis_core::tickets::TicketStatus;
+    // Issue #72: turning the feature off forgets every code, even one that a failing
+    // decision had taken out of the ticket at that moment.
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "off" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    s.f.engine.set_approval_record_limits(0, 0);
+    let engine = s.f.engine.clone();
+    s.f.engine.set_device_apply_hook(Some(std::sync::Arc::new(move || engine.turn_off_device_approval())));
+    let _ = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    s.f.engine.set_device_apply_hook(None);
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    assert_eq!(s.f.engine.ticket(&id).unwrap().status, TicketStatus::PendingApproval);
+
+    // Turned on again within the code's five minutes: the old code is dead.
+    s.f.engine.set_device_approval(true, Some(PIN.into())).await.unwrap();
+    let err = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "{err:?}");
+}
+
+#[tokio::test]
+async fn a_submission_while_a_decision_is_applied_is_a_conflict_not_a_wrong_code() {
+    use aegis_core::tickets::TicketStatus;
+    // Issue #73: a double-click while the first decision is being written gets "being
+    // applied", with no strike on the ticket and no miss toward the hourly limit.
+    let s = server().await;
+    let pending = s.call("demo__fix", json!({ "note": "double" })).await["structuredContent"].clone();
+    let id = pending["ticketId"].as_str().unwrap().to_owned();
+    let (_, code) = s.device_code(&id).await;
+    s.f.engine.set_approval_record_limits(0, 0);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (engine, seen_in, again, id_in) = (s.f.engine.clone(), seen.clone(), code.clone(), id.clone());
+    s.f.engine.set_device_apply_hook(Some(std::sync::Arc::new(move || {
+        for _ in 0..4 {
+            seen_in.lock().unwrap().push(engine.decide_on_device(&id_in, true, &again, None, None).unwrap_err().code);
+        }
+        seen_in.lock().unwrap().push(engine.decide_on_device(&id_in, false, "", None, None).unwrap_err().code);
+    })));
+    let _ = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap_err();
+    s.f.engine.set_device_apply_hook(None);
+    s.f.engine.set_approval_record_limits(u64::MAX, u64::MAX);
+    assert!(seen.lock().unwrap().iter().all(|c| *c == aegis_core::ErrorCode::Conflict), "{:?}", seen.lock().unwrap());
+
+    // Nothing was counted: the ticket keeps its three attempts and the code still works.
+    let ticket = s.f.engine.ticket(&id).unwrap();
+    assert_eq!(ticket.status, TicketStatus::PendingApproval);
+    assert_eq!(ticket.attempts_remaining, 3);
+    assert!(s.f.engine.device_approval_on(), "no hourly misses were counted");
+    let approved = s.f.engine.decide_on_device(&id, true, &code, None, None).unwrap();
+    assert_ne!(approved.status, TicketStatus::PendingApproval);
+}
