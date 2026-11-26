@@ -644,7 +644,7 @@ fn render_ticket(ticket: &TicketView, csrf: Option<&str>, message: Option<(&str,
             "<form method=\"post\" autocomplete=\"off\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
 {CODE_FIELD}\
 <label for=\"comment\">Note for the agent (optional)</label><textarea id=\"comment\" name=\"comment\" rows=\"2\" maxlength=\"500\"></textarea>\
-<p>{} attempt(s) left for this request.</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run</button>\
+<p>{}</p><div class=\"row\"><button class=\"approve\" name=\"decision\" value=\"approve\">Approve and run</button>\
 <button class=\"decline\" name=\"decision\" value=\"decline\">Decline</button></div></form>",
             escape_html(csrf),
             ticket.attempts_remaining
@@ -754,7 +754,12 @@ fn render_plan(ticket: &TicketView, plan: &PlanMeta, csrf: Option<&str>, message
 {}</div></form>{}",
             escape_html(csrf),
             escape_html(&plan.hash),
-            ticket.attempts_remaining,
+            // Wrong codes lock only an agent's plan; on any other they cancel the code.
+            if plan.origin == PlanOrigin::Agent {
+                format!("{} attempt(s) left for this request.", ticket.attempts_remaining)
+            } else {
+                format!("{} wrong codes cancel this code. The AegisWin app can show a new one.", crate::tickets::STRIKES_PER_TICKET)
+            },
             ticket.steps.len(),
             if ticket.steps.len() == 1 { "" } else { "s" },
             // A plan the owner or the assistant wrote is declined only in the

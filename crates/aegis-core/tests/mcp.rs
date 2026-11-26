@@ -818,6 +818,7 @@ async fn the_device_page_declines_only_what_an_agent_could_decline_with_the_app_
     let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
     assert!(!html.contains("value=\"decline\""), "no Decline button on the owner's plan");
     assert!(html.contains("To decline it, use the AegisWin app."));
+    assert!(html.contains("3 wrong codes cancel this code.") && !html.contains("attempt(s) left for this request"), "codes cannot lock the owner's plan, so the page counts none for it");
     let csrf = extract_csrf(&html);
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "decline")]).finish();
     let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
@@ -835,6 +836,7 @@ async fn the_device_page_declines_only_what_an_agent_could_decline_with_the_app_
     let (url, _) = s.device_code(&id).await;
     let html = s.http.get(&url).send().await.unwrap().text().await.unwrap();
     assert!(html.contains("value=\"decline\""));
+    assert!(html.contains("3 attempt(s) left for this request."));
     let csrf = extract_csrf(&html);
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("csrf", csrf.as_str()), ("decision", "decline")]).finish();
     let r = s.http.post(&url).header("origin", &s.base).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.unwrap();
@@ -864,9 +866,32 @@ async fn wrong_codes_on_the_device_page_cancel_the_code_but_never_end_a_plan_onl
     let err = s.f.engine.decide_on_device(&id, true, &code, None, Some(&hash)).unwrap_err();
     assert_eq!(err.code, aegis_core::ErrorCode::CodeInvalid, "the cancelled code no longer approves");
 
-    // A new code from the app works, and the owner can still approve in the app instead.
-    let (_, fresh) = s.device_code(&id).await;
+    // A new code from the app starts a fresh count: two misses, a new code, two more
+    // misses, and the newest code still approves. (Codes come straight from the engine
+    // here, so the hourly count is not reset by turning the feature on again.)
+    let next = s.f.engine.device_code(&id).await.unwrap().code;
+    for _ in 0..2 {
+        let _ = s.f.engine.decide_on_device(&id, true, wrong, None, Some(&hash)).unwrap_err();
+    }
+    let fresh = s.f.engine.device_code(&id).await.unwrap().code;
+    assert_ne!(next, fresh);
+    for _ in 0..2 {
+        let _ = s.f.engine.decide_on_device(&id, true, wrong, None, Some(&hash)).unwrap_err();
+    }
     assert_ne!(s.f.engine.decide_on_device(&id, true, &fresh, None, Some(&hash)).unwrap().status, TicketStatus::PendingApproval);
+
+    // Wrong codes on such a plan still count toward the hourly limit: 8 so far, and two
+    // more on another owner plan turn the feature off, with that plan still waiting.
+    use aegis_core::engine::DEVICE_MISSES_PER_HOUR;
+    assert_eq!(DEVICE_MISSES_PER_HOUR, 10, "the counts below assume the limit");
+    let other = s.f.engine.propose_plan(PlanOrigin::Owner, json!({ "steps": [{ "tool": "demo__fix", "args": { "note": "also mine" } }] })).await.unwrap();
+    let other_hash = other.plan.as_ref().unwrap().hash.clone();
+    s.f.engine.device_code(&other.ticket_id).await.unwrap();
+    let _ = s.f.engine.decide_on_device(&other.ticket_id, true, wrong, None, Some(&other_hash)).unwrap_err();
+    assert!(s.f.engine.device_approval_on(), "nine misses leave it on");
+    let _ = s.f.engine.decide_on_device(&other.ticket_id, true, wrong, None, Some(&other_hash)).unwrap_err();
+    assert!(!s.f.engine.device_approval_on(), "the tenth turns it off");
+    assert_eq!(s.f.engine.ticket(&other.ticket_id).unwrap().status, TicketStatus::PendingApproval);
 
     // An agent's request is still locked by three wrong codes, as before.
     let agent = s.call("demo__fix", json!({ "note": "theirs" })).await["structuredContent"].clone();
