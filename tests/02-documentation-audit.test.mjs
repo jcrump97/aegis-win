@@ -176,6 +176,15 @@ test('Documentation Audit: agent docs keep the review and findings rules, and no
   assert.match(fs.readFileSync('documentation/GUIDING_PRINCIPLES.md', 'utf8'), /`--ui-scale: 0\.80` to `1\.50`/);
 });
 
+test('Documentation Audit: every ledger row from 113 on has the five columns of the header', () => {
+  // Older rows predate the column check and are left as they are.
+  const rows = fs.readFileSync('documentation/AUDIT_LEDGER.md', 'utf8').split(/\r?\n/).filter((l) => /^\| \d+ \|/.test(l));
+  for (const row of rows.filter((l) => Number(l.match(/^\| (\d+) \|/)[1]) >= 113)) {
+    const cells = row.replace(/`[^`]*`/g, 'x').split('|').slice(1, -1);
+    assert.equal(cells.length, 5, `ledger row ${row.slice(0, 12)} has five cells`);
+  }
+});
+
 test('Documentation Audit: the guiding principles in AGENTS.md are numbered in order', () => {
   // Rendered Markdown renumbers a list, so an out-of-order source shows different numbers than it says (issue #28).
   const section = fs.readFileSync('AGENTS.md', 'utf8').split(/^## /m).find((s) => s.startsWith('1. Guiding Engineering Principles'));
