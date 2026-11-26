@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, Weak};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -180,6 +181,8 @@ impl From<AegisError> for AppendError {
 pub(crate) struct HistoryService {
     data_dir: PathBuf,
     streams: Mutex<BTreeMap<String, Slot>>,
+    /// Set by [`HistoryService::seal`]: this copy writes nothing more.
+    sealed: AtomicBool,
 }
 
 fn io_err(e: io::Error) -> AegisError {
@@ -188,7 +191,32 @@ fn io_err(e: io::Error) -> AegisError {
 
 impl HistoryService {
     pub(crate) fn new(data_dir: &Path) -> Self {
-        Self { data_dir: data_dir.to_owned(), streams: Mutex::new(BTreeMap::new()) }
+        Self { data_dir: data_dir.to_owned(), streams: Mutex::new(BTreeMap::new()), sealed: AtomicBool::new(false) }
+    }
+
+    /// Closes every open file and refuses every later write, for good. Used
+    /// when a restart as administrator lets go of the install claim: the
+    /// files may be the elevated copy's from then on (issue #91). Set under
+    /// the streams lock, so a write already under way finishes first.
+    pub(crate) fn seal(&self) {
+        let mut streams = self.streams();
+        for slot in streams.values_mut() {
+            if let Some(w) = slot.writer.as_mut() {
+                let _ = w.close();
+            }
+        }
+        self.sealed.store(true, Ordering::SeqCst);
+    }
+
+    fn sealed(&self) -> bool {
+        self.sealed.load(Ordering::SeqCst)
+    }
+
+    fn refuse_if_sealed(&self) -> AegisResult<()> {
+        if self.sealed() {
+            return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator, so this copy writes nothing more."));
+        }
+        Ok(())
     }
 
     fn streams(&self) -> MutexGuard<'_, BTreeMap<String, Slot>> {
@@ -239,6 +267,7 @@ impl HistoryService {
     /// Seals one record as `how` says.
     pub(crate) fn append_with(&self, stream: &str, record: &Value, now: DateTime<Utc>, how: Append) -> Result<(), AppendError> {
         let mut streams = self.streams();
+        self.refuse_if_sealed()?;
         let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet; unlock AegisWin once"))?;
         let writer = slot.writer(self.dir(stream), stream);
         if how.chained && !writer.is_chained() {
@@ -272,6 +301,7 @@ impl HistoryService {
     /// same lock so no record lands in between. Returns the chain's head.
     pub(crate) fn turn_session(&self, stream: &str, session: Session, head: impl FnOnce() -> AegisResult<Head>) -> AegisResult<Head> {
         let mut streams = self.streams();
+        self.refuse_if_sealed()?;
         let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet"))?;
         let writer = slot.writer(self.dir(stream), stream);
         writer.close().map_err(io_err)?;
@@ -291,6 +321,7 @@ impl HistoryService {
     /// Starts the stream's chain again from nothing (after a purge).
     pub(crate) fn restart_chain(&self, stream: &str, session: Session) -> AegisResult<()> {
         let mut streams = self.streams();
+        self.refuse_if_sealed()?;
         let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet"))?;
         slot.writer(self.dir(stream), stream).set_chain(ChainWriter::new(Head::genesis(), session));
         Ok(())
@@ -298,7 +329,11 @@ impl HistoryService {
 
     /// Forces every stream's pending frames to disk once 30 seconds have passed.
     pub(crate) fn sync_due(&self) {
-        for slot in self.streams().values_mut() {
+        let mut streams = self.streams();
+        if self.sealed() {
+            return;
+        }
+        for slot in streams.values_mut() {
             if let Some(w) = slot.writer.as_mut() {
                 let _ = w.sync_if_due();
             }
@@ -309,7 +344,11 @@ impl HistoryService {
     /// context in memory while locked never covers frames written before.
     /// The writers stay, so a chained stream carries on from where it was.
     pub(crate) fn close_all(&self) {
-        for slot in self.streams().values_mut() {
+        let mut streams = self.streams();
+        if self.sealed() {
+            return;
+        }
+        for slot in streams.values_mut() {
             if let Some(w) = slot.writer.as_mut() {
                 let _ = w.close();
             }
@@ -345,6 +384,7 @@ impl HistoryService {
     /// hash is written and synced, and only then is the file deleted.
     pub(crate) fn prune_chained(&self, stream: &str, key: &StreamKey, oldest: NaiveDate, now: DateTime<Utc>) -> AegisResult<usize> {
         let mut streams = self.streams();
+        self.refuse_if_sealed()?;
         let dir = self.dir(stream);
         let slot = streams.get_mut(stream).ok_or_else(|| AegisError::new(ErrorCode::VaultLocked, "this history stream has no key yet"))?;
         let writer = slot.writer(dir.clone(), stream);
@@ -376,6 +416,7 @@ impl HistoryService {
     /// no record lands in between under the old key.
     pub(crate) fn purge(&self, stream: &str, key: PublicStreamKey, retention: Retention) -> AegisResult<usize> {
         let mut streams = self.streams();
+        self.refuse_if_sealed()?;
         // Replacing the slot drops the old writer, which closes its file.
         streams.insert(stream.to_owned(), Slot { key, retention, writer: None });
         history::purge(&self.dir(stream)).map_err(io_err)
@@ -383,7 +424,11 @@ impl HistoryService {
 
     /// Applies retention to every stream with a known key (at startup and unlock).
     pub(crate) fn enforce_retention(&self, now: DateTime<Utc>) {
-        for (stream, slot) in self.streams().iter() {
+        let streams = self.streams();
+        if self.sealed() {
+            return;
+        }
+        for (stream, slot) in streams.iter() {
             // A chained stream is pruned by the engine, which records what it removes.
             if stream == APPROVALS_STREAM || slot.writer.as_ref().is_some_and(SegmentWriter::is_chained) {
                 continue;
@@ -403,6 +448,9 @@ impl HistoryService {
     }
 
     pub(crate) fn write_runtime(&self, plugin_id: &str, file: Option<&RuntimeFile>) -> AegisResult<()> {
+        // Held while writing, so a seal waits for a write under way.
+        let _streams = self.streams();
+        self.refuse_if_sealed()?;
         let path = self.runtime_path(plugin_id);
         match file {
             Some(file) => {
@@ -418,6 +466,10 @@ impl HistoryService {
 
     /// Moves a runtime file aside so it is never resumed from.
     pub(crate) fn reject_runtime(&self, plugin_id: &str) {
+        let _streams = self.streams();
+        if self.sealed() {
+            return;
+        }
         let _ = std::fs::rename(self.runtime_path(plugin_id), self.rejected_path(plugin_id));
     }
 
@@ -496,4 +548,34 @@ impl HistoryHandle {
         self.engine()?.change_windows(since)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::StreamKey;
+
+    #[test]
+    fn a_sealed_service_closes_its_files_and_writes_nothing_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = HistoryService::new(dir.path());
+        service.set_key("demo", StreamKey::generate().public(), default_retention("demo"));
+        let now = Utc::now();
+        service.append("demo", &serde_json::json!({ "kind": "before" }), now).unwrap();
+        service.seal();
+        let size = |d: &Path| -> u64 { std::fs::read_dir(d).map(|r| r.map(|e| e.unwrap().metadata().unwrap().len()).sum()).unwrap_or(0) };
+        let (history_dir, runtime_dir) = (service.dir("demo"), dir.path().join(RUNTIME_DIR));
+        let before = size(&history_dir);
+        assert!(before > 0);
+        assert_eq!(service.append("demo", &serde_json::json!({ "kind": "after" }), now).unwrap_err().code, ErrorCode::Conflict);
+        assert!(service.turn_session("demo", Session::start("2026-11-26").0, || Ok(Head::genesis())).is_err());
+        assert!(service.purge("demo", StreamKey::generate().public(), default_retention("demo")).is_err());
+        service.sync_due();
+        service.close_all();
+        service.enforce_retention(now);
+        assert_eq!(service.write_runtime("demo", None).unwrap_err().code, ErrorCode::Conflict);
+        drop(service);
+        assert_eq!(size(&history_dir), before, "nothing was written after the seal, not even on drop");
+        assert_eq!(size(&runtime_dir), 0);
+    }
 }

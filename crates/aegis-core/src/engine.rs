@@ -47,6 +47,9 @@ impl Default for EngineOptions {
     }
 }
 
+/// See `Engine::set_exit_hook`.
+pub type ExitHook = Arc<dyn Fn() + Send + Sync>;
+
 pub struct Engine {
     /// Lets `&self` methods hand an owning reference to background tasks.
     me: std::sync::Weak<Engine>,
@@ -59,6 +62,23 @@ pub struct Engine {
     tickets: Mutex<TicketStore>,
     http: reqwest::Client,
     elevated: bool,
+    /// Set when an accepted restart began this copy's exit: a later exit (the
+    /// app's exit handler) does nothing, so no stop step runs after the
+    /// install claim went to the elevated copy (issue #91).
+    exiting_for_restart: AtomicBool,
+    /// Set on every accepted restart just before the claim is let go: the exit
+    /// starts no further stop step, and history and the vault are closed to
+    /// writes (issue #91).
+    exit_cut: AtomicBool,
+    /// Tests only: runs in the exit after MCP stops, standing in for a slow
+    /// plugin stop step.
+    exit_hook: Mutex<Option<ExitHook>>,
+    /// Tests only: runs in an unlock just before the key is derived,
+    /// standing in for a slow key derivation.
+    unlock_hook: Mutex<Option<ExitHook>>,
+    /// Tests only: runs in an unlock just after the vault is kept, before the
+    /// plugins are told.
+    unlock_kept_hook: Mutex<Option<ExitHook>>,
     kdf: KdfParams,
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
     /// Last owner activity, for idle auto-lock.
@@ -392,6 +412,11 @@ impl Engine {
             tickets: Mutex::new(TicketStore::default()),
             http: crate::llm::http_client(),
             elevated: options.elevated,
+            exiting_for_restart: AtomicBool::new(false),
+            exit_cut: AtomicBool::new(false),
+            exit_hook: Mutex::new(None),
+            unlock_hook: Mutex::new(None),
+            unlock_kept_hook: Mutex::new(None),
             kdf: options.kdf,
             mcp: tokio::sync::Mutex::new(None),
             activity: Mutex::new(Instant::now()),
@@ -479,6 +504,11 @@ impl Engine {
     /// on; the wizard can change that.
     pub async fn setup(&self, pin: String) -> AegisResult<Status> {
         let pin = Zeroizing::new(pin);
+        // Serialized with unlocks, so a restart's exit waits for it (issue #91).
+        let _serial = self.pin_check.lock().await;
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         vault::validate_new_passphrase(&pin).map_err(vault_err)?;
         let mut state = VaultState::default();
         for plugin in self.registry.plugins() {
@@ -494,22 +524,43 @@ impl Engine {
             .map_err(internal)?
             .map_err(vault_err)?;
         self.finish_unlock(vault).await;
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         Ok(self.status())
     }
 
     pub async fn unlock(&self, pin: String) -> AegisResult<Status> {
         let pin = Zeroizing::new(pin);
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         if lock(&self.vault).is_some() {
             return Ok(self.status());
         }
         let _serial = self.pin_check.lock().await;
+        // A restart may have begun while this unlock waited its turn.
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         self.guard_check()?;
         let path = self.vault_path();
-        let result = tokio::task::spawn_blocking(move || UnlockedVault::<VaultState>::unlock(&path, &pin)).await.map_err(internal)?;
+        let hook = lock(&self.unlock_hook).clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if let Some(hook) = hook {
+                hook();
+            }
+            UnlockedVault::<VaultState>::unlock(&path, &pin)
+        })
+        .await
+        .map_err(internal)?;
         match result {
             Ok(vault) => {
                 lock(&self.guard).record(true, Instant::now());
                 self.finish_unlock(vault).await;
+                if self.exiting_for_restart() {
+                    return Err(restarting());
+                }
                 Ok(self.status())
             }
             Err(VaultError::WrongPin) => {
@@ -525,7 +576,19 @@ impl Engine {
         let mcp_enabled = vault.state.mcp.enabled;
         let installed: Vec<(String, Vec<String>)> =
             vault.state.installed_plugins.iter().map(|id| (id.clone(), vault.state.components_for(id))).collect();
-        *lock(&self.vault) = Some(vault);
+        {
+            let mut guard = lock(&self.vault);
+            // An unlock that began before an accepted restart keeps nothing:
+            // the exit, or the cut, may already have dropped the vault.
+            if self.exiting_for_restart() {
+                return;
+            }
+            *guard = Some(vault);
+        }
+        let hook = lock(&self.unlock_kept_hook).clone();
+        if let Some(hook) = hook {
+            let _ = tokio::task::spawn_blocking(move || hook()).await;
+        }
         // Plugins running locked carry on under `on_unlock`. One resumed at
         // launch from a file whose plugin is not installed stops here.
         let was_running = std::mem::take(&mut *lock(&self.locked_work));
@@ -690,18 +753,109 @@ impl Engine {
         self.executor.running()
     }
 
+    /// Restart as administrator: if no change is running, no change starts
+    /// until the hold is dropped. Refused while a change runs or another
+    /// restart prompt is open.
+    pub fn hold_changes_for_restart(&self) -> Result<crate::executor::RestartHold<'_>, crate::executor::RestartRefused> {
+        self.executor.hold_for_restart()
+    }
+
     /// Stops the MCP server and background work, drops the key, and forgets tickets.
     /// Locks the vault. A plugin that declared locked work keeps running it
     /// (*locked, monitoring*, ADR 0002 §4) unless its runtime file waits for
     /// the owner's review; everything else stops.
     pub async fn lock(&self) -> Status {
+        // An accepted restart's exit is already stopping everything; a lock now
+        // (tray, idle auto-lock) would start locked work in this copy, or take
+        // the vault before the exit has stopped the plugins. The exit locks.
+        if self.exiting_for_restart.load(Ordering::SeqCst) {
+            return self.status();
+        }
         self.lock_inner(true).await
     }
 
     /// AegisWin is exiting: plugins write their clean-stop record, then
-    /// everything stops, including locked work.
+    /// everything stops, including locked work. Does nothing once an accepted
+    /// restart began the exit ([`Self::begin_exit_for_restart`]).
     pub async fn exit(&self, reason: ExitReason) {
+        if self.exiting_for_restart.load(Ordering::SeqCst) {
+            return;
+        }
+        self.exit_now(reason).await;
+    }
+
+    /// For an accepted Restart as administrator: marks the engine so a later
+    /// [`Self::exit`] does nothing, and runs the exit on its own task, so a
+    /// stop step that blocks its thread cannot keep the caller past its budget
+    /// (issue #91). `None` if the engine is already being dropped.
+    ///
+    /// An await that is already ready never yields, so aborting the task alone
+    /// does not stop it after a step that blocked its thread. The caller calls
+    /// [`Self::cut_exit_for_restart`] before it lets go of the claim, and the
+    /// exit checks that between its steps.
+    pub(crate) fn begin_exit_for_restart(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.exiting_for_restart.store(true, Ordering::SeqCst);
+        let me = self.self_arc().ok()?;
+        Some(tokio::spawn(async move { me.exit_now(ExitReason::Quit).await }))
+    }
+
+    /// Called on every accepted restart, just before the claim is let go:
+    /// the exit starts no further step, history and runtime files refuse
+    /// every later write, and the vault is dropped, so nothing this copy does
+    /// afterwards writes to `./data` (issue #91). A step already under way
+    /// is not interrupted, but its writes are refused.
+    pub(crate) fn cut_exit_for_restart(&self) {
+        self.exit_cut.store(true, Ordering::SeqCst);
+        self.history.seal();
+        lock(&self.vault).take();
+    }
+
+    /// True while an accepted restart is ending this copy.
+    pub fn exiting_for_restart(&self) -> bool {
+        self.exiting_for_restart.load(Ordering::SeqCst)
+    }
+
+    fn exit_cut(&self) -> bool {
+        self.exit_cut.load(Ordering::SeqCst)
+    }
+
+    /// Runs `hook` in every exit, after the MCP server stops and before the
+    /// plugins stop. Tests only.
+    #[doc(hidden)]
+    pub fn set_exit_hook(&self, hook: Option<ExitHook>) {
+        *lock(&self.exit_hook) = hook;
+    }
+
+    /// Runs `hook` in every unlock, on the blocking thread just before the key
+    /// is derived. Tests only.
+    #[doc(hidden)]
+    pub fn set_unlock_hook(&self, hook: Option<ExitHook>) {
+        *lock(&self.unlock_hook) = hook;
+    }
+
+    /// Runs `hook` in every unlock, on a blocking thread just after the vault
+    /// is kept and before the plugins are told. Tests only.
+    #[doc(hidden)]
+    pub fn set_unlock_kept_hook(&self, hook: Option<ExitHook>) {
+        *lock(&self.unlock_kept_hook) = hook;
+    }
+
+    async fn exit_now(&self, reason: ExitReason) {
+        // An unlock or PIN check already under way finishes first, so it
+        // cannot start the MCP server, call a plugin's on_unlock or rewrite
+        // the vault after the stop steps below. During a restart, an unlock
+        // that waits on this lock is refused once it gets it (issue #91).
+        drop(self.pin_check.lock().await);
+        // First, so no agent request lands while a plugin's stop step runs.
+        self.stop_mcp().await;
+        let hook = lock(&self.exit_hook).clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         for id in self.background_plugins() {
+            if self.exit_cut() {
+                return;
+            }
             if let Some(plugin) = self.registry.plugin(&id) {
                 plugin.on_exit(reason);
             }
@@ -711,9 +865,17 @@ impl Engine {
 
     async fn lock_inner(&self, keep_locked_work: bool) -> Status {
         self.stop_mcp().await;
+        // A restart's exit that ran past its budget writes nothing more: the
+        // claim, and the files, may already be the elevated copy's (issue #91).
+        if self.exit_cut() {
+            return self.status();
+        }
         // Recorded while the vault is still open; the requests are forgotten below.
         let open: Vec<String> = lock(&self.tickets).list(Instant::now()).into_iter().filter(|v| !v.status.is_final()).map(|v| v.ticket_id).collect();
         for id in open {
+            if self.exit_cut() {
+                return self.status();
+            }
             self.record_approval(json!({
                 "event": "cancelled",
                 "ticketId": id,
@@ -723,6 +885,9 @@ impl Engine {
         }
         // While the vault key is still here: close the file, checkpoint, and
         // store the key of the session that covers the locked period (ADR 0004 §4.2).
+        if self.exit_cut() {
+            return self.status();
+        }
         let _ = self.turn_approval_session(false);
         let reviews: BTreeSet<String> = lock(&self.runtime_reviews).keys().cloned().collect();
         let taken = lock(&self.vault).take().map(|v| (v.state.installed_plugins.clone(), v.state.runtime.clone()));
@@ -734,7 +899,7 @@ impl Engine {
                 let mut running = BTreeSet::new();
                 for id in installed {
                     let Some(plugin) = self.registry.plugin(&id) else { continue };
-                    match runtime.get(&id).filter(|_| keep_locked_work && !reviews.contains(&id)) {
+                    match runtime.get(&id).filter(|_| keep_locked_work && !reviews.contains(&id) && !self.exiting_for_restart()) {
                         Some(section) => {
                             if plugin.run_locked(&LockedContext { runtime: section.clone(), history: self.history_for(&id), paused, launch: None }) {
                                 running.insert(id);
@@ -757,6 +922,9 @@ impl Engine {
             None => {}
         }
         // A fresh file (and HPKE context) for anything written while locked.
+        if self.exit_cut() {
+            return self.status();
+        }
         self.history.close_all();
         lock(&self.tickets).clear();
         lock(&self.resume_notices).clear();
@@ -837,6 +1005,9 @@ impl Engine {
     /// Deletes the short PIN for this PC. Needs no PIN, works while locked:
     /// it only removes a way in (ADR 0004 §3.3).
     pub fn forget_this_pc(&self) -> AegisResult<Status> {
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         {
             let mut guard = lock(&self.vault);
             match guard.as_mut() {
@@ -894,6 +1065,10 @@ impl Engine {
     }
 
     pub async fn update_settings(&self, update: SettingsUpdate) -> AegisResult<SettingsView> {
+        // A copy that is quitting changes no setting (issue #91).
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         let (mcp_changed, enabled) = self.mutate(|s| {
             if let Some(scale) = update.ui_scale {
                 if !(80..=150).contains(&scale) {
@@ -2624,6 +2799,9 @@ impl Engine {
     }
 
     pub async fn start_mcp(&self) -> AegisResult<McpStatus> {
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         self.mutate(|s| {
             s.mcp.enabled = true;
             Ok(())
@@ -2632,9 +2810,18 @@ impl Engine {
     }
 
     async fn start_mcp_inner(&self) -> AegisResult<McpStatus> {
+        // The restart's exit has stopped the server, or is about to.
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         let config = self.with_state(|s| s.mcp.clone())?;
         let host = validate_mcp_host(&config.host)?;
         let mut slot = self.mcp.lock().await;
+        // Again under the server's lock: a restart may have begun, and its
+        // exit stopped the server, while this start waited for the lock.
+        if self.exiting_for_restart() {
+            return Err(restarting());
+        }
         if let Some(old) = slot.take() {
             old.stop().await;
         }
@@ -3061,6 +3248,10 @@ fn too_many_pending() -> AegisError {
 
 fn too_many_plans() -> AegisError {
     AegisError::new(ErrorCode::Conflict, format!("{MAX_PENDING_PLANS} plans are already waiting for a decision. Wait for those to be decided or to expire."))
+}
+
+fn restarting() -> AegisError {
+    AegisError::new(ErrorCode::Conflict, "AegisWin is restarting as administrator, so this copy does nothing more. Use the new copy once it opens.")
 }
 
 fn ticket_not_found() -> AegisError {
