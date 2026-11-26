@@ -46,7 +46,7 @@ Nothing found stays only in this conversation. Where a finding goes depends on t
 
 A pull request that fixes bugs does not leave new issues behind. Every finding, whatever its severity and whether or not this PR caused it, goes in the one PR comment (`gh pr comment <n> --body-file <file>`) as a must-fix item, most serious first, each with file and line, what goes wrong, and a fix direction. File no issue for it. The author fixes each one in this PR before merge and answers the comment with the commit, and the new commits get a fresh-session review under the same rule, until a review finds nothing.
 
-Only the maintainer can send a bug-fix finding to an issue instead: say in the comment when a fix needs a design decision or a file that another open pull request is changing, and let the maintainer decide. The author never decides alone to leave a bug-fix finding for later. An exploitable security problem is still never posted in public (below).
+Only the maintainer can send a bug-fix finding to an issue instead: say in the comment when a fix needs a design decision or a file that another open pull request is changing, and let the maintainer decide. When the maintainer does send one, the author files it as an issue before merge, in the format of `.github/ISSUE_TEMPLATE/finding.md`, and adds the issue number to the PR comment, so it never stays only in the comment. The author never decides alone to leave a bug-fix finding for later. An exploitable security problem is still never posted in public (below).
 
 ### On a standard PR: what is not fixed here is filed
 
@@ -54,6 +54,7 @@ Only the maintainer can send a bug-fix finding to an issue instead: say in the c
 - **Every other finding becomes an issue, filed by you in this session, however small**: low severity, a note, a problem that was already there. `gh issue create --label <bug|enhancement|documentation>`, in the format of `.github/ISSUE_TEMPLATE/finding.md` (`**Status:**`, `**Where:**` with a permalink to the commit, what goes wrong, `**Fix direction:**`). Do not leave it to the author to file, and do not fold it into a "small notes" paragraph. If an open issue already covers it, add a comment there instead. List the issue numbers in the PR comment.
 - **If the author decides not to fix a must-fix finding in this PR**, the author files it as an issue before merge (the reviewer's session has usually ended), in the same format, and adds the issue number to the PR comment. `AGENTS.md` section 3 says the same. A finding is never left only in a PR comment.
 - **If the author fixes a finding in this PR**, the fixing commit closes its issue (`Fixes #N`) or, for a finding in the PR comment, the author answers that comment with the commit. The new commits are reviewed by a fresh session.
+
 ### On any PR
 
 - **A security problem someone could exploit** is not posted in public. Tell the user in this session and let them decide how to handle it.
