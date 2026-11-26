@@ -17,4 +17,4 @@
 
 ## Found and not fixed here
 
-<!-- Issue numbers for anything found and left for later, or "None". -->
+<!-- Issue numbers for anything found and left for later, or "None". On a bug-fix PR (title starts with (fix) or (security)), review findings are fixed in this PR instead; list only those the maintainer sent to an issue, which the author files before merge. -->

@@ -154,7 +154,7 @@ test('Documentation Audit: agent docs keep the review and findings rules, and no
   // Findings are filed as issues, reviews come from a fresh session, and shared functions get a caller audit.
   for (const doc of ['AGENTS.md', 'CLAUDE.md']) {
     const text = fs.readFileSync(doc, 'utf8');
-    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Caller Audit', 'Two-Actor Test', 'Fixes Start with a Failing Test']) {
+    for (const rule of ['Fresh-Session Review', 'File Every Finding', 'Bug-Fix PRs Fix Their Findings', 'Caller Audit', 'Two-Actor Test', 'Fixes Start with a Failing Test']) {
       assert.ok(text.includes(`**${rule}**`), `${doc} must name the ${rule} rule`);
     }
   }
@@ -174,6 +174,15 @@ test('Documentation Audit: agent docs keep the review and findings rules, and no
   assert.match(agent, /`80%`–`150%`/);
   assert.match(fs.readFileSync('documentation/ARCHITECTURE.md', 'utf8'), /Dynamic Zoom: 80% - 150%/);
   assert.match(fs.readFileSync('documentation/GUIDING_PRINCIPLES.md', 'utf8'), /`--ui-scale: 0\.80` to `1\.50`/);
+});
+
+test('Documentation Audit: every ledger row from 113 on has the five columns of the header', () => {
+  // Older rows predate the column check and are left as they are.
+  const rows = fs.readFileSync('documentation/AUDIT_LEDGER.md', 'utf8').split(/\r?\n/).filter((l) => /^\| \d+ \|/.test(l));
+  for (const row of rows.filter((l) => Number(l.match(/^\| (\d+) \|/)[1]) >= 113)) {
+    const cells = row.replace(/`[^`]*`/g, 'x').split('|').slice(1, -1);
+    assert.equal(cells.length, 5, `ledger row ${row.slice(0, 12)} has five cells`);
+  }
 });
 
 test('Documentation Audit: the guiding principles in AGENTS.md are numbered in order', () => {
