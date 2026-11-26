@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use crate::engine::Engine;
 use crate::error::{AegisError, AegisResult, ErrorCode};
-use crate::registry::ExitReason;
+use crate::executor::RestartRefused;
+use tokio::task::JoinHandle;
 
 /// How long the elevated copy (`--after-restart`) waits for the install claim
 /// before it gives up and acts as an ordinary second launch.
@@ -25,20 +26,23 @@ pub const EXIT_BUDGET: Duration = Duration::from_secs(20);
 ///    A cancelled prompt (`ErrorKind::Interrupted`) or a failed launch leaves
 ///    this copy exactly as it was: it keeps the install claim and keeps
 ///    monitoring, and no quit record is written. While the prompt is open no
-///    change starts (one approved meanwhile waits, and is cancelled by the
-///    exit if the launch is accepted), so the exit cannot cut a change off.
-/// 2. On `Ok`, `engine.exit(Quit)` stops the MCP server and monitoring and
-///    writes the quit record, within [`EXIT_BUDGET`]. Only then does
+///    change starts (one approved meanwhile waits), so the exit cannot cut a
+///    change off. Only one prompt is open at a time.
+/// 2. On `Ok`, the hold on changes is kept until the process ends, so nothing
+///    approved meanwhile ever starts in this copy. The exit (stop the MCP
+///    server and monitoring, write the quit record, cancel what waits) runs
+///    on its own task for at most [`EXIT_BUDGET`]. Only then does
 ///    `release_claim` let go of the install. The elevated copy starts with
 ///    `--after-restart` and waits for that claim before it resumes anything,
 ///    so the two copies never sample or write history at the same time.
-/// 3. `quit` ends this process (its exit handler finds nothing left to stop).
+/// 3. `quit` ends this process. Its exit handler runs no second exit.
 ///
 /// After an accepted launch, `release_claim` and `quit` run even if the exit
-/// panics or runs past its budget, so this copy never stays half-stopped
-/// with the claim held while the elevated copy waits for it. If the elevated
-/// copy dies before it takes the claim, no copy is left running; the owner
-/// starts AegisWin again.
+/// panics, or blocks or runs past its budget; the exit task is then stopped
+/// at its next await and the quit record may be missing. This copy never
+/// stays half-stopped with the claim held while the elevated copy waits for
+/// it. If the elevated copy dies before it takes the claim, no copy is left
+/// running; the owner starts AegisWin again.
 pub async fn restart_elevated(
     engine: &Engine,
     launch: impl FnOnce() -> io::Result<()>,
@@ -48,19 +52,39 @@ pub async fn restart_elevated(
     if engine.elevated() {
         return Err(AegisError::new(ErrorCode::Conflict, "AegisWin is already running as administrator."));
     }
-    // Restarting would cut the running change off; waiting ones are cancelled when this copy exits.
-    let _hold = engine
-        .hold_changes_for_restart()
-        .map_err(|tool| AegisError::new(ErrorCode::Conflict, format!("Wait for {tool} to finish before restarting as administrator.")))?;
+    // Restarting would cut the running change off; waiting ones never start (they are cancelled by the exit).
+    let hold = engine.hold_changes_for_restart().map_err(|refused| match refused {
+        RestartRefused::Running(tool) => AegisError::new(ErrorCode::Conflict, format!("Wait for {tool} to finish before restarting as administrator.")),
+        RestartRefused::AlreadyAsking => AegisError::new(ErrorCode::Conflict, "The administrator prompt is already open. Answer it first."),
+    })?;
     match launch() {
         Ok(()) => {
-            finish(engine.exit(ExitReason::Quit), EXIT_BUDGET, release_claim, quit).await;
+            hold.keep();
+            finish(on_own_task(engine.begin_exit_for_restart()), EXIT_BUDGET, release_claim, quit).await;
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
             Err(AegisError::new(ErrorCode::AccessDenied, "The administrator prompt was cancelled. AegisWin is still running as before."))
         }
         Err(e) => Err(AegisError::failed(format!("Could not restart as administrator: {e}"))),
+    }
+}
+
+/// Waits for `task` (if any). Dropping the wait, as [`finish`] does past its
+/// budget, stops the task at its next await, so no stop step starts after
+/// the claim is let go. A task that panics just ends the wait.
+fn on_own_task(task: Option<JoinHandle<()>>) -> impl Future<Output = ()> {
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    async move {
+        if let Some(task) = task {
+            let _abort = AbortOnDrop(task.abort_handle());
+            let _ = task.await;
+        }
     }
 }
 
@@ -125,5 +149,32 @@ mod tests {
         let task = tokio::spawn(finish(async { panic!("exit failed") }, EXIT_BUDGET, release, quit));
         assert!(task.await.unwrap_err().is_panic());
         assert_eq!(*log.lock().unwrap(), ["release", "quit"]);
+    }
+
+    #[tokio::test]
+    async fn an_exit_task_that_panics_still_releases_and_quits() {
+        let (log, release, quit) = steps();
+        finish(on_own_task(Some(tokio::spawn(async { panic!("exit failed") }))), EXIT_BUDGET, release, quit).await;
+        assert_eq!(*log.lock().unwrap(), ["release", "quit"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exit_that_blocks_its_thread_is_still_cut_at_the_budget_and_stopped() {
+        // Issue #91 names a stop step that blocks (a thread join): a timeout alone
+        // cannot interrupt it, so the exit runs on its own task.
+        let (log, release, quit) = steps();
+        let after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let after_in = after.clone();
+        let exit = tokio::spawn(async move {
+            std::thread::sleep(Duration::from_millis(1500));
+            tokio::task::yield_now().await;
+            after_in.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        finish(on_own_task(Some(exit)), Duration::from_millis(100), release, quit).await;
+        assert!(started.elapsed() < Duration::from_millis(1000), "cut at the budget, not after the blocking step");
+        assert_eq!(*log.lock().unwrap(), ["release", "quit"]);
+        std::thread::sleep(Duration::from_millis(2000));
+        assert!(!after.load(std::sync::atomic::Ordering::SeqCst), "nothing after the blocked step ran once the claim was let go");
     }
 }

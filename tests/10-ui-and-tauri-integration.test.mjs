@@ -123,6 +123,10 @@ test('Lifecycle: one copy per install, close-to-tray only while monitors run, an
   assert.match(model, /While the prompt is open no change starts/);
   assert.match(model, /within 20 s, then lets go of the install claim/);
   assert.match(model, /It lets go and exits even if stopping panics or takes longer/);
+  assert.match(model, /the hold on changes is kept until the process ends/);
+  assert.match(model, /the app's own exit handler runs no second stop after that/);
+  assert.match(model, /Only one administrator prompt is open at a time/);
+  assert.doesNotMatch(model, /the rest of it is dropped/);
   assert.match(mainRs, /args\(\)\.skip\(1\)\.any\(\|a\| a == os::AFTER_RESTART_ARG\)/);
   const main = fs.readFileSync('src/ui/main.ts', 'utf8');
   // Only input in the app window counts as activity.
@@ -240,7 +244,10 @@ test('Serial executor: the app shows the change in progress, and the shell never
   assert.match(main, /queued: \['approved, waiting its turn'/);
   // Restarting as administrator is refused while a change runs; Quit asks first.
   // Restart refuses while a change runs, and holds every new change from the same check until the prompt is answered (issue #87).
-  assert.match(fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8'), /let _hold = engine\s*\.hold_changes_for_restart\(\)\s*\.map_err\([\s\S]*?\)\?;\s*match launch\(\)/);
+  const restartRs = fs.readFileSync('crates/aegis-core/src/restart.rs', 'utf8');
+  assert.match(restartRs, /let hold = engine\s*\.hold_changes_for_restart\(\)\s*\.map_err\([\s\S]*?\)\?;\s*match launch\(\)/);
+  // An accepted launch keeps the hold for good, runs the exit on its own task within the budget, then lets go and quits.
+  assert.match(restartRs, /Ok\(\(\)\) => \{\s*hold\.keep\(\);\s*finish\(on_own_task\(engine\.begin_exit_for_restart\(\)\), EXIT_BUDGET, release_claim, quit\)\.await;\s*Ok\(\(\)\)\s*\}/);
   assert.match(mainRs, /fn quit_app[\s\S]*?change_running\(\)[\s\S]*?os::confirm\(/);
   assert.match(mainRs, /"quit" => quit_app\(app\),/);
 });

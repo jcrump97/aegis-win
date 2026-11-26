@@ -59,6 +59,10 @@ pub struct Engine {
     tickets: Mutex<TicketStore>,
     http: reqwest::Client,
     elevated: bool,
+    /// Set when an accepted restart began this copy's exit: a later exit (the
+    /// app's exit handler) does nothing, so no stop step runs after the
+    /// install claim went to the elevated copy (issue #91).
+    exiting_for_restart: AtomicBool,
     kdf: KdfParams,
     mcp: tokio::sync::Mutex<Option<McpHandle>>,
     /// Last owner activity, for idle auto-lock.
@@ -392,6 +396,7 @@ impl Engine {
             tickets: Mutex::new(TicketStore::default()),
             http: crate::llm::http_client(),
             elevated: options.elevated,
+            exiting_for_restart: AtomicBool::new(false),
             kdf: options.kdf,
             mcp: tokio::sync::Mutex::new(None),
             activity: Mutex::new(Instant::now()),
@@ -691,8 +696,9 @@ impl Engine {
     }
 
     /// Restart as administrator: if no change is running, no change starts
-    /// until the hold is dropped. Fails with the running tool's name.
-    pub fn hold_changes_for_restart(&self) -> Result<crate::executor::RestartHold<'_>, String> {
+    /// until the hold is dropped. Refused while a change runs or another
+    /// restart prompt is open.
+    pub fn hold_changes_for_restart(&self) -> Result<crate::executor::RestartHold<'_>, crate::executor::RestartRefused> {
         self.executor.hold_for_restart()
     }
 
@@ -705,8 +711,26 @@ impl Engine {
     }
 
     /// AegisWin is exiting: plugins write their clean-stop record, then
-    /// everything stops, including locked work.
+    /// everything stops, including locked work. Does nothing once an accepted
+    /// restart began the exit ([`Self::begin_exit_for_restart`]).
     pub async fn exit(&self, reason: ExitReason) {
+        if self.exiting_for_restart.load(Ordering::SeqCst) {
+            return;
+        }
+        self.exit_now(reason).await;
+    }
+
+    /// For an accepted Restart as administrator: marks the engine so a later
+    /// [`Self::exit`] does nothing, and runs the exit on its own task, so a
+    /// stop step that blocks its thread cannot keep the caller past its budget
+    /// (issue #91). `None` if the engine is already being dropped.
+    pub(crate) fn begin_exit_for_restart(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.exiting_for_restart.store(true, Ordering::SeqCst);
+        let me = self.self_arc().ok()?;
+        Some(tokio::spawn(async move { me.exit_now(ExitReason::Quit).await }))
+    }
+
+    async fn exit_now(&self, reason: ExitReason) {
         for id in self.background_plugins() {
             if let Some(plugin) = self.registry.plugin(&id) {
                 plugin.on_exit(reason);

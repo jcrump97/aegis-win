@@ -93,3 +93,31 @@ async fn a_running_change_refuses_the_restart_before_any_prompt() {
     f.plugin.release.add_permits(1);
     run.await.unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_prompt_is_refused_while_the_first_is_open() {
+    use aegis_core::executor::RestartRefused;
+    // The app has two Restart buttons: the answer to one prompt must not end the other's hold.
+    let f = ready().await;
+    let out = restart_elevated(&f.engine, || {
+        assert_eq!(f.engine.hold_changes_for_restart().err(), Some(RestartRefused::AlreadyAsking));
+        Err(io::Error::from(io::ErrorKind::Interrupted))
+    }, || {}, || {})
+    .await;
+    assert_eq!(out.unwrap_err().code, ErrorCode::AccessDenied);
+    assert!(f.engine.hold_changes_for_restart().is_ok(), "the hold ends with the prompt");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_an_accepted_restart_the_app_s_exit_handler_stops_nothing_more() {
+    // Issue #91: the claim may already be the elevated copy's, so the app's own exit,
+    // which runs after `quit`, must not stop or write anything a second time.
+    let f = ready().await;
+    let (released, quit) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+    restart_elevated(&f.engine, || Ok(()), || released.set(true), || quit.set(true)).await.unwrap();
+    assert!(released.get() && quit.get());
+    assert!(!f.engine.status().unlocked, "the restart's exit ran and locked the vault");
+    f.engine.unlock(PIN.into()).await.unwrap();
+    f.engine.exit(aegis_core::registry::ExitReason::Quit).await;
+    assert!(f.engine.status().unlocked, "a later exit does nothing");
+}

@@ -71,6 +71,24 @@ pub struct RestartHold<'a> {
     executor: &'a Executor,
 }
 
+impl RestartHold<'_> {
+    /// Keeps the hold until this process ends: for an accepted restart, so no
+    /// change starts in this copy once the elevated copy may own the install,
+    /// even if the exit is cut off before it cancels the queue (issue #87).
+    pub fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// Why [`Executor::hold_for_restart`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartRefused {
+    /// A change is running; it has this label.
+    Running(String),
+    /// Another restart prompt is already open.
+    AlreadyAsking,
+}
+
 impl Drop for RestartHold<'_> {
     fn drop(&mut self) {
         self.executor.lock().restart = false;
@@ -195,22 +213,26 @@ impl Executor {
         }
     }
 
-    /// True while idle auto-lock is waiting or a restart prompt is open: a
-    /// plan does not start its next step.
+    /// True while idle auto-lock is waiting: a plan does not start its next
+    /// step. A restart hold is never taken while a plan runs (the plan holds
+    /// the slot), so it has no part here.
     pub fn held(&self) -> bool {
-        let inner = self.lock();
-        inner.hold || inner.restart
+        self.lock().hold
     }
 
     /// For Restart as administrator: if no change is running, starts nothing
     /// new until the returned hold is dropped, so a change approved while the
     /// UAC prompt is open cannot be cut off by the exit that follows (issue
     /// #87). The check and the hold are one step, under the same lock that
-    /// gives out the slot. Fails with the running tool's label otherwise.
-    pub fn hold_for_restart(&self) -> Result<RestartHold<'_>, String> {
+    /// gives out the slot. Refused while a change runs, and while another
+    /// restart prompt is open, whose answer would otherwise end this hold.
+    pub fn hold_for_restart(&self) -> Result<RestartHold<'_>, RestartRefused> {
         let mut inner = self.lock();
         if let Some((_, label)) = &inner.running {
-            return Err(label.clone());
+            return Err(RestartRefused::Running(label.clone()));
+        }
+        if inner.restart {
+            return Err(RestartRefused::AlreadyAsking);
         }
         inner.restart = true;
         Ok(RestartHold { executor: self })
@@ -361,7 +383,7 @@ mod tests {
         let a = ex.enqueue(e, "a", None).unwrap();
         let (_ta, release_a) = waiter(&ex, a, "a", &tx);
         assert_eq!(next(&mut log).await, "a");
-        assert_eq!(ex.hold_for_restart().err().as_deref(), Some("a"), "refused while a change runs");
+        assert_eq!(ex.hold_for_restart().err(), Some(RestartRefused::Running("a".into())), "refused while a change runs");
         release_a.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while ex.running().is_some() {
@@ -372,16 +394,30 @@ mod tests {
         .unwrap();
 
         let hold = ex.hold_for_restart().unwrap();
+        // A second prompt while the first is open is refused: its answer would end the first's hold.
+        assert_eq!(ex.hold_for_restart().err(), Some(RestartRefused::AlreadyAsking));
         // Idle auto-lock clears its own hold on every tick; that must not end the restart's.
         ex.hold(false);
-        assert!(ex.held());
+        assert!(!ex.held(), "a plan's auto-lock check is not the restart hold");
         let b = ex.enqueue(e, "b", None).unwrap();
         let (_tb, _release_b) = waiter(&ex, b, "b", &tx);
         nothing_starts(&mut log).await;
         assert!(!ex.is_next(b));
         drop(hold);
-        assert!(!ex.held());
         assert_eq!(next(&mut log).await, "b");
+    }
+
+    #[tokio::test]
+    async fn a_kept_restart_hold_starts_nothing_for_good() {
+        let ex = Arc::new(Executor::default());
+        let (tx, mut log) = mpsc::unbounded_channel();
+        let e = ex.epoch();
+        ex.hold_for_restart().unwrap().keep();
+        let b = ex.enqueue(e, "b", None).unwrap();
+        let (_tb, _release_b) = waiter(&ex, b, "b", &tx);
+        nothing_starts(&mut log).await;
+        assert!(!ex.is_next(b));
+        assert_eq!(ex.hold_for_restart().err(), Some(RestartRefused::AlreadyAsking));
     }
 
     #[tokio::test]
